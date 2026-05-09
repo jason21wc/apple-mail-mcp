@@ -15,9 +15,11 @@ from typing import Any, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
+from .drafts import _validate_draft_id
 from .exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
+    MailDraftNotFoundError,
     MailKeychainAccessDeniedError,
     MailKeychainEntryNotFoundError,
     MailMailboxNotFoundError,
@@ -1487,83 +1489,6 @@ class AppleMailConnector:
         out["original_subject"] = str(msg.get("subject") or "")
         return out
 
-    def send_email(
-        self,
-        subject: str,
-        body: str,
-        to: list[str],
-        cc: list[str] | None = None,
-        bcc: list[str] | None = None,
-        from_account: str | None = None,
-    ) -> bool:
-        """
-        Send an email.
-
-        Args:
-            subject: Email subject
-            body: Email body
-            to: List of To recipients
-            cc: List of CC recipients
-            bcc: List of BCC recipients
-            from_account: Optional Mail.app account (name or UUID) to send
-                from. None (default) uses Mail.app's default sender. See
-                #155.
-
-        Returns:
-            True if sent successfully
-
-        Raises:
-            MailAccountNotFoundError: If ``from_account`` doesn't match any
-                configured account.
-            MailAppleScriptError: If send fails
-        """
-        subject_safe = escape_applescript_string(sanitize_input(subject))
-        body_safe = escape_applescript_string(sanitize_input(body))
-
-        # Build recipient lists
-        to_list = ", ".join(f'"{escape_applescript_string(addr)}"' for addr in to)
-        cc_list = ", ".join(f'"{escape_applescript_string(addr)}"' for addr in (cc or []))
-        bcc_list = ", ".join(f'"{escape_applescript_string(addr)}"' for addr in (bcc or []))
-
-        sender_clause = ""
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
-            sender_safe = escape_applescript_string(sender_email)
-            sender_clause = (
-                f'set sender of theMessage to "{sender_safe}"'
-            )
-
-        script = f"""
-        tell application "Mail"
-            set theMessage to make new outgoing message with properties {{subject:"{subject_safe}", content:"{body_safe}", visible:false}}
-            {sender_clause}
-
-            tell theMessage
-                -- Add To recipients
-                repeat with addr in {{{to_list}}}
-                    make new to recipient with properties {{address:addr}}
-                end repeat
-
-                -- Add CC recipients
-                repeat with addr in {{{cc_list}}}
-                    make new cc recipient with properties {{address:addr}}
-                end repeat
-
-                -- Add BCC recipients
-                repeat with addr in {{{bcc_list}}}
-                    make new bcc recipient with properties {{address:addr}}
-                end repeat
-
-                send
-            end tell
-
-            return "sent"
-        end tell
-        """
-
-        result = self._run_applescript(script)
-        return result == "sent"
-
     def mark_as_read(
         self,
         message_ids: list[str],
@@ -1620,122 +1545,6 @@ class AppleMailConnector:
 
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
-
-    def send_email_with_attachments(
-        self,
-        subject: str,
-        body: str,
-        to: list[str],
-        attachments: list[Path],
-        cc: list[str] | None = None,
-        bcc: list[str] | None = None,
-        max_attachment_size: int = 25 * 1024 * 1024,
-        from_account: str | None = None,
-    ) -> bool:
-        """
-        Send an email with file attachments.
-
-        Args:
-            subject: Email subject
-            body: Email body
-            to: List of To recipients
-            attachments: List of file paths to attach
-            cc: List of CC recipients
-            bcc: List of BCC recipients
-            max_attachment_size: Maximum size per attachment in bytes
-            from_account: Optional Mail.app account (name or UUID) to send
-                from. None (default) uses Mail.app's default sender. See
-                #155.
-
-        Returns:
-            True if sent successfully
-
-        Raises:
-            FileNotFoundError: If attachment file doesn't exist
-            ValueError: If attachment exceeds size limit
-            MailAccountNotFoundError: If ``from_account`` doesn't match any
-                configured account.
-            MailAppleScriptError: If send fails
-        """
-        from .security import validate_attachment_size, validate_attachment_type
-
-        # Validate all attachments exist and are within size limit
-        for attachment_path in attachments:
-            if not attachment_path.exists():
-                raise FileNotFoundError(f"Attachment not found: {attachment_path}")
-
-            if not attachment_path.is_file():
-                raise ValueError(f"Attachment is not a file: {attachment_path}")
-
-            file_size = attachment_path.stat().st_size
-            if not validate_attachment_size(file_size, max_attachment_size):
-                raise ValueError(
-                    f"Attachment {attachment_path.name} exceeds size limit "
-                    f"({file_size} bytes > {max_attachment_size} bytes)"
-                )
-
-            if not validate_attachment_type(attachment_path.name):
-                raise ValueError(
-                    f"Attachment type not allowed: {attachment_path.name}"
-                )
-
-        subject_safe = escape_applescript_string(sanitize_input(subject))
-        body_safe = escape_applescript_string(sanitize_input(body))
-
-        # Build recipient lists
-        to_list = ", ".join(f'"{escape_applescript_string(addr)}"' for addr in to)
-        cc_list = ", ".join(f'"{escape_applescript_string(addr)}"' for addr in (cc or []))
-        bcc_list = ", ".join(f'"{escape_applescript_string(addr)}"' for addr in (bcc or []))
-
-        # Build attachment list (convert to POSIX file references)
-        attachment_list = ", ".join(
-            f'POSIX file "{escape_applescript_string(str(path.absolute()))}"'
-            for path in attachments
-        )
-
-        sender_clause = ""
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
-            sender_safe = escape_applescript_string(sender_email)
-            sender_clause = (
-                f'set sender of theMessage to "{sender_safe}"'
-            )
-
-        script = f"""
-        tell application "Mail"
-            set theMessage to make new outgoing message with properties {{subject:"{subject_safe}", content:"{body_safe}", visible:false}}
-            {sender_clause}
-
-            tell theMessage
-                -- Add To recipients
-                repeat with addr in {{{to_list}}}
-                    make new to recipient with properties {{address:addr}}
-                end repeat
-
-                -- Add CC recipients
-                repeat with addr in {{{cc_list}}}
-                    make new cc recipient with properties {{address:addr}}
-                end repeat
-
-                -- Add BCC recipients
-                repeat with addr in {{{bcc_list}}}
-                    make new bcc recipient with properties {{address:addr}}
-                end repeat
-
-                -- Add attachments
-                repeat with filePath in {{{attachment_list}}}
-                    make new attachment with properties {{file name:filePath}} at after last paragraph
-                end repeat
-
-                send
-            end tell
-
-            return "sent"
-        end tell
-        """
-
-        result = self._run_applescript(script)
-        return result == "sent"
 
     def get_attachments(
         self,
@@ -2631,208 +2440,6 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
 
-    def reply_to_message(
-        self,
-        message_id: str,
-        body: str,
-        reply_all: bool = False,
-        quote_original: bool = True,
-        from_account: str | None = None,
-    ) -> str:
-        """
-        Reply to a message.
-
-        Args:
-            message_id: ID of message to reply to
-            body: Reply body text
-            reply_all: If True, reply to all recipients; if False, reply only to sender
-            quote_original: If True, include original message quoted
-            from_account: Optional Mail.app account (name or UUID) to send
-                the reply from. None (default) uses Mail.app's default
-                sender for the reply. See #155.
-
-        Returns:
-            Message ID of the reply
-
-        Raises:
-            MailAccountNotFoundError: If ``from_account`` doesn't match any
-                configured account.
-            MailMessageNotFoundError: If message doesn't exist
-        """
-        from .utils import sanitize_input
-
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
-        body_safe = escape_applescript_string(sanitize_input(body))
-        reply_type = "reply to all" if reply_all else "reply"
-
-        sender_clause = ""
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
-            sender_safe = escape_applescript_string(sender_email)
-            sender_clause = (
-                f'set sender of replyMsg to "{sender_safe}"'
-            )
-
-        # Apple Mail's reply command automatically handles quoting if opened in editor
-        # We'll create a reply and set its content
-        script = f"""
-        tell application "Mail"
-            set idList to {{"{message_id_safe}"}}
-
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set origMsg to first message of mb whose id is "{message_id_safe}"
-
-                        -- Create reply message
-                        set replyMsg to {reply_type} origMsg
-
-                        -- Set body content
-                        set content of replyMsg to "{body_safe}"
-                        {sender_clause}
-
-                        -- Get the message ID
-                        set replyId to id of replyMsg
-
-                        -- Send the message
-                        send replyMsg
-
-                        return replyId
-                    end try
-                end repeat
-            end repeat
-
-            error "Message not found"
-        end tell
-        """
-
-        result = self._run_applescript(script)
-        return result
-
-    def forward_message(
-        self,
-        message_id: str,
-        to: list[str],
-        body: str = "",
-        cc: list[str] | None = None,
-        bcc: list[str] | None = None,
-        include_attachments: bool = True,
-        from_account: str | None = None,
-    ) -> str:
-        """
-        Forward a message to recipients.
-
-        Args:
-            message_id: ID of message to forward
-            to: List of recipient email addresses
-            body: Optional body text to add before forwarded content
-            cc: Optional CC recipients
-            bcc: Optional BCC recipients
-            include_attachments: If True, include original attachments
-            from_account: Optional Mail.app account (name or UUID) to send
-                the forward from. None (default) uses Mail.app's default
-                sender. See #155.
-
-        Returns:
-            Message ID of the forwarded message
-
-        Raises:
-            ValueError: If no recipients or invalid emails
-            MailAccountNotFoundError: If ``from_account`` doesn't match any
-                configured account.
-            MailMessageNotFoundError: If message doesn't exist
-        """
-        from .utils import format_applescript_list, sanitize_input, validate_email
-
-        if not to:
-            raise ValueError("At least one recipient required")
-
-        # Validate all email addresses
-        for email in to:
-            if not validate_email(email):
-                raise ValueError(f"Invalid email address: {email}")
-
-        if cc:
-            for email in cc:
-                if not validate_email(email):
-                    raise ValueError(f"Invalid CC email address: {email}")
-
-        if bcc:
-            for email in bcc:
-                if not validate_email(email):
-                    raise ValueError(f"Invalid BCC email address: {email}")
-
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
-        body_safe = escape_applescript_string(sanitize_input(body))
-        to_list = format_applescript_list(to)
-        cc_list = format_applescript_list(cc) if cc else '""'
-        bcc_list = format_applescript_list(bcc) if bcc else '""'
-
-        sender_clause = ""
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
-            sender_safe = escape_applescript_string(sender_email)
-            sender_clause = (
-                f'set sender of fwdMsg to "{sender_safe}"'
-            )
-
-        script = f"""
-        tell application "Mail"
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set origMsg to first message of mb whose id is "{message_id_safe}"
-
-                        -- Create forward message
-                        set fwdMsg to forward origMsg
-                        {sender_clause}
-
-                        -- Add body text before forwarded content
-                        if "{body_safe}" is not "" then
-                            set origContent to content of fwdMsg
-                            set content of fwdMsg to "{body_safe}" & return & return & origContent
-                        end if
-
-                        -- Set recipients
-                        set toRecipients to {to_list}
-                        repeat with recipientAddr in toRecipients
-                            make new to recipient at end of to recipients of fwdMsg with properties {{address:recipientAddr}}
-                        end repeat
-
-                        -- Set CC if provided
-                        if {cc_list} is not "" then
-                            set ccRecipients to {cc_list}
-                            repeat with recipientAddr in ccRecipients
-                                make new cc recipient at end of cc recipients of fwdMsg with properties {{address:recipientAddr}}
-                            end repeat
-                        end if
-
-                        -- Set BCC if provided
-                        if {bcc_list} is not "" then
-                            set bccRecipients to {bcc_list}
-                            repeat with recipientAddr in bccRecipients
-                                make new bcc recipient at end of bcc recipients of fwdMsg with properties {{address:recipientAddr}}
-                            end repeat
-                        end if
-
-                        -- Get the message ID
-                        set fwdId to id of fwdMsg
-
-                        -- Send the message
-                        send fwdMsg
-
-                        return fwdId
-                    end try
-                end repeat
-            end repeat
-
-            error "Message not found"
-        end tell
-        """
-
-        result = self._run_applescript(script)
-        return result
-
     def get_selected_messages(
         self,
         include_content: bool = True,
@@ -2891,3 +2498,588 @@ class AppleMailConnector:
         script = _wrap_as_json_script(tell_body)
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
+
+    def delete_draft(self, draft_id: str) -> bool:
+        """Move a draft to Trash (lifecycle endpoint for cancellation).
+
+        Mail.app's ``delete`` moves the message to the Deleted Messages
+        mailbox. Recovery from Trash is technically possible but Mail.app
+        no longer treats a trashed draft as editable, so this is
+        effectively a one-way discard.
+
+        Args:
+            draft_id: Mail.app internal draft id (from ``create_draft``).
+
+        Returns:
+            True if a draft with that id was found and trashed.
+
+        Raises:
+            MailDraftInvalidIdError: ``draft_id`` failed validation.
+            MailDraftNotFoundError: no draft with that id exists.
+        """
+        _validate_draft_id(draft_id)
+
+        script = f"""
+        tell application "Mail"
+            set didDelete to false
+            repeat with acc in accounts
+                try
+                    repeat with mb in mailboxes of acc
+                        if name of mb contains "Drafts" then
+                            try
+                                set m to first message of mb whose id is "{draft_id}"
+                                delete m
+                                set didDelete to true
+                                exit repeat
+                            end try
+                        end if
+                    end repeat
+                end try
+                if didDelete then exit repeat
+            end repeat
+            if didDelete then
+                return "OK"
+            else
+                return "NOT_FOUND"
+            end if
+        end tell
+        """
+
+        result = self._run_applescript(script).strip()
+        if result == "OK":
+            return True
+        raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
+
+    def find_message_by_message_id(
+        self, rfc5322_message_id: str
+    ) -> str | None:
+        """Resolve an RFC 5322 Message-ID header to Mail's internal id.
+
+        Used by ``update_draft`` to recover a reply seed from a saved
+        draft's ``In-Reply-To`` header (which carries the original
+        message's RFC 5322 Message-ID, including the angle brackets).
+
+        Args:
+            rfc5322_message_id: e.g. ``<calendar-abc123@google.com>``.
+                Angle brackets are accepted; AppleScript's ``message id``
+                property stores the value verbatim as it appears on the
+                wire.
+
+        Returns:
+            Mail's internal numeric id (as a string) of the first
+            matching message found, or None if no message with that
+            Message-ID exists in any mailbox.
+        """
+        if not rfc5322_message_id:
+            return None
+        safe = escape_applescript_string(sanitize_input(rfc5322_message_id))
+
+        script = f"""
+        tell application "Mail"
+            set foundId to ""
+            repeat with acc in accounts
+                try
+                    repeat with mb in mailboxes of acc
+                        try
+                            set m to first message of mb whose message id is "{safe}"
+                            set foundId to (id of m as text)
+                            exit repeat
+                        end try
+                    end repeat
+                end try
+                if foundId is not "" then exit repeat
+            end repeat
+            if foundId is "" then
+                return "NOT_FOUND"
+            else
+                return foundId
+            end if
+        end tell
+        """
+
+        result = self._run_applescript(script).strip()
+        if result == "NOT_FOUND" or not result:
+            return None
+        return result
+
+    def get_draft_state(self, draft_id: str) -> dict[str, Any]:
+        """Read recipients, subject, body, threading headers, and
+        attachment names from a saved draft.
+
+        Used by ``update_draft`` to merge the caller's overrides with
+        the draft's current state before delete-and-recreate.
+
+        Iterates Drafts mailboxes manually (rather than `whose id is`)
+        because newly-created drafts can take a moment to be queryable
+        via whose-clause; iteration is reliable and Drafts mailboxes
+        are typically small.
+
+        Returns:
+            ``{
+                "draft_id": "...",
+                "to":  [...email...],
+                "cc":  [...email...],
+                "bcc": [...email...],
+                "subject": "...",
+                "body": "...",
+                "in_reply_to": "<msg-id>" | "",
+                "references": "<msg-id> ..." | "",
+                "attachment_names": ["foo.pdf", ...],
+            }``
+
+        Raises:
+            MailDraftInvalidIdError: ``draft_id`` failed validation.
+            MailDraftNotFoundError: no draft with that id exists.
+        """
+        _validate_draft_id(draft_id)
+
+        tell_body = f"""
+        tell application "Mail"
+            set targetId to "{draft_id}"
+            set foundDraft to missing value
+            repeat with acc in accounts
+                try
+                    repeat with mb in mailboxes of acc
+                        if name of mb contains "Drafts" then
+                            repeat with d in messages of mb
+                                if (id of d as text) is targetId then
+                                    set foundDraft to d
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                        if foundDraft is not missing value then exit repeat
+                    end repeat
+                end try
+                if foundDraft is not missing value then exit repeat
+            end repeat
+
+            if foundDraft is missing value then
+                set resultData to {{|found|:false}}
+            else
+                set toList to {{}}
+                try
+                    repeat with r in to recipients of foundDraft
+                        set end of toList to (address of r)
+                    end repeat
+                end try
+                set ccList to {{}}
+                try
+                    repeat with r in cc recipients of foundDraft
+                        set end of ccList to (address of r)
+                    end repeat
+                end try
+                set bccList to {{}}
+                try
+                    repeat with r in bcc recipients of foundDraft
+                        set end of bccList to (address of r)
+                    end repeat
+                end try
+
+                set inReplyTo to ""
+                set refs to ""
+                try
+                    repeat with h in headers of foundDraft
+                        set hname to (name of h)
+                        if hname is "In-Reply-To" then set inReplyTo to (content of h)
+                        if hname is "References" then set refs to (content of h)
+                    end repeat
+                end try
+
+                set attNames to {{}}
+                try
+                    repeat with a in mail attachments of foundDraft
+                        try
+                            set end of attNames to (name of a)
+                        end try
+                    end repeat
+                end try
+
+                set draftSubject to ""
+                try
+                    set draftSubject to (subject of foundDraft)
+                end try
+                set draftBody to ""
+                try
+                    set draftBody to (content of foundDraft)
+                end try
+
+                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames}}
+            end if
+        end tell
+        """
+
+        script = _wrap_as_json_script(tell_body)
+        raw = self._run_applescript(script)
+        data = parse_applescript_json(raw)
+        if not isinstance(data, dict) or not data.get("found"):
+            raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
+        # Drop the internal flag from the user-visible payload.
+        data.pop("found", None)
+        return cast(dict[str, Any], data)
+
+    def create_draft(
+        self,
+        *,
+        seed: str = "new",
+        seed_id: str | None = None,
+        to: list[str] | None = None,
+        cc: list[str] | None = None,
+        bcc: list[str] | None = None,
+        subject: str | None = None,
+        body: str = "",
+        attachment_paths: list[Path] | None = None,
+        reply_all: bool = False,
+        from_account: str | None = None,
+        send_now: bool = False,
+    ) -> dict[str, str]:
+        """Create a draft (fresh, reply, or forward). Optionally send.
+
+        Args:
+            seed: ``"new"``, ``"reply"``, or ``"forward"``.
+            seed_id: Mail's internal id of the message to reply/forward.
+                Required when ``seed != "new"``.
+            to/cc/bcc: Recipient lists. For reply/forward, ``None`` keeps
+                Mail's auto-derived recipients; an empty list explicitly
+                clears that group; a populated list replaces.
+            subject: Subject. For ``seed="new"`` this is required by the
+                caller. For reply/forward, ``None`` keeps Mail's
+                auto-derived ``Re:``/``Fwd:`` prefix; non-None overrides.
+            body: Body text. For reply/forward, prepended above the
+                auto-quoted original (``body + "\\n\\n" + auto-content``).
+            attachment_paths: List of file paths. Each must exist.
+            reply_all: For ``seed="reply"`` only — use ``reply to all``.
+            from_account: Mail.app account name or UUID; ``None`` uses
+                Mail's default sender for the seed message.
+            send_now: ``False`` saves as draft and returns
+                ``{"draft_id": ...}``. ``True`` sends and returns
+                ``{"draft_id": "", "sent_message_id": ""}`` (sent_message_id
+                is empty on this version — recovering the just-sent message
+                across IMAP sync is unreliable).
+
+        Returns:
+            ``{"draft_id": <persisted-id>, "sent_message_id": <id-or-empty>}``.
+
+        Raises:
+            ValueError: invalid seed or missing required fields.
+            MailAccountNotFoundError: ``from_account`` doesn't match.
+            MailMessageNotFoundError: ``seed_id`` not found in any mailbox.
+            MailAppleScriptError: AppleScript failure.
+        """
+        if seed not in ("new", "reply", "forward"):
+            raise ValueError(f"seed must be 'new', 'reply', or 'forward'; got {seed!r}")
+        if seed in ("reply", "forward"):
+            if not seed_id:
+                raise ValueError(f"seed_id is required for seed={seed!r}")
+        else:  # seed == "new"
+            if not to:
+                raise ValueError("'to' is required when seed='new'")
+            if not subject:
+                raise ValueError("'subject' is required when seed='new'")
+
+        # Escape user inputs.
+        body_safe = escape_applescript_string(sanitize_input(body))
+        subject_safe = (
+            escape_applescript_string(sanitize_input(subject))
+            if subject is not None
+            else None
+        )
+        seed_id_safe = (
+            escape_applescript_string(sanitize_input(seed_id))
+            if seed_id is not None
+            else None
+        )
+
+        # Sender clause.
+        sender_clause = ""
+        if from_account is not None:
+            sender_email = self._resolve_account_to_sender(from_account)
+            sender_safe = escape_applescript_string(sender_email)
+            sender_clause = f'set sender of theMessage to "{sender_safe}"'
+
+        # Recipient blocks: AppleScript fragments that, when included,
+        # clear and re-populate that recipient group on `theMessage`.
+        def _recipient_block(kind: str, addrs: list[str] | None) -> str:
+            if addrs is None:
+                return ""  # keep auto-derived
+            list_str = ", ".join(
+                f'"{escape_applescript_string(a)}"' for a in addrs
+            )
+            return f"""
+                delete (every {kind} recipient of theMessage)
+                repeat with addr in {{{list_str}}}
+                    make new {kind} recipient at end of {kind} recipients of theMessage with properties {{address:addr}}
+                end repeat
+            """
+
+        to_block = _recipient_block("to", to)
+        cc_block = _recipient_block("cc", cc)
+        bcc_block = _recipient_block("bcc", bcc)
+
+        # Attachment block.
+        attachment_block = ""
+        if attachment_paths:
+            for p in attachment_paths:
+                pp = Path(p)
+                if not pp.is_file():
+                    raise FileNotFoundError(f"attachment not found: {pp}")
+            paths_safe = ", ".join(
+                f'"{escape_applescript_string(str(Path(p).resolve()))}"'
+                for p in attachment_paths
+            )
+            attachment_block = f"""
+                repeat with apath in {{{paths_safe}}}
+                    tell theMessage to make new attachment with properties {{file name:(POSIX file apath)}} at after last paragraph
+                end repeat
+            """
+
+        # Subject override (reply/forward only — for new, subject is set
+        # via `make new outgoing message ... properties`).
+        subject_override = ""
+        if seed != "new" and subject is not None:
+            subject_override = f'set subject of theMessage to "{subject_safe}"'
+
+        # Body handling differs by seed:
+        #
+        # - new: body baked into `make new outgoing message` properties.
+        # - reply/forward: Mail.app's auto-quoted content is NOT readable
+        #   from `content of d` until AFTER save (where the draft becomes
+        #   immutable), so true prepending is impossible. Tradeoff:
+        #     * non-empty body  -> override Mail's auto-content with user
+        #       body (matches existing reply_to_message behavior; loses
+        #       inline quote but preserves threading headers).
+        #     * empty body      -> leave Mail's auto-content alone (the
+        #       quoted-reply default the user gets in Mail.app).
+        if seed == "new":
+            body_block = ""
+        elif body:
+            body_block = f'set content of theMessage to "{body_safe}"'
+        else:
+            body_block = ""
+
+        # Seed-specific creation block.
+        if seed == "new":
+            creation_block = (
+                f'set theMessage to make new outgoing message with properties '
+                f'{{subject:"{subject_safe}", content:"{body_safe}", visible:false}}'
+            )
+        elif seed == "reply":
+            verb = "reply to all" if reply_all else "reply"
+            # Look up seed across all accounts/mailboxes; reuse the existing
+            # message-id lookup pattern.
+            creation_block = f"""
+                set origMsg to missing value
+                repeat with acc in accounts
+                    try
+                        repeat with mb in mailboxes of acc
+                            try
+                                set origMsg to first message of mb whose id is "{seed_id_safe}"
+                                exit repeat
+                            end try
+                        end repeat
+                    end try
+                    if origMsg is not missing value then exit repeat
+                end repeat
+                if origMsg is missing value then error "SEED_NOT_FOUND"
+                set theMessage to {verb} origMsg opening window false
+            """
+        else:  # forward
+            creation_block = f"""
+                set origMsg to missing value
+                repeat with acc in accounts
+                    try
+                        repeat with mb in mailboxes of acc
+                            try
+                                set origMsg to first message of mb whose id is "{seed_id_safe}"
+                                exit repeat
+                            end try
+                        end repeat
+                    end try
+                    if origMsg is not missing value then exit repeat
+                end repeat
+                if origMsg is missing value then error "SEED_NOT_FOUND"
+                set theMessage to forward origMsg opening window false
+            """
+
+        # Terminal block: save (with id-bridging diff) or send.
+        if send_now:
+            terminal_block = """
+                tell theMessage to send
+                return "SENT"
+            """
+        else:
+            terminal_block = """
+                save theMessage
+                delay 0.5
+
+                set newDraftId to ""
+                repeat with acc in accounts
+                    try
+                        repeat with mb in mailboxes of acc
+                            if name of mb contains "Drafts" then
+                                repeat with d in messages of mb
+                                    set candId to (id of d as text)
+                                    if candId is not in beforeIds then
+                                        set newDraftId to candId
+                                        exit repeat
+                                    end if
+                                end repeat
+                            end if
+                            if newDraftId is not "" then exit repeat
+                        end repeat
+                    end try
+                    if newDraftId is not "" then exit repeat
+                end repeat
+                return newDraftId
+            """
+
+        # Pre-save snapshot for id diffing (only when saving as draft).
+        snapshot_block = ""
+        if not send_now:
+            snapshot_block = """
+                set beforeIds to {}
+                repeat with acc in accounts
+                    try
+                        repeat with mb in mailboxes of acc
+                            if name of mb contains "Drafts" then
+                                repeat with d in messages of mb
+                                    copy (id of d as text) to end of beforeIds
+                                end repeat
+                            end if
+                        end repeat
+                    end try
+                end repeat
+            """
+
+        script = f"""
+        tell application "Mail"
+            {snapshot_block}
+
+            {creation_block}
+
+            {sender_clause}
+            {subject_override}
+            {body_block}
+            {to_block}
+            {cc_block}
+            {bcc_block}
+            {attachment_block}
+
+            {terminal_block}
+        end tell
+        """
+
+        try:
+            result = self._run_applescript(script).strip()
+        except MailAppleScriptError as e:
+            if "SEED_NOT_FOUND" in str(e):
+                raise MailMessageNotFoundError(
+                    f"no message with id {seed_id!r}"
+                ) from e
+            raise
+
+        if send_now:
+            return {"draft_id": "", "sent_message_id": ""}
+        return {"draft_id": result, "sent_message_id": ""}
+
+    def extract_draft_attachments(
+        self,
+        draft_id: str,
+        attachment_names: list[str],
+        dest_dir: Path,
+    ) -> list[Path]:
+        """Save each attachment of a draft to disk.
+
+        Used by ``update_draft`` to preserve attachments through the
+        delete-and-recreate cycle. Mail.app doesn't expose attachment
+        file paths on saved drafts (`file of att` returns an opaque
+        reference), so we extract via the ``save`` AppleScript command.
+
+        Each attachment lands in its own ``<dest_dir>/<i>/`` subdirectory
+        so filename collisions between attachments don't lose data.
+        Original filenames are preserved.
+
+        Args:
+            draft_id: Draft to read attachments from.
+            attachment_names: Filenames (index-aligned with the draft's
+                ``mail attachments`` collection). Caller typically sources
+                these from ``get_draft_state(draft_id)["attachment_names"]``.
+            dest_dir: Existing directory under which subdirectories are
+                created. Caller owns the lifecycle (e.g. tempdir cleanup).
+
+        Returns:
+            Paths of the extracted files, in the same order as
+            ``attachment_names``. Length equals number of attachments
+            actually written; missing entries indicate per-attachment
+            extraction failures.
+
+        Raises:
+            MailDraftInvalidIdError: ``draft_id`` failed validation.
+            MailDraftNotFoundError: no draft with that id exists.
+            FileNotFoundError: ``dest_dir`` does not exist.
+        """
+        _validate_draft_id(draft_id)
+        dest_dir = Path(dest_dir)
+        if not dest_dir.is_dir():
+            raise FileNotFoundError(f"dest_dir does not exist: {dest_dir}")
+        if not attachment_names:
+            return []
+
+        # Pre-create per-attachment subdirectories on the Python side so
+        # the AppleScript only has to do `save att in (POSIX file <path>)`.
+        target_paths: list[Path] = []
+        for i, name in enumerate(attachment_names):
+            subdir = dest_dir / str(i)
+            subdir.mkdir(parents=True, exist_ok=True)
+            target_paths.append(subdir / name)
+
+        targets_safe = ", ".join(
+            f'"{escape_applescript_string(str(p.resolve()))}"'
+            for p in target_paths
+        )
+
+        script = f"""
+        tell application "Mail"
+            set targetId to "{draft_id}"
+            set foundDraft to missing value
+            repeat with acc in accounts
+                try
+                    repeat with mb in mailboxes of acc
+                        if name of mb contains "Drafts" then
+                            repeat with d in messages of mb
+                                if (id of d as text) is targetId then
+                                    set foundDraft to d
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                        if foundDraft is not missing value then exit repeat
+                    end repeat
+                end try
+                if foundDraft is not missing value then exit repeat
+            end repeat
+            if foundDraft is missing value then return "ERR_NOT_FOUND"
+
+            set targetPaths to {{{targets_safe}}}
+            set atts to mail attachments of foundDraft
+            set saved to 0
+            set total to count of atts
+            if total > (count of targetPaths) then set total to (count of targetPaths)
+            repeat with i from 1 to total
+                set a to item i of atts
+                set tp to item i of targetPaths
+                try
+                    save a in (POSIX file tp)
+                    set saved to saved + 1
+                end try
+            end repeat
+            return saved as text
+        end tell
+        """
+
+        result = self._run_applescript(script).strip()
+        if result == "ERR_NOT_FOUND":
+            raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
+
+        # Return only the paths that actually got files written.
+        return [p for p in target_paths if p.is_file()]

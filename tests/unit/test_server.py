@@ -26,14 +26,11 @@ from apple_mail_mcp.exceptions import (
     MailMessageNotFoundError,
 )
 from apple_mail_mcp.server import (
-    _build_forward_summary,
-    _build_send_summary,
     create_mailbox,
     create_rule,
     delete_messages,
     delete_rule,
     delete_template,
-    forward_message,
     get_messages,
     get_template,
     get_thread,
@@ -42,12 +39,9 @@ from apple_mail_mcp.server import (
     list_rules,
     list_templates,
     render_template,
-    reply_to_message,
     save_attachments,
     save_template,
     search_messages,
-    send_email,
-    send_email_with_attachments,
     update_message,
     update_rule,
 )
@@ -1232,126 +1226,6 @@ class TestGetMessages:
 
 
 # ---------------------------------------------------------------------------
-# 4. send_email
-# ---------------------------------------------------------------------------
-
-
-class TestSendEmail:
-    async def test_success_logs_and_returns_details(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-    ) -> None:
-        mock_mail.send_email.return_value = True
-
-        result = await send_email(
-            subject="Hi",
-            body="hello",
-            to=["a@example.com"],
-            cc=["b@example.com"],
-        )
-
-        assert result["success"] is True
-        assert result["details"]["recipients"] == 2
-        mock_mail.send_email.assert_called_once()
-        assert mock_logger.log_operation.call_args.args[2] == "success"
-
-    async def test_validation_failure_no_send(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-    ) -> None:
-        result = await send_email(subject="Hi", body="b", to=[])
-
-        assert result["success"] is False
-        assert result["error_type"] == "validation_error"
-        mock_mail.send_email.assert_not_called()
-        mock_logger.log_operation.assert_not_called()
-
-    async def test_elicitation_declined_logs_cancelled(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-        mock_ctx_decline: MagicMock,
-    ) -> None:
-        result = await send_email(
-            subject="Hi", body="b", to=["a@example.com"], ctx=mock_ctx_decline
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "cancelled"
-        mock_mail.send_email.assert_not_called()
-        mock_logger.log_operation.assert_called_once()
-        assert mock_logger.log_operation.call_args.args[2] == "cancelled"
-
-    async def test_applescript_error_maps_to_send_error(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-    ) -> None:
-        mock_mail.send_email.side_effect = MailAppleScriptError("fail")
-
-        result = await send_email(
-            subject="Hi", body="b", to=["a@example.com"]
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "send_error"
-        mock_logger.log_operation.assert_called_once()
-        assert mock_logger.log_operation.call_args.args[2] == "failure"
-
-    async def test_unexpected_exception_maps_to_unknown(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-    ) -> None:
-        mock_mail.send_email.side_effect = RuntimeError("boom")
-
-        result = await send_email(
-            subject="Hi", body="b", to=["a@example.com"]
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "unknown"
-
-    # ---- from_account (#155) --------------------------------------------
-
-    async def test_from_account_passes_through_to_connector(
-        self, mock_mail: MagicMock
-    ) -> None:
-        mock_mail.send_email.return_value = True
-
-        await send_email(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            from_account="iCloud",
-        )
-
-        kwargs = mock_mail.send_email.call_args.kwargs
-        assert kwargs["from_account"] == "iCloud"
-
-    async def test_from_account_not_found_returns_typed_error(
-        self, mock_mail: MagicMock
-    ) -> None:
-        from apple_mail_mcp.exceptions import MailAccountNotFoundError
-
-        mock_mail.send_email.side_effect = MailAccountNotFoundError(
-            "Account 'Bogus' not found"
-        )
-
-        result = await send_email(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            from_account="Bogus",
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "account_not_found"
-
-
-# ---------------------------------------------------------------------------
 # 5. update_message — patch tool replacing mark_as_read + move_messages + flag_message (#135)
 # ---------------------------------------------------------------------------
 
@@ -1594,195 +1468,6 @@ class TestUpdateMessage:
 
         assert result["success"] is False
         assert result["error_type"] == "unknown"
-
-
-# ---------------------------------------------------------------------------
-# 6. send_email_with_attachments
-# ---------------------------------------------------------------------------
-
-
-class TestSendEmailWithAttachments:
-    async def test_success_returns_attachment_count(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-        tmp_path: Any,
-    ) -> None:
-        att = tmp_path / "report.pdf"
-        att.write_bytes(b"pdf")
-        mock_mail.send_email_with_attachments.return_value = True
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(att)],
-        )
-
-        assert result["success"] is True
-        assert result["details"]["attachments"] == 1
-        mock_mail.send_email_with_attachments.assert_called_once()
-        assert mock_logger.log_operation.call_args.args[2] == "success"
-
-    async def test_validation_failure_short_circuits(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-    ) -> None:
-        result = await send_email_with_attachments(
-            subject="Hi", body="b", to=[], attachments=[]
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "validation_error"
-        mock_mail.send_email_with_attachments.assert_not_called()
-
-    async def test_missing_attachment_file(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-        tmp_path: Any,
-    ) -> None:
-        missing = tmp_path / "nope.pdf"
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(missing)],
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "file_not_found"
-        mock_mail.send_email_with_attachments.assert_not_called()
-
-    async def test_elicitation_declined_logs_cancelled(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-        mock_ctx_decline: MagicMock,
-        tmp_path: Any,
-    ) -> None:
-        att = tmp_path / "r.pdf"
-        att.write_bytes(b"x")
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(att)],
-            ctx=mock_ctx_decline,
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "cancelled"
-        mock_mail.send_email_with_attachments.assert_not_called()
-        mock_logger.log_operation.assert_called_once()
-        assert mock_logger.log_operation.call_args.args[2] == "cancelled"
-
-    async def test_connector_value_error_maps_to_validation_error(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-        tmp_path: Any,
-    ) -> None:
-        att = tmp_path / "r.pdf"
-        att.write_bytes(b"x")
-        mock_mail.send_email_with_attachments.side_effect = ValueError("bad size")
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(att)],
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "validation_error"
-        assert mock_logger.log_operation.call_args.args[2] == "failure"
-
-    async def test_applescript_error_maps_to_send_error(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-        tmp_path: Any,
-    ) -> None:
-        att = tmp_path / "r.pdf"
-        att.write_bytes(b"x")
-        mock_mail.send_email_with_attachments.side_effect = MailAppleScriptError("fail")
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(att)],
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "send_error"
-        assert mock_logger.log_operation.call_args.args[2] == "failure"
-
-    async def test_unexpected_exception_maps_to_unknown(
-        self,
-        mock_mail: MagicMock,
-        mock_logger: MagicMock,
-        tmp_path: Any,
-    ) -> None:
-        att = tmp_path / "r.pdf"
-        att.write_bytes(b"x")
-        mock_mail.send_email_with_attachments.side_effect = RuntimeError("boom")
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(att)],
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "unknown"
-
-    # ---- from_account (#155) --------------------------------------------
-
-    async def test_from_account_passes_through_to_connector(
-        self, mock_mail: MagicMock, tmp_path: Any
-    ) -> None:
-        att = tmp_path / "r.pdf"
-        att.write_bytes(b"x")
-        mock_mail.send_email_with_attachments.return_value = True
-
-        await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(att)],
-            from_account="iCloud",
-        )
-
-        kwargs = mock_mail.send_email_with_attachments.call_args.kwargs
-        assert kwargs["from_account"] == "iCloud"
-
-    async def test_from_account_not_found_returns_typed_error(
-        self, mock_mail: MagicMock, tmp_path: Any
-    ) -> None:
-        from apple_mail_mcp.exceptions import MailAccountNotFoundError
-
-        att = tmp_path / "r.pdf"
-        att.write_bytes(b"x")
-        mock_mail.send_email_with_attachments.side_effect = (
-            MailAccountNotFoundError("Account 'Bogus' not found")
-        )
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["a@example.com"],
-            attachments=[str(att)],
-            from_account="Bogus",
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "account_not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -2070,164 +1755,6 @@ class TestDeleteMessages:
 
 
 # ---------------------------------------------------------------------------
-# 13. reply_to_message
-# ---------------------------------------------------------------------------
-
-
-class TestReplyToMessage:
-    def test_success(self, mock_mail: MagicMock) -> None:
-        mock_mail.reply_to_message.return_value = "reply-42"
-
-        result = reply_to_message("1", "thanks", reply_all=True)
-
-        assert result["success"] is True
-        assert result["reply_id"] == "reply-42"
-        assert result["original_message_id"] == "1"
-        assert result["reply_all"] is True
-        mock_mail.reply_to_message.assert_called_once_with(
-            message_id="1", body="thanks", reply_all=True, from_account=None
-        )
-
-    def test_message_not_found(self, mock_mail: MagicMock) -> None:
-        mock_mail.reply_to_message.side_effect = MailMessageNotFoundError("x")
-
-        result = reply_to_message("999", "hi")
-
-        assert result["success"] is False
-        assert result["error_type"] == "message_not_found"
-        assert "999" in result["error"]
-
-    def test_unexpected_exception_maps_to_unknown(self, mock_mail: MagicMock) -> None:
-        mock_mail.reply_to_message.side_effect = RuntimeError("boom")
-
-        result = reply_to_message("1", "hi")
-
-        assert result["success"] is False
-        assert result["error_type"] == "unknown"
-
-    # ---- from_account (#155) --------------------------------------------
-
-    def test_from_account_passes_through_to_connector(
-        self, mock_mail: MagicMock
-    ) -> None:
-        mock_mail.reply_to_message.return_value = "reply-1"
-
-        reply_to_message("1", "thanks", from_account="iCloud")
-
-        kwargs = mock_mail.reply_to_message.call_args.kwargs
-        assert kwargs["from_account"] == "iCloud"
-
-    def test_from_account_not_found_returns_typed_error(
-        self, mock_mail: MagicMock
-    ) -> None:
-        from apple_mail_mcp.exceptions import MailAccountNotFoundError
-
-        mock_mail.reply_to_message.side_effect = MailAccountNotFoundError(
-            "Account 'Bogus' not found"
-        )
-
-        result = reply_to_message("1", "hi", from_account="Bogus")
-
-        assert result["success"] is False
-        assert result["error_type"] == "account_not_found"
-
-
-# ---------------------------------------------------------------------------
-# 14. forward_message
-# ---------------------------------------------------------------------------
-
-
-class TestForwardMessage:
-    async def test_success(self, mock_mail: MagicMock) -> None:
-        mock_mail.forward_message.return_value = "fwd-7"
-
-        result = await forward_message(
-            "1",
-            to=["c@example.com"],
-            body="fyi",
-            cc=["d@example.com"],
-        )
-
-        assert result["success"] is True
-        assert result["forward_id"] == "fwd-7"
-        assert result["original_message_id"] == "1"
-        assert result["recipients"] == ["c@example.com"]
-        assert result["cc"] == ["d@example.com"]
-
-    async def test_empty_to_validation_error(self, mock_mail: MagicMock) -> None:
-        result = await forward_message("1", to=[])
-
-        assert result["success"] is False
-        assert result["error_type"] == "validation_error"
-        mock_mail.forward_message.assert_not_called()
-
-    async def test_elicitation_declined_cancels(
-        self, mock_mail: MagicMock, mock_ctx_decline: MagicMock
-    ) -> None:
-        result = await forward_message("1", to=["c@example.com"], ctx=mock_ctx_decline)
-
-        assert result["success"] is False
-        assert result["error_type"] == "cancelled"
-        mock_mail.forward_message.assert_not_called()
-
-    async def test_message_not_found(self, mock_mail: MagicMock) -> None:
-        mock_mail.forward_message.side_effect = MailMessageNotFoundError("x")
-
-        result = await forward_message("999", to=["c@example.com"])
-
-        assert result["success"] is False
-        assert result["error_type"] == "message_not_found"
-
-    async def test_value_error_from_connector(self, mock_mail: MagicMock) -> None:
-        mock_mail.forward_message.side_effect = ValueError("bad")
-
-        result = await forward_message("1", to=["c@example.com"])
-
-        assert result["success"] is False
-        assert result["error_type"] == "validation_error"
-
-    async def test_unexpected_exception_maps_to_unknown(self, mock_mail: MagicMock) -> None:
-        mock_mail.forward_message.side_effect = RuntimeError("boom")
-
-        result = await forward_message("1", to=["c@example.com"])
-
-        assert result["success"] is False
-        assert result["error_type"] == "unknown"
-
-    # ---- from_account (#155) --------------------------------------------
-
-    async def test_from_account_passes_through_to_connector(
-        self, mock_mail: MagicMock
-    ) -> None:
-        mock_mail.forward_message.return_value = "fwd-1"
-
-        await forward_message(
-            "1",
-            to=["c@example.com"],
-            from_account="iCloud",
-        )
-
-        kwargs = mock_mail.forward_message.call_args.kwargs
-        assert kwargs["from_account"] == "iCloud"
-
-    async def test_from_account_not_found_returns_typed_error(
-        self, mock_mail: MagicMock
-    ) -> None:
-        from apple_mail_mcp.exceptions import MailAccountNotFoundError
-
-        mock_mail.forward_message.side_effect = MailAccountNotFoundError(
-            "Account 'Bogus' not found"
-        )
-
-        result = await forward_message(
-            "1", to=["c@example.com"], from_account="Bogus"
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "account_not_found"
-
-
-# ---------------------------------------------------------------------------
 # Rate limiting integration tests
 # ---------------------------------------------------------------------------
 
@@ -2244,322 +1771,6 @@ def tight_limits() -> Any:
     })
     yield
     sec.TIER_LIMITS.update(original)
-
-
-class TestRateLimitingIntegration:
-    """Verify rate limiting fires before connector calls in each tool."""
-
-    def test_cheap_read_rate_limited(
-        self, mock_mail: MagicMock, tight_limits: Any
-    ) -> None:
-        mock_mail.list_mailboxes.return_value = []
-
-        list_mailboxes("Gmail")
-        list_mailboxes("Gmail")
-        result = list_mailboxes("Gmail")
-
-        assert result["success"] is False
-        assert result["error_type"] == "rate_limited"
-        assert mock_mail.list_mailboxes.call_count == 2
-
-    def test_expensive_op_rate_limited(
-        self, mock_mail: MagicMock, tight_limits: Any
-    ) -> None:
-        mock_mail.search_messages.return_value = []
-
-        search_messages("Gmail")
-        search_messages("Gmail")
-        result = search_messages("Gmail")
-
-        assert result["success"] is False
-        assert result["error_type"] == "rate_limited"
-        assert mock_mail.search_messages.call_count == 2
-
-    async def test_sends_rate_limited(
-        self, mock_mail: MagicMock, tight_limits: Any
-    ) -> None:
-        mock_mail.send_email.return_value = True
-
-        await send_email(subject="a", body="b", to=["x@example.com"])
-        await send_email(subject="a", body="b", to=["x@example.com"])
-        result = await send_email(subject="a", body="b", to=["x@example.com"])
-
-        assert result["success"] is False
-        assert result["error_type"] == "rate_limited"
-        assert mock_mail.send_email.call_count == 2
-
-    def test_rate_limit_fires_before_connector(
-        self, mock_mail: MagicMock, tight_limits: Any
-    ) -> None:
-        """Prove the connector is never called once rate-limited."""
-        mock_mail.get_message.return_value = {"id": "1"}
-
-        get_messages(["1"])
-        get_messages(["1"])
-        result = get_messages(["1"])
-
-        assert result["error_type"] == "rate_limited"
-        assert mock_mail.get_message.call_count == 2
-
-    async def test_tiers_are_independent_in_server(
-        self, mock_mail: MagicMock, tight_limits: Any
-    ) -> None:
-        mock_mail.send_email.return_value = True
-        mock_mail.list_mailboxes.return_value = []
-
-        await send_email(subject="a", body="b", to=["x@example.com"])
-        await send_email(subject="a", body="b", to=["x@example.com"])
-
-        result = list_mailboxes("Gmail")
-        assert result["success"] is True
-
-
-# ---------------------------------------------------------------------------
-# Elicitation / confirmation tests
-# ---------------------------------------------------------------------------
-
-
-class TestBuildSendSummary:
-    def test_basic_summary(self) -> None:
-        result = _build_send_summary("Hi", ["a@example.com"], None, None, "body")
-        assert "Send this email?" in result
-        assert "To: a@example.com" in result
-        assert "Subject: Hi" in result
-        assert "body" in result
-
-    def test_includes_cc_bcc(self) -> None:
-        result = _build_send_summary(
-            "Hi", ["a@example.com"], ["b@example.com"], ["c@example.com"], "x"
-        )
-        assert "CC: b@example.com" in result
-        assert "BCC: c@example.com" in result
-
-    def test_truncates_long_body(self) -> None:
-        long_body = "x" * 300
-        result = _build_send_summary("Hi", ["a@example.com"], None, None, long_body)
-        assert "..." in result
-        assert len(result) < 400
-
-
-class TestBuildForwardSummary:
-    def test_basic_summary(self) -> None:
-        result = _build_forward_summary("msg-1", ["a@example.com"], None, None, "fyi")
-        assert "Forward this message?" in result
-        assert "msg-1" in result
-        assert "To: a@example.com" in result
-        assert "fyi" in result
-
-
-class TestElicitationFlow:
-    async def test_send_email_with_accepted_ctx(
-        self, mock_mail: MagicMock, mock_ctx_accept: MagicMock
-    ) -> None:
-        mock_mail.send_email.return_value = True
-
-        result = await send_email(
-            subject="Hi", body="b", to=["a@example.com"], ctx=mock_ctx_accept
-        )
-
-        assert result["success"] is True
-        mock_ctx_accept.elicit.assert_awaited_once()
-        mock_mail.send_email.assert_called_once()
-
-    async def test_send_email_without_ctx_skips_elicitation(
-        self, mock_mail: MagicMock
-    ) -> None:
-        mock_mail.send_email.return_value = True
-
-        result = await send_email(
-            subject="Hi", body="b", to=["a@example.com"], ctx=None
-        )
-
-        assert result["success"] is True
-        mock_mail.send_email.assert_called_once()
-
-    async def test_forward_with_accepted_ctx(
-        self, mock_mail: MagicMock, mock_ctx_accept: MagicMock
-    ) -> None:
-        mock_mail.forward_message.return_value = "fwd-1"
-
-        result = await forward_message(
-            "1", to=["a@example.com"], ctx=mock_ctx_accept
-        )
-
-        assert result["success"] is True
-        mock_ctx_accept.elicit.assert_awaited_once()
-
-    async def test_elicitation_exception_falls_open(
-        self, mock_mail: MagicMock
-    ) -> None:
-        ctx = MagicMock()
-        ctx.elicit = AsyncMock(side_effect=RuntimeError("unsupported"))
-        mock_mail.send_email.return_value = True
-
-        result = await send_email(
-            subject="Hi", body="b", to=["a@example.com"], ctx=ctx
-        )
-
-        assert result["success"] is True
-        mock_mail.send_email.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Test-mode safety gate (MAIL_TEST_MODE)
-# ---------------------------------------------------------------------------
-
-
-class TestSafetyGate:
-    """Verify test-mode safety gate fires before other checks in each tool."""
-
-    async def test_send_email_blocked_by_real_recipient(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-
-        result = await send_email(
-            subject="Hi", body="b", to=["real@person.com"]
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.send_email.assert_not_called()
-
-    async def test_send_email_allowed_with_reserved_recipient(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        mock_mail.send_email.return_value = True
-
-        result = await send_email(
-            subject="Hi", body="b", to=["test@example.com"]
-        )
-
-        assert result["success"] is True
-
-    async def test_send_email_with_attachments_blocked_by_real_recipient(
-        self, mock_mail: MagicMock, monkeypatch: Any, tmp_path: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        att = tmp_path / "a.pdf"
-        att.write_bytes(b"x")
-
-        result = await send_email_with_attachments(
-            subject="Hi",
-            body="b",
-            to=["real@person.com"],
-            attachments=[str(att)],
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.send_email_with_attachments.assert_not_called()
-
-    async def test_forward_message_blocked_by_real_recipient(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-
-        result = await forward_message("1", to=["real@person.com"])
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.forward_message.assert_not_called()
-
-    def test_reply_to_message_blocked_entirely(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-
-        result = reply_to_message("1", "hi")
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.reply_to_message.assert_not_called()
-
-    def test_list_mailboxes_blocked_by_wrong_account(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-
-        result = list_mailboxes("Gmail")
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.list_mailboxes.assert_not_called()
-
-    def test_list_mailboxes_allowed_with_test_account(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-        mock_mail.list_mailboxes.return_value = []
-
-        result = list_mailboxes("TestAccount")
-
-        assert result["success"] is True
-
-    def test_search_messages_blocked_by_wrong_account(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-
-        result = search_messages("Gmail")
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.search_messages.assert_not_called()
-
-    def test_update_message_blocked_by_wrong_account(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        """update_message gates on account when set (e.g., for moves)."""
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-
-        result = update_message(
-            ["1"], destination_mailbox="Archive", account="Gmail"
-        )
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.update_message.assert_not_called()
-
-    def test_create_mailbox_blocked_by_wrong_account(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-
-        result = create_mailbox("Gmail", "NewBox")
-
-        assert result["success"] is False
-        assert result["error_type"] == "safety_violation"
-        mock_mail.create_mailbox.assert_not_called()
-
-    def test_safety_fires_before_rate_limit(
-        self, mock_mail: MagicMock, monkeypatch: Any, tight_limits: Any
-    ) -> None:
-        """When both tight rate limits and bad account, safety error wins."""
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-
-        result = list_mailboxes("Gmail")
-
-        assert result["error_type"] == "safety_violation"
-        mock_mail.list_mailboxes.assert_not_called()
-
-    def test_non_test_mode_production_unaffected(
-        self, mock_mail: MagicMock, monkeypatch: Any
-    ) -> None:
-        """Without MAIL_TEST_MODE, all operations work normally."""
-        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
-        mock_mail.list_mailboxes.return_value = []
-
-        result = list_mailboxes("Gmail")
-
-        assert result["success"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2784,3 +1995,1088 @@ class TestRenderTemplate:
         result = render_template(name="never-existed")
         assert result["success"] is False
         assert result["error_type"] == "template_not_found"
+
+
+# ---------------------------------------------------------------------------
+# create_draft / update_draft / delete_draft (drafts lifecycle, #134)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_drafts(monkeypatch: Any, tmp_path: Any) -> Any:
+    """Point ~/.apple_mail_mcp/drafts/ at a tmp dir for the test."""
+    monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+    return tmp_path
+
+
+class TestCreateDraftTool:
+    @pytest.fixture(autouse=True)
+    def stub_security(self, monkeypatch: Any) -> None:
+        # Default: safety + rate-limit pass; recipient-validation passes.
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_test_mode_safety",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_rate_limit",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.validate_send_operation",
+            lambda *a, **kw: (True, None),
+        )
+
+    @pytest.mark.asyncio
+    async def test_save_fresh_draft_returns_id(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161055", "sent_message_id": ""
+        }
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x"
+        )
+        assert result["success"] is True
+        assert result["draft_id"] == "161055"
+        mock_mail.create_draft.assert_called_once()
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "new"
+        assert kwargs["seed_id"] is None
+        assert kwargs["send_now"] is False
+
+    @pytest.mark.asyncio
+    async def test_reply_to_routes_to_reply_seed(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161056", "sent_message_id": ""
+        }
+        result = await create_draft(reply_to="160989", body="thanks")
+        assert result["success"] is True
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "reply"
+        assert kwargs["seed_id"] == "160989"
+
+    @pytest.mark.asyncio
+    async def test_forward_of_routes_to_forward_seed(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161057", "sent_message_id": ""
+        }
+        result = await create_draft(
+            forward_of="160989", to=["x@example.com"], body="fyi"
+        )
+        assert result["success"] is True
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "forward"
+        assert kwargs["seed_id"] == "160989"
+
+    @pytest.mark.asyncio
+    async def test_mutually_exclusive_seeds_rejected(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        result = await create_draft(reply_to="1", forward_of="2")
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_template_vars_without_template_name_rejected(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        result = await create_draft(template_vars={"x": "y"})
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+
+    @pytest.mark.asyncio
+    async def test_fresh_seed_requires_to(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        result = await create_draft(subject="hi", body="x")
+        assert result["success"] is False
+        assert "'to'" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_fresh_seed_requires_subject(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        result = await create_draft(to=["a@example.com"], body="x")
+        assert result["success"] is False
+        assert "'subject'" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_send_now_elicits_and_sends(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            send_now=True, ctx=mock_ctx_accept,
+        )
+        assert result["success"] is True
+        mock_ctx_accept.elicit.assert_awaited_once()
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["send_now"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_now_declined_blocks_send(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        mock_ctx_decline: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            send_now=True, ctx=mock_ctx_decline,
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "cancelled"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_draft_state_persisted_for_reply_seed(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.drafts import DraftStateStore
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161056", "sent_message_id": ""
+        }
+        await create_draft(reply_to="160989", body="thanks", reply_all=True)
+        store = DraftStateStore()
+        seed = store.get_seed("161056")
+        assert seed is not None
+        assert seed.seed_kind == "reply"
+        assert seed.seed_id == "160989"
+        assert seed.reply_all is True
+
+    @pytest.mark.asyncio
+    async def test_draft_state_not_persisted_for_send_now(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.drafts import DraftStateStore
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
+        await create_draft(
+            reply_to="160989", body="thanks", send_now=True,
+            ctx=mock_ctx_accept,
+        )
+        store = DraftStateStore()
+        # send_now=True returns empty draft_id, nothing to persist.
+        # Sanity: nothing in state dir.
+        assert list(store.root.iterdir()) == [] if store.root.is_dir() else True
+
+
+class TestUpdateDraftTool:
+    @pytest.fixture(autouse=True)
+    def stub_security(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_test_mode_safety",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_rate_limit",
+            lambda *a, **kw: None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_uses_disk_seed_state(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+        from apple_mail_mcp.server import update_draft
+
+        store = DraftStateStore()
+        store.set_seed(
+            "160991",
+            SeedRecord(seed_kind="reply", seed_id="160000", reply_all=True),
+        )
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "Re: hello", "body": "old body",
+            "in_reply_to": "<orig@x>", "references": "<orig@x>",
+            "attachment_names": [],
+        }
+        mock_mail.delete_draft.return_value = True
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+
+        result = await update_draft(draft_id="160991", body="new body")
+        assert result["success"] is True
+        assert result["draft_id"] == "161000"
+        # Disk state used directly, no fallback lookup.
+        mock_mail.find_message_by_message_id.assert_not_called()
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "reply"
+        assert kwargs["seed_id"] == "160000"
+        assert kwargs["reply_all"] is True
+        assert kwargs["body"] == "new body"
+        # Recipients preserved from existing state.
+        assert kwargs["to"] == ["alice@example.com"]
+
+    @pytest.mark.asyncio
+    async def test_update_falls_back_to_in_reply_to(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        # No disk state. Must fall back to In-Reply-To header lookup.
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "Re: hi", "body": "",
+            "in_reply_to": "<orig@x>", "references": "<orig@x>",
+            "attachment_names": [],
+        }
+        mock_mail.find_message_by_message_id.return_value = "999000"
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+
+        result = await update_draft(draft_id="160991", body="patched")
+        assert result["success"] is True
+        mock_mail.find_message_by_message_id.assert_called_once_with(
+            "<orig@x>"
+        )
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "reply"
+        assert kwargs["seed_id"] == "999000"
+
+    @pytest.mark.asyncio
+    async def test_update_treats_as_fresh_when_no_seed(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "fresh", "body": "old",
+            "in_reply_to": "", "references": "",
+            "attachment_names": [],
+        }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+
+        result = await update_draft(draft_id="160991", body="new")
+        assert result["success"] is True
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "new"
+        assert kwargs["seed_id"] is None
+        # Fallback NOT called when there's no In-Reply-To.
+        mock_mail.find_message_by_message_id.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_preserves_attachments_when_paths_none(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["a@example.com"], "cc": [], "bcc": [],
+            "subject": "hi", "body": "x",
+            "in_reply_to": "", "references": "",
+            "attachment_names": ["report.pdf"],
+        }
+        # Mock the extraction to return a fake path; verify update_draft
+        # passes that path through to create_draft.
+        fake_path = tmp_path / "extracted.pdf"
+        fake_path.write_bytes(b"%PDF")
+        mock_mail.extract_draft_attachments.return_value = [fake_path]
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+
+        result = await update_draft(draft_id="160991", body="patched")
+        assert result["success"] is True
+        mock_mail.extract_draft_attachments.assert_called_once()
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["attachment_paths"] == [fake_path]
+
+    @pytest.mark.asyncio
+    async def test_update_clears_attachments_when_empty_list(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["a@example.com"], "cc": [], "bcc": [],
+            "subject": "hi", "body": "x",
+            "in_reply_to": "", "references": "",
+            "attachment_names": ["report.pdf"],
+        }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+
+        result = await update_draft(draft_id="160991", attachment_paths=[])
+        assert result["success"] is True
+        # Existing attachments NOT extracted (caller cleared explicitly).
+        mock_mail.extract_draft_attachments.assert_not_called()
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["attachment_paths"] == []
+
+    @pytest.mark.asyncio
+    async def test_update_returns_new_draft_id(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["a@example.com"], "cc": [], "bcc": [],
+            "subject": "hi", "body": "x",
+            "in_reply_to": "", "references": "",
+            "attachment_names": [],
+        }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "999999", "sent_message_id": ""
+        }
+
+        result = await update_draft(draft_id="160991", body="new")
+        # Critical contract: the returned draft_id is the NEW one.
+        assert result["draft_id"] == "999999"
+        assert result["draft_id"] != "160991"
+
+    @pytest.mark.asyncio
+    async def test_update_send_now_elicits(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["a@example.com"], "cc": [], "bcc": [],
+            "subject": "hi", "body": "x",
+            "in_reply_to": "", "references": "",
+            "attachment_names": [],
+        }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
+
+        result = await update_draft(
+            draft_id="160991", send_now=True, ctx=mock_ctx_accept
+        )
+        assert result["success"] is True
+        mock_ctx_accept.elicit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_update_persists_new_seed_state(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+        from apple_mail_mcp.server import update_draft
+
+        store = DraftStateStore()
+        store.set_seed(
+            "160991",
+            SeedRecord(seed_kind="reply", seed_id="160000", reply_all=False),
+        )
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991",
+            "to": ["a@example.com"], "cc": [], "bcc": [],
+            "subject": "Re: x", "body": "",
+            "in_reply_to": "<orig@x>", "references": "<orig@x>",
+            "attachment_names": [],
+        }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "999999", "sent_message_id": ""
+        }
+
+        await update_draft(draft_id="160991", body="patched")
+        # Old draft's state cleared, new draft's state persisted under
+        # the new id.
+        assert store.get_seed("160991") is None
+        new_seed = store.get_seed("999999")
+        assert new_seed is not None
+        assert new_seed.seed_id == "160000"
+
+    @pytest.mark.asyncio
+    async def test_update_template_vars_without_template_name_rejected(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        result = await update_draft(
+            draft_id="160991", template_vars={"x": "y"}
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        mock_mail.get_draft_state.assert_not_called()
+
+
+class TestDeleteDraftTool:
+    def test_success(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import delete_draft
+
+        mock_mail.delete_draft.return_value = True
+        result = delete_draft(draft_id="160991")
+        assert result["success"] is True
+        assert result["draft_id"] == "160991"
+        mock_mail.delete_draft.assert_called_once_with("160991")
+
+    def test_clears_disk_state(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+        from apple_mail_mcp.server import delete_draft
+
+        store = DraftStateStore()
+        store.set_seed(
+            "160991",
+            SeedRecord(seed_kind="forward", seed_id="999"),
+        )
+        assert store.get_seed("160991") is not None
+
+        mock_mail.delete_draft.return_value = True
+        delete_draft(draft_id="160991")
+        assert store.get_seed("160991") is None
+
+    def test_not_found_returns_typed_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+        from apple_mail_mcp.server import delete_draft
+
+        mock_mail.delete_draft.side_effect = MailDraftNotFoundError(
+            "no draft with id '999'"
+        )
+        result = delete_draft(draft_id="999")
+        assert result["success"] is False
+        assert result["error_type"] == "draft_not_found"
+
+    def test_invalid_id_returns_typed_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailDraftInvalidIdError
+        from apple_mail_mcp.server import delete_draft
+
+        mock_mail.delete_draft.side_effect = MailDraftInvalidIdError(
+            "draft_id '../escape' must match ..."
+        )
+        result = delete_draft(draft_id="../escape")
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_draft_id"
+
+
+class TestDraftToolErrorPaths:
+    """Coverage for the error-handling branches of all three draft tools.
+
+    These are tedious but each one corresponds to a real
+    response-shape contract that callers depend on for branching
+    (account_not_found vs file_not_found vs unknown, etc.)."""
+
+    @pytest.fixture(autouse=True)
+    def stub_security(self, monkeypatch: Any) -> None:
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_test_mode_safety",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_rate_limit",
+            lambda *a, **kw: None,
+        )
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.validate_send_operation",
+            lambda *a, **kw: (True, None),
+        )
+
+    # ------------------------------------------------------------------
+    # create_draft
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_create_draft_seed_not_found(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.side_effect = MailMessageNotFoundError(
+            "no message"
+        )
+        result = await create_draft(reply_to="999", body="x")
+        assert result["error_type"] == "message_not_found"
+
+    @pytest.mark.asyncio
+    async def test_create_draft_account_not_found(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.side_effect = MailAccountNotFoundError(
+            "no account 'Bogus'"
+        )
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            from_account="Bogus",
+        )
+        assert result["error_type"] == "account_not_found"
+
+    @pytest.mark.asyncio
+    async def test_create_draft_file_not_found(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.side_effect = FileNotFoundError(
+            "attachment missing"
+        )
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            attachment_paths=["/nonexistent/x.pdf"],
+        )
+        assert result["error_type"] == "file_not_found"
+
+    @pytest.mark.asyncio
+    async def test_create_draft_applescript_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.side_effect = MailAppleScriptError(
+            "osascript failed"
+        )
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x"
+        )
+        assert result["error_type"] == "applescript_error"
+
+    @pytest.mark.asyncio
+    async def test_create_draft_unknown_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        mock_mail.create_draft.side_effect = RuntimeError("boom")
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x"
+        )
+        assert result["error_type"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_create_draft_template_error_returns_typed(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        # No template stored at this name → template_not_found.
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            template_name="never-existed",
+        )
+        assert result["error_type"] == "template_not_found"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_draft_send_now_safety_gate_blocks(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        monkeypatch: Any,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_test_mode_safety",
+            lambda *a, **kw: {
+                "success": False, "error": "blocked",
+                "error_type": "safety_violation",
+            },
+        )
+        result = await create_draft(
+            to=["real@example.com"], subject="hi", body="x",
+            send_now=True, ctx=mock_ctx_accept,
+        )
+        assert result["error_type"] == "safety_violation"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_draft_send_now_rate_limit_blocks(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        monkeypatch: Any,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_rate_limit",
+            lambda *a, **kw: {
+                "success": False, "error": "rate-limited",
+                "error_type": "rate_limit",
+            },
+        )
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            send_now=True, ctx=mock_ctx_accept,
+        )
+        assert result["error_type"] == "rate_limit"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_draft_send_now_validation_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        monkeypatch: Any,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.validate_send_operation",
+            lambda *a, **kw: (False, "too many recipients"),
+        )
+        result = await create_draft(
+            to=["a@example.com"], subject="hi", body="x",
+            send_now=True, ctx=mock_ctx_accept,
+        )
+        assert result["error_type"] == "validation_error"
+        mock_mail.create_draft.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # update_draft
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_update_draft_not_found(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.side_effect = MailDraftNotFoundError(
+            "no draft"
+        )
+        result = await update_draft(draft_id="160991", body="x")
+        assert result["error_type"] == "draft_not_found"
+
+    @pytest.mark.asyncio
+    async def test_update_draft_template_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": [], "cc": [], "bcc": [],
+            "subject": "", "body": "", "in_reply_to": "",
+            "references": "", "attachment_names": [],
+        }
+        result = await update_draft(
+            draft_id="160991", template_name="never-existed"
+        )
+        assert result["error_type"] == "template_not_found"
+
+    @pytest.mark.asyncio
+    async def test_update_draft_send_now_safety_gate_blocks(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        monkeypatch: Any,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": ["real@gmail.com"],
+            "cc": [], "bcc": [], "subject": "x", "body": "y",
+            "in_reply_to": "", "references": "", "attachment_names": [],
+        }
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_test_mode_safety",
+            lambda *a, **kw: {
+                "success": False, "error": "blocked",
+                "error_type": "safety_violation",
+            },
+        )
+        result = await update_draft(
+            draft_id="160991", send_now=True, ctx=mock_ctx_accept
+        )
+        assert result["error_type"] == "safety_violation"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_draft_send_now_rate_limit_blocks(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        monkeypatch: Any,
+        mock_ctx_accept: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": ["a@example.com"],
+            "cc": [], "bcc": [], "subject": "x", "body": "y",
+            "in_reply_to": "", "references": "", "attachment_names": [],
+        }
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.check_rate_limit",
+            lambda *a, **kw: {
+                "success": False, "error": "limit",
+                "error_type": "rate_limit",
+            },
+        )
+        result = await update_draft(
+            draft_id="160991", send_now=True, ctx=mock_ctx_accept
+        )
+        assert result["error_type"] == "rate_limit"
+
+    @pytest.mark.asyncio
+    async def test_update_draft_send_now_declined(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        mock_ctx_decline: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": ["a@example.com"],
+            "cc": [], "bcc": [], "subject": "x", "body": "y",
+            "in_reply_to": "", "references": "", "attachment_names": [],
+        }
+        result = await update_draft(
+            draft_id="160991", send_now=True, ctx=mock_ctx_decline
+        )
+        assert result["error_type"] == "cancelled"
+        mock_mail.delete_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_draft_applescript_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": [], "cc": [], "bcc": [],
+            "subject": "", "body": "", "in_reply_to": "",
+            "references": "", "attachment_names": [],
+        }
+        mock_mail.create_draft.side_effect = MailAppleScriptError("boom")
+        result = await update_draft(draft_id="160991", body="x")
+        assert result["error_type"] == "applescript_error"
+
+    @pytest.mark.asyncio
+    async def test_update_draft_unknown_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.side_effect = RuntimeError("boom")
+        result = await update_draft(draft_id="160991", body="x")
+        assert result["error_type"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_update_draft_tempdir_cleaned_up(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        tmp_path: Any,
+        monkeypatch: Any,
+    ) -> None:
+        """When extraction populates tempdir, it must be cleaned up
+        even on a downstream failure."""
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": ["a@example.com"],
+            "cc": [], "bcc": [], "subject": "x", "body": "y",
+            "in_reply_to": "", "references": "",
+            "attachment_names": ["report.pdf"],
+        }
+        # Track which tempdirs get created so we can verify cleanup.
+        created_dirs: list[str] = []
+        original = __import__("tempfile").TemporaryDirectory
+
+        def tracking_tempdir(*args: Any, **kwargs: Any) -> Any:
+            td = original(*args, **kwargs)
+            created_dirs.append(td.name)
+            return td
+
+        monkeypatch.setattr(
+            "apple_mail_mcp.server.tempfile.TemporaryDirectory",
+            tracking_tempdir,
+        )
+
+        # Have extract create a real file so the path is non-empty.
+        from pathlib import Path
+
+        def fake_extract(
+            draft_id: str, names: list[str], dest: Path
+        ) -> list[Path]:
+            (dest / "0").mkdir(parents=True, exist_ok=True)
+            p = dest / "0" / "report.pdf"
+            p.write_bytes(b"x")
+            return [p]
+
+        mock_mail.extract_draft_attachments.side_effect = fake_extract
+        # Force a failure AFTER extraction so the finally block runs.
+        mock_mail.create_draft.side_effect = RuntimeError("boom")
+
+        await update_draft(draft_id="160991", body="x")
+
+        assert created_dirs, "tempdir was never created"
+        # All tempdirs must be cleaned up.
+        for d in created_dirs:
+            from pathlib import Path as _Path
+            assert not _Path(d).exists(), f"tempdir {d} not cleaned up"
+
+    # ------------------------------------------------------------------
+    # delete_draft
+    # ------------------------------------------------------------------
+
+    def test_delete_draft_applescript_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import delete_draft
+
+        mock_mail.delete_draft.side_effect = MailAppleScriptError("boom")
+        result = delete_draft(draft_id="160991")
+        assert result["error_type"] == "applescript_error"
+
+    def test_delete_draft_unknown_error(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import delete_draft
+
+        mock_mail.delete_draft.side_effect = RuntimeError("boom")
+        result = delete_draft(draft_id="160991")
+        assert result["error_type"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_update_draft_delete_step_not_found(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """If the draft is somehow deleted between get_draft_state and
+        the orchestrator's own delete_draft call, return a typed error
+        rather than crash."""
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": [], "cc": [], "bcc": [],
+            "subject": "", "body": "", "in_reply_to": "",
+            "references": "", "attachment_names": [],
+        }
+        mock_mail.delete_draft.side_effect = MailDraftNotFoundError("gone")
+        result = await update_draft(draft_id="160991", body="x")
+        assert result["error_type"] == "draft_not_found"
+
+    @pytest.mark.asyncio
+    async def test_update_draft_template_success_renders(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """Template renders subject + body when caller didn't supply them."""
+        from apple_mail_mcp.server import update_draft
+        from apple_mail_mcp.templates import Template, TemplateStore
+
+        # Write a template the renderer can pick up.
+        store = TemplateStore()
+        store.save(Template(
+            name="patch", subject="[patched] {today}",
+            body="Hi {recipient_name},\n\nUpdated.\n",
+        ))
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "160991", "to": ["a@example.com"],
+            "cc": [], "bcc": [], "subject": "old", "body": "old",
+            "in_reply_to": "", "references": "", "attachment_names": [],
+        }
+        mock_mail.auto_template_vars.return_value = {
+            "today": "2026-05-08",
+            "recipient_name": "alice",
+        }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "999", "sent_message_id": "",
+        }
+
+        result = await update_draft(
+            draft_id="160991", template_name="patch"
+        )
+        assert result["success"] is True
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["subject"].startswith("[patched]")
+        assert "Hi alice" in kwargs["body"]
+
+
+class TestConnectorCreateDraftEdgeCase:
+    """Connector-layer error path that the server tests don't reach."""
+
+    @pytest.fixture
+    def connector(self) -> Any:
+        from apple_mail_mcp.mail_connector import AppleMailConnector
+        return AppleMailConnector(timeout=30)
+
+    @patch("apple_mail_mcp.mail_connector.AppleMailConnector._run_applescript")
+    def test_applescript_error_not_seed_not_found_propagates(
+        self, mock_run: MagicMock, connector: Any
+    ) -> None:
+        """A non-SEED_NOT_FOUND AppleScript error in create_draft must
+        propagate as MailAppleScriptError (the typed exception path
+        below the SEED_NOT_FOUND branch)."""
+        mock_run.side_effect = MailAppleScriptError("Mail.app crashed")
+        with pytest.raises(MailAppleScriptError, match="Mail.app crashed"):
+            connector.create_draft(
+                seed="reply", seed_id="160000", body="x"
+            )
