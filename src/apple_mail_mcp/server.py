@@ -1264,10 +1264,78 @@ def get_thread(message_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_attachment_content(
+    message_id: str,
+    attachment_index: int = 0,
+) -> dict[str, Any]:
+    """
+    Read attachment content from a message without saving to disk.
+
+    Returns the content as text (for text files) or base64 (for binary).
+    Use this to inspect attachment content before deciding on a save location
+    or filename.
+
+    Args:
+        message_id: Message ID from search results
+        attachment_index: Zero-based index of the attachment to read (default: 0)
+
+    Returns:
+        Dictionary with name, mime_type, size, content, and is_binary flag
+
+    Example:
+        >>> get_attachment_content("12345")
+        {"success": True, "name": "report.txt", "content": "...", "is_binary": False}
+    """
+    try:
+        rate_err = check_rate_limit("get_attachment_content", {"message_id": message_id})
+        if rate_err:
+            return rate_err
+
+        result = mail.get_attachment_content(
+            message_id=message_id,
+            attachment_index=attachment_index,
+        )
+
+        operation_logger.log_operation(
+            "get_attachment_content",
+            {"message_id": message_id, "attachment_index": attachment_index},
+            "success",
+        )
+
+        return {
+            "success": True,
+            **result,
+        }
+
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "validation_error",
+        }
+    except MailMessageNotFoundError as e:
+        logger.error(f"Message not found: {e}")
+        return {
+            "success": False,
+            "error": f"Message '{message_id}' not found",
+            "error_type": "message_not_found",
+        }
+    except Exception as e:
+        logger.error(f"Error reading attachment content: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "unknown",
+        }
+
+
+@mcp.tool()
 def save_attachments(
     message_id: str,
     save_directory: str,
     attachment_indices: list[int] | None = None,
+    output_filename: str | None = None,
 ) -> dict[str, Any]:
     """
     Save attachments from a message to a directory.
@@ -1276,6 +1344,9 @@ def save_attachments(
         message_id: Message ID from search results
         save_directory: Directory path to save attachments to
         attachment_indices: Specific attachment indices to save (0-based), None for all
+        output_filename: Custom filename for the saved attachment. Only valid when
+            saving a single attachment (one index or message has one attachment).
+            The filename is sanitized for safety.
 
     Returns:
         Dictionary indicating success and number of attachments saved
@@ -1284,10 +1355,12 @@ def save_attachments(
         >>> save_attachments("12345", "/Users/me/Downloads")
         {"success": True, "saved": 2, "directory": "/Users/me/Downloads"}
 
-        >>> save_attachments("12345", "/Users/me/Downloads", [0, 2])
-        {"success": True, "saved": 2, "directory": "/Users/me/Downloads"}
+        >>> save_attachments("12345", "/Users/me/Reports", [0], "2026.05.25-daily.txt")
+        {"success": True, "saved": 1, "directory": "/Users/me/Reports", "filename": "2026.05.25-daily.txt"}
     """
-    from pathlib import Path
+    import shutil
+
+    from .utils import sanitize_filename
 
     try:
         rate_err = check_rate_limit("save_attachments", {"message_id": message_id})
@@ -1311,15 +1384,49 @@ def save_attachments(
                 "error_type": "invalid_directory",
             }
 
+        # Validate output_filename constraints
+        if output_filename is not None:
+            if attachment_indices is None or len(attachment_indices) != 1:
+                return {
+                    "success": False,
+                    "error": "output_filename can only be used when saving a single attachment (provide exactly one attachment_indices entry)",
+                    "error_type": "validation_error",
+                }
+            output_filename = sanitize_filename(output_filename)
+
         logger.info(
             f"Saving attachments from message {message_id} to {save_directory}"
         )
 
-        count = mail.save_attachments(
-            message_id=message_id,
-            save_directory=save_path,
-            attachment_indices=attachment_indices,
-        )
+        # When output_filename is set, save to a temp directory first to
+        # avoid TOCTOU race conditions, then move with the correct name.
+        final_filename = None
+        if output_filename is not None:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                count = mail.save_attachments(
+                    message_id=message_id,
+                    save_directory=tmp_path,
+                    attachment_indices=attachment_indices,
+                )
+                if count == 1:
+                    saved_files = list(tmp_path.iterdir())
+                    if not saved_files:
+                        return {
+                            "success": False,
+                            "error": "Attachment was reported saved but file not found",
+                            "error_type": "unknown",
+                        }
+                    src_file = saved_files[0]
+                    target = save_path.resolve() / output_filename
+                    shutil.move(str(src_file), str(target))
+                    final_filename = output_filename
+        else:
+            count = mail.save_attachments(
+                message_id=message_id,
+                save_directory=save_path,
+                attachment_indices=attachment_indices,
+            )
 
         operation_logger.log_operation(
             "save_attachments",
@@ -1327,15 +1434,19 @@ def save_attachments(
                 "message_id": message_id,
                 "directory": save_directory,
                 "indices": attachment_indices,
+                "output_filename": output_filename,
             },
             "success"
         )
 
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "saved": count,
             "directory": save_directory,
         }
+        if final_filename:
+            result["filename"] = final_filename
+        return result
 
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Validation error: {e}")

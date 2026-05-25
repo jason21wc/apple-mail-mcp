@@ -29,6 +29,7 @@ EXPECTED_TOOLS = {
     "search_messages",
     "get_messages",
     "get_thread",
+    "get_attachment_content",
     # Drafts lifecycle (#134)
     "create_draft",
     "update_draft",

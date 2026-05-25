@@ -1741,6 +1741,144 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
+    _MAX_ATTACHMENT_READ_BYTES = 25 * 1024 * 1024  # 25 MB
+
+    def get_attachment_content(
+        self,
+        message_id: str,
+        attachment_index: int = 0,
+    ) -> dict[str, Any]:
+        """
+        Read attachment content from a message without saving to disk.
+
+        Uses a temporary directory with a safe filename to save the
+        attachment via AppleScript, reads the content into memory, then
+        cleans up. This avoids needing a permanent disk write for content
+        inspection workflows.
+
+        Args:
+            message_id: Message ID (Mail.app internal id)
+            attachment_index: Zero-based index of attachment to read
+
+        Returns:
+            Dict with keys: name (str), mime_type (str), size (int),
+            content (str — decoded text or base64 for binary),
+            is_binary (bool).
+
+        Raises:
+            MailMessageNotFoundError: If message doesn't exist
+            ValueError: If attachment_index is out of range or negative,
+                or if the attachment exceeds the size limit.
+        """
+        import base64
+        import tempfile
+
+        if attachment_index < 0:
+            raise ValueError("attachment_index must be non-negative")
+
+        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        as_index = attachment_index + 1  # AppleScript is 1-based
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dir_safe = escape_applescript_string(tmp_dir)
+            # Use a fixed safe filename to prevent path traversal via
+            # attacker-controlled attachment names from email.
+            safe_save_name = f"_att_{as_index}"
+
+            script = f"""
+            tell application "Mail"
+                set foundMsg to missing value
+                repeat with acc in accounts
+                    repeat with mb in mailboxes of acc
+                        try
+                            set foundMsg to first message of mb whose id is "{message_id_safe}"
+                            exit repeat
+                        end try
+                    end repeat
+                    if foundMsg is not missing value then exit repeat
+                end repeat
+
+                if foundMsg is missing value then
+                    error "Can't get message: not found"
+                end if
+
+                set attList to mail attachments of foundMsg
+                if (count of attList) < {as_index} then
+                    error "Attachment index out of range"
+                end if
+
+                set att to item {as_index} of attList
+                set attName to name of att
+                set attMime to MIME type of att
+                set attSize to file size of att
+                save att in POSIX file "{dir_safe}/{safe_save_name}"
+
+                return attName & "|||" & attMime & "|||" & (attSize as text)
+            end tell
+            """
+
+            try:
+                result = self._run_applescript(script)
+            except MailAppleScriptError as e:
+                if "Attachment index out of range" in str(e):
+                    raise ValueError("Attachment index out of range") from e
+                raise
+
+            parts = result.rsplit("|||", maxsplit=2)
+            if len(parts) != 3:
+                raise MailAppleScriptError(
+                    f"Unexpected AppleScript output: {result}"
+                )
+
+            att_name, mime_type, size_str = parts
+            saved_path = Path(tmp_dir) / safe_save_name
+
+            # Check size before reading into memory
+            try:
+                att_size = int(size_str.strip())
+            except (ValueError, AttributeError):
+                att_size = 0
+            if att_size > self._MAX_ATTACHMENT_READ_BYTES:
+                raise ValueError(
+                    f"Attachment too large ({att_size // (1024*1024)} MB); "
+                    f"use save_attachments to download to disk instead"
+                )
+
+            if not saved_path.exists():
+                raise MailAppleScriptError(
+                    "AppleScript save completed but file not found at "
+                    f"expected path: {saved_path}"
+                )
+
+            content_bytes = saved_path.read_bytes()
+            if len(content_bytes) > self._MAX_ATTACHMENT_READ_BYTES:
+                raise ValueError(
+                    f"Attachment content exceeds size limit "
+                    f"({len(content_bytes) // (1024*1024)} MB); "
+                    f"use save_attachments to download to disk instead"
+                )
+
+            is_text = mime_type.startswith("text/") or att_name.endswith(
+                (".txt", ".csv", ".md", ".json", ".xml", ".html", ".log")
+            )
+
+            if is_text:
+                try:
+                    content = content_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    content = base64.b64encode(content_bytes).decode("ascii")
+                    is_text = False
+            else:
+                content = base64.b64encode(content_bytes).decode("ascii")
+
+            return {
+                "name": att_name,
+                "mime_type": mime_type,
+                "size": int(size_str) if size_str.isdigit() else len(content_bytes),
+                "content": content,
+                "is_binary": not is_text,
+            }
+
     def get_thread(self, message_id: str) -> list[dict[str, Any]]:
         """Return all messages in the thread containing ``message_id``.
 
@@ -2446,7 +2584,7 @@ class AppleMailConnector:
             raise ValueError(f"Invalid save directory: {e}") from e
 
         message_id_safe = escape_applescript_string(sanitize_input(message_id))
-        dir_safe = escape_applescript_string(str(save_directory))
+        dir_safe = escape_applescript_string(sanitize_input(str(save_directory)))
 
         # Build index filter if specified
         if attachment_indices is not None:
@@ -2469,7 +2607,9 @@ class AppleMailConnector:
                         repeat with att in attList
                             try
                                 set attName to name of att
-                                save att in ("{dir_safe}/" & attName)
+                                -- Strip path components to prevent traversal
+                                set safeName to do shell script "basename " & quoted form of attName
+                                save att in ("{dir_safe}/" & safeName)
                                 set saveCount to saveCount + 1
                             end try
                         end repeat

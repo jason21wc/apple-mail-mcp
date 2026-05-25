@@ -1,4 +1,27 @@
-# Apple Mail MCP Server
+# Apple Mail MCP Server (CHMG Fork)
+
+Fork of s-morgan-jeffries/apple-mail-mcp, pinned at v0.8.2.
+
+**Owner:** Jason Collier (Collier Hotel Management Group)
+**Purpose:** Give Claude full read/write access to Apple Mail on macOS, focused on iCloud accounts. Primary use case: automated hotel property report extraction.
+**Governance:** Wrapped with ai-governance-proxy in claude_desktop_config.json. Never run this server directly — always via the governance proxy.
+
+## Fork Modifications (from upstream)
+
+1. **`get_attachment_content` tool** — reads attachment content without saving to disk (text or base64)
+2. **`save_attachments` extension** — added `output_filename` parameter for custom filename on save
+3. **Post-save path validation** — security hardening against path traversal via malicious attachment names
+
+## Upstream Tracking
+
+```bash
+git remote -v  # origin = jason21wc fork, upstream = s-morgan-jeffries
+git fetch upstream && git log upstream/main --oneline -5  # Check for updates
+```
+
+Pin tag: `pin-v0.8.2`. Do not auto-merge upstream changes.
+
+---
 
 An MCP server bridging Claude and Apple Mail via AppleScript on macOS.
 
@@ -23,12 +46,12 @@ make coverage              # Coverage report
 
 **Running the server:** `uv run python -m apple_mail_mcp.server` or via Claude Desktop config.
 
-## API Surface (23 MCP tools)
+## API Surface (24 MCP tools)
 
 **Core:** list_mailboxes, search_messages, get_messages, update_message
 **Drafts lifecycle (#134):** create_draft, update_draft, delete_draft
 **Mailbox CRUD:** create_mailbox, update_mailbox (rename + move via IMAP), delete_mailbox (IMAP-only)
-**Attachments & Management:** save_attachments, delete_messages
+**Attachments & Management:** get_attachment_content, save_attachments (with output_filename), delete_messages
 **Discovery & Rules:** list_accounts, list_rules, get_thread, create_rule, update_rule, delete_rule
 **Templates:** list_templates, get_template, save_template, delete_template, render_template
 
