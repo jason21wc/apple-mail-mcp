@@ -99,6 +99,20 @@ _RULE_OPERATOR_MAP = {
 }
 
 
+def _applescript_mailbox_ref(mailbox_path: str, account_clause: str) -> str:
+    """Build an AppleScript nested mailbox reference from a slash-separated path.
+
+    Example: "Investments Current/Hotel DENBT" with account clause becomes
+    'mailbox "Hotel DENBT" of mailbox "Investments Current" of account "iCloud"'
+    """
+    parts = mailbox_path.split("/")
+    ref = account_clause
+    for part in parts:
+        part_safe = escape_applescript_string(sanitize_input(part))
+        ref = f'mailbox "{part_safe}" of {ref}'
+    return ref
+
+
 def _wrap_as_json_script(body: str, *, timeout: int) -> str:
     """Wrap a tell-block body with ASObjC imports and an NSJSONSerialization return.
 
@@ -195,9 +209,9 @@ def _bulk_repeat_block(
         action_indent = " " * 20
         action_lines = "\n".join(action_indent + a for a in actions)
         account_clause = applescript_account_clause(account)
-        mb_safe = escape_applescript_string(sanitize_input(source_mailbox))
+        mb_ref = _applescript_mailbox_ref(source_mailbox, account_clause)
         return (
-            f'            set sourceMb to mailbox "{mb_safe}" of {account_clause}\n'
+            f"            set sourceMb to {mb_ref}\n"
             f"            repeat with msgId in idList\n"
             f"                try\n"
             f"                    set msg to first message of sourceMb whose id is msgId\n"
@@ -946,6 +960,13 @@ class AppleMailConnector:
     def list_mailboxes(self, account: str) -> list[dict[str, Any]]:
         """List all mailboxes for an account.
 
+        Returns full slash-separated paths for nested mailboxes (e.g.,
+        "Investments Current/Hotel DENBT Platte River Property"). These
+        paths can be passed directly to search_messages' mailbox parameter.
+
+        Uses the IMAP path when available (returns accurate hierarchy);
+        falls back to AppleScript with container-walking for full paths.
+
         Args:
             account: Account name.
 
@@ -955,6 +976,36 @@ class AppleMailConnector:
         Raises:
             MailAccountNotFoundError: If account doesn't exist.
         """
+        if not self._imap_breaker_open(account):
+            try:
+                return self._list_mailboxes_imap(account)
+            except Exception:
+                pass
+
+        return self._list_mailboxes_applescript(account)
+
+    def _list_mailboxes_imap(self, account: str) -> list[dict[str, Any]]:
+        """IMAP path for list_mailboxes — returns full folder paths."""
+        host, port, email = self._resolve_imap_config(account)
+        password = get_imap_password(account, email)
+        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+
+        with imap._session() as client:
+            folders = client.list_folders()
+            result: list[dict[str, Any]] = []
+            for _flags, _delimiter, folder_name in folders:
+                if isinstance(folder_name, bytes):
+                    folder_name = folder_name.decode("utf-8", errors="replace")
+                try:
+                    status = client.folder_status(folder_name, ["UNSEEN"])
+                    unread = status.get(b"UNSEEN", 0)
+                except Exception:
+                    unread = 0
+                result.append({"name": folder_name, "unread_count": unread})
+            return result
+
+    def _list_mailboxes_applescript(self, account: str) -> list[dict[str, Any]]:
+        """AppleScript path for list_mailboxes with full path resolution."""
         account_clause = applescript_account_clause(account)
 
         tell_body = f'''
@@ -965,7 +1016,14 @@ class AppleMailConnector:
             repeat with mb in mailboxes of accountRef
                 set mbUnread to unread count of mb
                 if mbUnread is missing value then set mbUnread to 0
-                set mbRecord to {{|name|:(name of mb), |unread_count|:mbUnread}}
+                -- Build full path by walking container chain
+                set fullPath to name of mb
+                set currentContainer to container of mb
+                repeat while class of currentContainer is mailbox
+                    set fullPath to (name of currentContainer) & "/" & fullPath
+                    set currentContainer to container of currentContainer
+                end repeat
+                set mbRecord to {{|name|:fullPath, |unread_count|:mbUnread}}
                 set end of resultData to mbRecord
             end repeat
         end tell
@@ -1222,7 +1280,7 @@ class AppleMailConnector:
             MailMailboxNotFoundError: If mailbox doesn't exist.
         """
         account_clause = applescript_account_clause(account)
-        mailbox_safe = escape_applescript_string(sanitize_input(mailbox))
+        mailbox_ref = _applescript_mailbox_ref(mailbox, account_clause)
 
         # Build per-message AppleScript IF filters instead of a `whose` clause.
         #
@@ -1354,8 +1412,7 @@ class AppleMailConnector:
 
         tell_body = f'''
         tell application "Mail"
-            set accountRef to {account_clause}
-            set mailboxRef to mailbox "{mailbox_safe}" of accountRef
+            set mailboxRef to {mailbox_ref}
             set msgs to messages of mailboxRef
             set total to count of msgs
 
@@ -2663,7 +2720,7 @@ class AppleMailConnector:
         from .utils import sanitize_input
 
         account_clause = applescript_account_clause(account)
-        mailbox_safe = escape_applescript_string(sanitize_input(destination_mailbox))
+        dest_mb_ref = _applescript_mailbox_ref(destination_mailbox, account_clause)
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
             for mid in message_ids
@@ -2688,7 +2745,7 @@ class AppleMailConnector:
         script = f"""
         tell application "Mail"
             set accountRef to {account_clause}
-            set destMailbox to mailbox "{mailbox_safe}" of accountRef
+            set destMailbox to {dest_mb_ref}
             set idList to {{{id_list}}}
             set moveCount to 0
 

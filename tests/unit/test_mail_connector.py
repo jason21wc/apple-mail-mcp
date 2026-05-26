@@ -837,7 +837,8 @@ class TestAppleMailConnector:
         mock_run.return_value = "[]"
         connector.list_mailboxes("Gmail")
         script = mock_run.call_args[0][0]
-        assert "|name|:(name of mb)" in script
+        assert "|name|:" in script
+        assert "fullPath" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_list_mailboxes_with_name_uses_account_clause(
@@ -3340,7 +3341,7 @@ class TestAppleMailConnector:
         mock_run.return_value = "[]"
         connector._search_messages_applescript(uuid, "INBOX")
         script = mock_run.call_args[0][0]
-        assert f'set accountRef to account id "{uuid}"' in script
+        assert f'account id "{uuid}"' in script
 
     def test_search_messages_logs_imap_hint_when_applescript_path_is_slow(
         self, connector: AppleMailConnector, caplog: pytest.LogCaptureFixture
