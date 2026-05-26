@@ -11,6 +11,7 @@ from apple_mail_mcp.exceptions import (
 )
 from apple_mail_mcp.keychain import (
     SERVICE_NAME_PREFIX,
+    _env_var_name,
     delete_imap_password,
     get_imap_password,
     set_imap_password,
@@ -24,6 +25,49 @@ def _mock_security(returncode: int, stdout: str = "", stderr: str = "") -> Magic
     m.stdout = stdout
     m.stderr = stderr
     return m
+
+
+class TestEnvVarName:
+    def test_simple_account(self):
+        assert _env_var_name("iCloud") == "APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD"
+
+    def test_account_with_spaces(self):
+        assert _env_var_name("My Gmail") == "APPLE_MAIL_MCP_IMAP_PASSWORD_MY_GMAIL"
+
+    def test_already_uppercase(self):
+        assert _env_var_name("WORK") == "APPLE_MAIL_MCP_IMAP_PASSWORD_WORK"
+
+
+class TestEnvVarOverride:
+    @patch("apple_mail_mcp.keychain.subprocess.run")
+    def test_env_var_bypasses_keychain(self, mock_run, monkeypatch):
+        monkeypatch.setenv("APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD", "env-secret")
+        result = get_imap_password("iCloud", "user@icloud.com")
+        assert result == "env-secret"
+        mock_run.assert_not_called()
+
+    @patch("apple_mail_mcp.keychain.subprocess.run")
+    def test_empty_env_var_falls_through_to_keychain(self, mock_run, monkeypatch):
+        monkeypatch.setenv("APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD", "")
+        mock_run.return_value = _mock_security(0, stdout="keychain-pw\n")
+        result = get_imap_password("iCloud", "user@icloud.com")
+        assert result == "keychain-pw"
+        mock_run.assert_called_once()
+
+    @patch("apple_mail_mcp.keychain.subprocess.run")
+    def test_unset_env_var_falls_through_to_keychain(self, mock_run, monkeypatch):
+        monkeypatch.delenv("APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD", raising=False)
+        mock_run.return_value = _mock_security(0, stdout="keychain-pw\n")
+        result = get_imap_password("iCloud", "user@icloud.com")
+        assert result == "keychain-pw"
+        mock_run.assert_called_once()
+
+    @patch("apple_mail_mcp.keychain.subprocess.run")
+    def test_env_var_with_spaces_in_account_name(self, mock_run, monkeypatch):
+        monkeypatch.setenv("APPLE_MAIL_MCP_IMAP_PASSWORD_MY_GMAIL", "gmail-secret")
+        result = get_imap_password("My Gmail", "user@gmail.com")
+        assert result == "gmail-secret"
+        mock_run.assert_not_called()
 
 
 class TestServiceNamePrefix:

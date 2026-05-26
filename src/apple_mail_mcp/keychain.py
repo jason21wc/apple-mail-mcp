@@ -15,6 +15,7 @@ design decisions.
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 from apple_mail_mcp.exceptions import (
@@ -30,8 +31,22 @@ _EXIT_INTERACTION_NOT_ALLOWED = 128
 _ACCESS_DENIED_MARKERS = ("-25308", "-128", "not allowed", "user canceled")
 
 
+def _env_var_name(mail_app_account: str) -> str:
+    """Derive the env-var name for a given Mail.app account.
+
+    Example: ``"iCloud"`` → ``"APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD"``.
+    """
+    suffix = mail_app_account.upper().replace(" ", "_")
+    return f"APPLE_MAIL_MCP_IMAP_PASSWORD_{suffix}"
+
+
 def get_imap_password(mail_app_account: str, email: str) -> str:
     """Return the app-specific password stored in Keychain.
+
+    If the env var ``APPLE_MAIL_MCP_IMAP_PASSWORD_<ACCOUNT>`` is set
+    (e.g. ``APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD``), it is returned
+    immediately — Keychain is not consulted.  This bypasses macOS
+    Keychain ACL restrictions in sandboxed processes.
 
     Args:
         mail_app_account: Mail.app account name (e.g. "iCloud", "Gmail").
@@ -45,6 +60,10 @@ def get_imap_password(mail_app_account: str, email: str) -> str:
         MailKeychainAccessDeniedError: ACL or user denial.
         MailKeychainError: Any other ``security(1)`` failure.
     """
+    env_val = os.environ.get(_env_var_name(mail_app_account))
+    if env_val:
+        return env_val
+
     service = SERVICE_NAME_PREFIX + mail_app_account
     try:
         result = subprocess.run(
