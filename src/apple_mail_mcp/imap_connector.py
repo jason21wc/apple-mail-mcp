@@ -58,6 +58,13 @@ CONNECT_TIMEOUT_S: float = 3.0
 fallback happens inside the graceful-degradation window without
 waiting for TCP's default timeout."""
 
+OP_TIMEOUT_S: float = 30.0
+"""Socket timeout applied after login for SEARCH/FETCH operations.
+Filtered IMAP SEARCH (FROM/SUBJECT) on large mailboxes can take 10-20s
+server-side on iCloud.  The connect timeout stays at 3s for fast
+offline detection; this higher ceiling prevents premature timeouts
+on legitimate queries."""
+
 POOL_IDLE_TIMEOUT_S: float = 270.0
 """Default pool idle threshold. iCloud and most providers drop IMAP
 sessions after ~30 min idle. 270s = 4.5 min keeps us comfortably under
@@ -155,6 +162,7 @@ class ImapConnectionPool:
                     host, port=port, ssl=True, timeout=connect_timeout
                 )
                 client.login(email, password)
+                client.socket().settimeout(OP_TIMEOUT_S)
                 entry = _PooledClient(client=client)
                 self._cache[key] = entry
 
@@ -546,6 +554,7 @@ class ImapConnector:
         )
         try:
             client.login(self._email, self._password)
+            client.socket().settimeout(OP_TIMEOUT_S)
             yield client
         finally:
             client.logout()

@@ -8,7 +8,7 @@ import pytest
 from imapclient.exceptions import IMAPClientError
 from imapclient.response_types import Address, Envelope
 
-from apple_mail_mcp.imap_connector import CONNECT_TIMEOUT_S, ImapConnector
+from apple_mail_mcp.imap_connector import CONNECT_TIMEOUT_S, OP_TIMEOUT_S, ImapConnector
 
 
 def _fake_envelope(
@@ -69,6 +69,23 @@ class TestConstructor:
         assert conn._port == 993
         assert conn._email == "user@example.com"
         assert conn._password == "secret"
+
+
+class TestOpTimeout:
+    def test_op_timeout_is_30_seconds(self):
+        assert OP_TIMEOUT_S == 30.0
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_socket_timeout_raised_after_login(self, mock_cls):
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.search.return_value = []
+
+        conn = ImapConnector("h", 993, "u@e.com", "pw")
+        conn.search_messages()
+
+        mock_cls.assert_called_once_with("h", port=993, ssl=True, timeout=3.0)
+        mock_client.socket().settimeout.assert_called_once_with(OP_TIMEOUT_S)
 
 
 class TestSearchHappyPath:
