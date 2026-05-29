@@ -233,6 +233,29 @@ def diagnose_imap(
             results["connector_fetch"] = "failed"
             results["connector_fetch_error"] = f"{type(e).__name__}: {e}"
 
+    # 7. Test get_messages function directly (bypasses MCP transport
+    # but uses the identical code path the MCP tool uses)
+    if results.get("connector_fetch") == "success" and message_id:
+        start = time.time()
+        try:
+            gm_result = get_messages(
+                [message_id], include_content=True,
+                account=account, mailbox=mailbox,
+            )
+            results["get_messages_time"] = round(time.time() - start, 2)
+            results["get_messages_success"] = gm_result.get("success")
+            results["get_messages_count"] = gm_result.get("count")
+            if gm_result.get("messages"):
+                content = gm_result["messages"][0].get("content", "")
+                results["get_messages_content_len"] = len(content)
+                import json as _json
+                results["get_messages_response_bytes"] = len(
+                    _json.dumps(gm_result)
+                )
+        except Exception as e:
+            results["get_messages_time"] = round(time.time() - start, 2)
+            results["get_messages_error"] = f"{type(e).__name__}: {e}"
+
     return {"success": True, **results}
 
 
