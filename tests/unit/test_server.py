@@ -22,6 +22,7 @@ from fastmcp.server.elicitation import (
 from apple_mail_mcp.exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
+    MailKeychainEntryNotFoundError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
 )
@@ -32,6 +33,7 @@ from apple_mail_mcp.server import (
     delete_messages,
     delete_rule,
     delete_template,
+    diagnose_imap,
     get_messages,
     get_template,
     get_thread,
@@ -271,6 +273,63 @@ class TestListAccounts:
         assert result["success"] is False
         assert result["error_type"] == "unknown"
         assert "boom" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 0a2. diagnose_imap (temporary diagnostic tool)
+# ---------------------------------------------------------------------------
+
+
+class TestDiagnoseImap:
+    @patch("apple_mail_mcp.server.get_imap_password")
+    def test_reports_env_var_status(
+        self, mock_pw: MagicMock, mock_mail: MagicMock
+    ) -> None:
+        """diagnose_imap reports whether the IMAP password env var is set."""
+        mock_pw.side_effect = Exception("no pw")
+        with patch.dict("os.environ", {"APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD": "test123"}):
+            mock_mail._resolve_imap_config.return_value = ("host", 993, "u@e.com")
+            result = diagnose_imap("iCloud")
+
+        assert result["success"] is True
+        assert result["env_var_set"] is True
+        assert result["env_var_name"] == "APPLE_MAIL_MCP_IMAP_PASSWORD_ICLOUD"
+
+    @patch("apple_mail_mcp.server.get_imap_password")
+    def test_reports_password_unavailable(
+        self, mock_pw: MagicMock, mock_mail: MagicMock
+    ) -> None:
+        """When no password is available, reports the error."""
+        mock_pw.side_effect = MailKeychainEntryNotFoundError("none")
+        with patch.dict("os.environ", {}, clear=True):
+            mock_mail._resolve_imap_config.return_value = ("host", 993, "u@e.com")
+            result = diagnose_imap("iCloud")
+
+        assert result["success"] is True
+        assert result["password_available"] is False
+
+    @patch("apple_mail_mcp.server.ImapConnector")
+    @patch("apple_mail_mcp.server.get_imap_password")
+    def test_successful_body_fetch(
+        self, mock_pw: MagicMock, mock_imap_cls: MagicMock,
+        mock_mail: MagicMock,
+    ) -> None:
+        """When IMAP works, reports timing and content length."""
+        mock_pw.return_value = "pw"
+        with patch.dict("os.environ", {}, clear=True):
+            mock_mail._resolve_imap_config.return_value = ("host", 993, "u@e.com")
+            mock_mail._imap_pool = None
+            mock_imap = mock_imap_cls.return_value
+            mock_imap.search_messages.return_value = [{"id": "abc@x"}]
+            mock_imap.get_message.return_value = {
+                "content": "<html>hello</html>",
+            }
+            mock_mail._imap_breaker_open.return_value = False
+            result = diagnose_imap("iCloud")
+
+        assert result["success"] is True
+        assert result["body_fetch"] == "success"
+        assert result["content_length"] == 18
 
 
 # ---------------------------------------------------------------------------
