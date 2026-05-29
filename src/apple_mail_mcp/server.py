@@ -33,7 +33,7 @@ from .exceptions import (
     MailUnsupportedRuleActionError,
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
-from .keychain import get_imap_password, _env_var_name
+from .keychain import _env_var_name, get_imap_password
 from .mail_connector import AppleMailConnector
 from .security import (
     check_rate_limit,

@@ -29,11 +29,11 @@ from apple_mail_mcp.exceptions import (
 from apple_mail_mcp.server import (
     _elicit_confirmation,
     create_mailbox,
-    diagnose_imap,
     create_rule,
     delete_messages,
     delete_rule,
     delete_template,
+    diagnose_imap,
     get_messages,
     get_template,
     get_thread,
