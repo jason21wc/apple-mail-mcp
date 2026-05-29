@@ -1185,6 +1185,44 @@ class TestSearchMessages:
         kwargs = mock_mail.search_messages.call_args.kwargs
         assert callable(kwargs.get("on_warning"))
 
+    def test_search_results_stamp_account_mailbox_per_row(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """Each message row carries the account/mailbox it came from,
+        so downstream get_messages calls can forward IMAP routing hints."""
+        mock_mail.search_messages.return_value = [
+            {"id": "1", "subject": "A"},
+            {"id": "2", "subject": "B"},
+        ]
+
+        result = search_messages("Gmail", mailbox="Sent")
+
+        assert result["success"] is True
+        for msg in result["messages"]:
+            assert msg["account"] == "Gmail"
+            assert msg["mailbox"] == "Sent"
+
+    def test_search_results_source_mode_does_not_stamp(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """source=[ids] mode fetches from heterogeneous locations —
+        per-row account/mailbox should NOT be stamped."""
+        mock_mail.get_message.return_value = {
+            "id": "1",
+            "subject": "X",
+            "sender": "a@example.com",
+            "date_received": "2026-01-01",
+            "read_status": True,
+            "flagged": False,
+        }
+
+        result = search_messages(source=["1"])
+
+        assert result["success"] is True
+        msg = result["messages"][0]
+        assert "account" not in msg or msg.get("account") is None
+        assert "mailbox" not in msg or msg.get("mailbox") is None
+
 
 # ---------------------------------------------------------------------------
 # 3. get_messages
