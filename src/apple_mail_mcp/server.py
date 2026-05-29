@@ -892,6 +892,10 @@ def search_messages(
             on_warning=warnings.append,
         )
 
+        for msg in messages:
+            msg["account"] = account
+            msg["mailbox"] = mailbox
+
         operation_logger.log_operation(
             "search_messages",
             {

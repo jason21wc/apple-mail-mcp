@@ -99,6 +99,17 @@ _RULE_OPERATOR_MAP = {
 }
 
 
+def _is_rfc_message_id(message_id: str) -> bool:
+    """True when *message_id* looks like an RFC 5322 Message-ID rather than
+    Mail.app's internal numeric id.
+
+    Mail.app numeric ids are stringified long integers (no ``@``).  RFC 5322
+    Message-IDs always contain ``@`` per section 3.6.4.  Matches the
+    discriminator in ``_maybe_resolve_rfc_seed_id`` (issue #205).
+    """
+    return bool(message_id) and "@" in message_id
+
+
 def _applescript_mailbox_ref(mailbox_path: str, account_clause: str) -> str:
     """Build an AppleScript nested mailbox reference from a slash-separated path.
 
@@ -1503,7 +1514,8 @@ class AppleMailConnector:
                 # fall through to AppleScript
 
         return self._get_message_applescript(
-            message_id, include_content, include_attachments
+            message_id, include_content, include_attachments,
+            account=account, mailbox=mailbox,
         )
 
     def _imap_get_message(
@@ -1537,14 +1549,38 @@ class AppleMailConnector:
         message_id: str,
         include_content: bool,
         include_attachments: bool = False,
+        *,
+        account: str | None = None,
+        mailbox: str | None = None,
     ) -> dict[str, Any]:
-        """AppleScript fallback for get_message — iterates account × mailbox.
+        """AppleScript fallback for get_message.
 
-        Slow on accounts with many mailboxes (see issue #72). Callers
-        with a known account+mailbox should provide them to take the
-        IMAP path instead.
+        When *account* and *mailbox* are both provided the scan narrows
+        to a single mailbox (fast). Otherwise falls back to a cross-scan
+        over all accounts × mailboxes (slow, see issue #72).
+
+        Handles both Mail.app numeric ids (``whose id is``) and RFC 5322
+        Message-IDs (``whose message id is``), so callers coming from the
+        IMAP path — which returns RFC ids — degrade gracefully.
         """
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        if _is_rfc_message_id(message_id):
+            bare = message_id.strip()
+            if bare.startswith("<") and bare.endswith(">"):
+                bare = bare[1:-1]
+            bracketed = f"<{bare}>"
+            safe_bare = escape_applescript_string(sanitize_input(bare))
+            safe_bracketed = escape_applescript_string(
+                sanitize_input(bracketed)
+            )
+            whose_clause = (
+                f'whose (message id is "{safe_bare}" '
+                f'or message id is "{safe_bracketed}")'
+            )
+        else:
+            message_id_safe = escape_applescript_string(
+                sanitize_input(message_id)
+            )
+            whose_clause = f'whose id is "{message_id_safe}"'
 
         content_clause = (
             'set msgContent to content of msg'
@@ -1565,16 +1601,44 @@ class AppleMailConnector:
             attachments_clause = ""
             attachments_field = ""
 
-        tell_body = f'''
+        result_record = (
+            '{{|id|:(id of msg as text), |rfc_message_id|:(message id of msg),'
+            ' |subject|:(subject of msg), |sender|:(sender of msg),'
+            ' |date_received|:(date received of msg as text),'
+            ' |read_status|:(read status of msg),'
+            ' |flagged|:(flagged status of msg),'
+            f' |content|:msgContent{attachments_field}}}'
+        )
+
+        if account is not None and mailbox is not None:
+            acct_clause = applescript_account_clause(account)
+            mb_ref = _applescript_mailbox_ref(mailbox, acct_clause)
+            tell_body = f'''
+        tell application "Mail"
+            set resultData to missing value
+            try
+                set msg to first message of {mb_ref} {whose_clause}
+                {content_clause}
+{attachments_clause}
+                set resultData to {result_record}
+            end try
+
+            if resultData is missing value then
+                error "Can't get message: not found"
+            end if
+        end tell
+        '''
+        else:
+            tell_body = f'''
         tell application "Mail"
             set resultData to missing value
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb whose id is "{message_id_safe}"
+                        set msg to first message of mb {whose_clause}
                         {content_clause}
 {attachments_clause}
-                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent{attachments_field}}}
+                        set resultData to {result_record}
                         exit repeat
                     end try
                 end repeat

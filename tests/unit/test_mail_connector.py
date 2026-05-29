@@ -3496,7 +3496,9 @@ class TestAppleMailConnector:
 
         assert result == {"id": "1"}
         imap_path.assert_not_called()
-        as_path.assert_called_once_with("123", True, False)
+        as_path.assert_called_once_with(
+            "123", True, False, account=None, mailbox=None,
+        )
 
     def test_get_message_partial_hint_skips_imap(
         self, connector: AppleMailConnector
@@ -3636,8 +3638,153 @@ class TestAppleMailConnector:
             connector.get_message("123", headers_only=True)
         # AppleScript path receives the original signature (message_id,
         # include_content, include_attachments); headers_only is silently dropped.
-        as_path.assert_called_once_with("123", True, False)
+        as_path.assert_called_once_with(
+            "123", True, False, account=None, mailbox=None,
+        )
 
+    # -- ID type detection + narrowed scan (Fixes 2 & 3) ------------------
+
+    def test_is_rfc_message_id(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Canonical discriminator: '@' presence means RFC 5322."""
+        from apple_mail_mcp.mail_connector import _is_rfc_message_id
+
+        assert _is_rfc_message_id("abc@server.com") is True
+        assert _is_rfc_message_id("<abc@server.com>") is True
+        assert _is_rfc_message_id("12345") is False
+        assert _is_rfc_message_id("") is False
+
+    @patch("subprocess.run")
+    def test_get_message_applescript_numeric_id_uses_whose_id_is(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Numeric message_id → whose id is (current indexed path)."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"id":"12345","rfc_message_id":"x@y","subject":"Hi",'
+                   '"sender":"a@b","date_received":"2026-01-01",'
+                   '"read_status":true,"flagged":false,"content":"body"}',
+            stderr="",
+        )
+        connector._get_message_applescript("12345", True)
+        script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
+        assert 'whose id is "12345"' in script
+        assert "whose message id is" not in script
+        assert "whose (message id" not in script
+
+    @patch("subprocess.run")
+    def test_get_message_applescript_rfc_id_uses_whose_message_id_is(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """RFC 5322 message_id → whose message id is (bare + bracketed)."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"id":"99","rfc_message_id":"abc@server.com","subject":"Hi",'
+                   '"sender":"a@b","date_received":"2026-01-01",'
+                   '"read_status":true,"flagged":false,"content":"body"}',
+            stderr="",
+        )
+        connector._get_message_applescript("abc@server.com", True)
+        script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
+        assert 'message id is "abc@server.com"' in script
+        assert 'message id is "<abc@server.com>"' in script
+        assert 'whose id is' not in script
+
+    @patch("subprocess.run")
+    def test_get_message_applescript_rfc_id_strips_brackets(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Bracketed RFC ID input → strips before querying both forms."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"id":"99","rfc_message_id":"abc@s","subject":"Hi",'
+                   '"sender":"a@b","date_received":"2026-01-01",'
+                   '"read_status":true,"flagged":false,"content":"body"}',
+            stderr="",
+        )
+        connector._get_message_applescript("<abc@s>", True)
+        script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
+        assert 'message id is "abc@s"' in script
+        assert 'message id is "<abc@s>"' in script
+        # No double-bracketing.
+        assert "<<" not in script
+        assert ">>" not in script
+
+    @patch("subprocess.run")
+    def test_get_message_applescript_rfc_id_sanitized(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """RFC IDs with special chars are escaped for AppleScript safety."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"id":"99","rfc_message_id":"x@y","subject":"Hi",'
+                   '"sender":"a@b","date_received":"2026-01-01",'
+                   '"read_status":true,"flagged":false,"content":"body"}',
+            stderr="",
+        )
+        connector._get_message_applescript('evil"@host.com', True)
+        script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
+        # Quotes must be escaped in AppleScript string context.
+        assert 'evil\\"@host.com' in script
+
+    @patch("subprocess.run")
+    def test_get_message_applescript_with_account_mailbox_narrows_scan(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """When account+mailbox provided, scan narrows to one mailbox."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"id":"1","rfc_message_id":"x@y","subject":"Hi",'
+                   '"sender":"a@b","date_received":"2026-01-01",'
+                   '"read_status":true,"flagged":false,"content":"body"}',
+            stderr="",
+        )
+        connector._get_message_applescript(
+            "12345", True, account="iCloud", mailbox="INBOX",
+        )
+        script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
+        assert "repeat with acc in accounts" not in script
+        assert 'account "iCloud"' in script
+        assert 'mailbox "INBOX"' in script
+
+    @patch("subprocess.run")
+    def test_get_message_applescript_without_hints_does_full_scan(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Without account+mailbox, the cross-scan is preserved."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"id":"1","rfc_message_id":"x@y","subject":"Hi",'
+                   '"sender":"a@b","date_received":"2026-01-01",'
+                   '"read_status":true,"flagged":false,"content":"body"}',
+            stderr="",
+        )
+        connector._get_message_applescript("12345", True)
+        script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
+        assert "repeat with acc in accounts" in script
+
+    def test_get_message_fallback_threads_account_mailbox(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """IMAP failure → AppleScript fallback receives account+mailbox."""
+        with patch.object(
+            connector, "_imap_get_message",
+            side_effect=OSError("socket timeout"),
+        ), patch.object(
+            connector, "_get_message_applescript",
+            return_value={"id": "1"},
+        ) as as_path, patch.object(
+            connector, "_log_imap_fallback",
+        ):
+            connector.get_message(
+                "abc@x", account="iCloud", mailbox="INBOX",
+            )
+
+        as_path.assert_called_once_with(
+            "abc@x", True, False,
+            account="iCloud", mailbox="INBOX",
+        )
 
     def test_get_attachments_uses_imap_when_account_and_mailbox_provided(
         self, connector: AppleMailConnector
@@ -4495,7 +4642,8 @@ class TestWhoseIdQuoting:
         uuid_id = "CF7C3761-C190-40BA-B94E-3EBC321980ED@icloud.com"
         connector.get_message(uuid_id, include_content=False)
         script = mock_run.call_args[0][0]
-        assert f'whose id is "{uuid_id}"' in script
+        # RFC-form id (contains @) → whose message id is (bare + bracketed).
+        assert f'whose (message id is "{uuid_id}"' in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_quotes_id_in_whose(
