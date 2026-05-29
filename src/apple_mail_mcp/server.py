@@ -32,7 +32,8 @@ from .exceptions import (
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
 )
-from .imap_connector import ImapConnectionPool
+from .imap_connector import ImapConnectionPool, ImapConnector
+from .keychain import get_imap_password, _env_var_name
 from .mail_connector import AppleMailConnector
 from .security import (
     check_rate_limit,
@@ -157,12 +158,7 @@ def diagnose_imap(
     import os
     import time
 
-    from .keychain import get_imap_password
-
     results: dict[str, Any] = {"account": account, "mailbox": mailbox}
-
-    # 1. Check env var
-    from .keychain import _env_var_name
     env_name = _env_var_name(account)
     env_val = os.environ.get(env_name)
     results["env_var_name"] = env_name
@@ -188,7 +184,6 @@ def diagnose_imap(
         return {"success": True, **results}
 
     # 3. Timed IMAP connection test
-    from .imap_connector import ImapConnector
     start = time.time()
     try:
         imap = ImapConnector(host, port, email_addr, password, pool=mail._imap_pool)
