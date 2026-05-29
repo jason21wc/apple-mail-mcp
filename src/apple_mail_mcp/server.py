@@ -215,6 +215,24 @@ def diagnose_imap(
     # 5. Circuit breaker state
     results["breaker_open"] = mail._imap_breaker_open(account)
 
+    # 6. Test through mail.get_message (same path as get_messages)
+    if results.get("body_fetch") == "success" and message_id:
+        start = time.time()
+        try:
+            connector_msg = mail.get_message(
+                message_id, include_content=True,
+                account=account, mailbox=mailbox,
+            )
+            results["connector_fetch_time"] = round(time.time() - start, 2)
+            results["connector_fetch"] = "success"
+            results["connector_content_length"] = len(
+                connector_msg.get("content", "")
+            )
+        except Exception as e:
+            results["connector_fetch_time"] = round(time.time() - start, 2)
+            results["connector_fetch"] = "failed"
+            results["connector_fetch_error"] = f"{type(e).__name__}: {e}"
+
     return {"success": True, **results}
 
 
