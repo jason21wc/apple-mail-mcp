@@ -736,7 +736,14 @@ class TestGetMessage:
                 b"FLAGS": (b"\\Seen",),
             }
             if include_body_fetch:
-                entry[b"BODY[TEXT]"] = body
+                rfc822_body = (
+                    b"From: alice@example.com\r\n"
+                    b"Subject: Hello\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Content-Transfer-Encoding: 7bit\r\n"
+                    b"\r\n"
+                ) + (body if isinstance(body, bytes) else body.encode())
+                entry[b"BODY[]"] = rfc822_body
             if include_header_fetch:
                 entry[b"BODY[HEADER]"] = (
                     b"From: alice@example.com\r\nSubject: Hello\r\n"
@@ -809,11 +816,11 @@ class TestGetMessage:
         assert result["read_status"] is True
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_default_fetch_keys_include_body_text(
+    def test_default_fetch_keys_include_body(
         self, mock_cls: MagicMock
     ) -> None:
         """Default include_content=True and headers_only=False → fetch
-        ENVELOPE + FLAGS + BODY[TEXT]."""
+        ENVELOPE + FLAGS + BODY[] (full RFC 822 for proper decoding)."""
         self._setup_client(mock_cls)
 
         ImapConnector("h", 993, "u@e.com", "pw").get_message(
@@ -823,7 +830,7 @@ class TestGetMessage:
         fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
         assert b"ENVELOPE" in fetch_keys
         assert b"FLAGS" in fetch_keys
-        assert b"BODY[TEXT]" in fetch_keys
+        assert b"BODY[]" in fetch_keys
         assert b"BODY[HEADER]" not in fetch_keys
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
@@ -837,7 +844,7 @@ class TestGetMessage:
         )
 
         fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
-        assert b"BODY[TEXT]" not in fetch_keys
+        assert b"BODY[]" not in fetch_keys
         assert b"BODY[HEADER]" not in fetch_keys
         # content empty when not requested.
         assert result["content"] == ""
@@ -860,8 +867,78 @@ class TestGetMessage:
 
         fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
         assert b"BODY[HEADER]" in fetch_keys
-        assert b"BODY[TEXT]" not in fetch_keys
+        assert b"BODY[]" not in fetch_keys
         assert result["content"] == ""
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_body_content_decodes_quoted_printable(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """IMAP body content must be decoded from content-transfer-encoding
+        before returning — quoted-printable =3D artifacts should not leak."""
+        qp_body = (
+            b"From: alice@example.com\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"Content-Transfer-Encoding: quoted-printable\r\n"
+            b"\r\n"
+            b'<html><body>content=3D"yes" price=3D$5</body></html>'
+        )
+        client = self._setup_client(mock_cls, body=b"unused")
+        # Override the fetch return to use our custom RFC 822 message.
+        client.fetch.return_value = {
+            42: {
+                b"ENVELOPE": _fake_envelope(),
+                b"FLAGS": (b"\\Seen",),
+                b"BODY[]": qp_body,
+            }
+        }
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_message(
+            "abc@x", mailbox="INBOX", include_content=True,
+        )
+
+        assert "=3D" not in result["content"]
+        assert 'content="yes"' in result["content"]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_body_content_decodes_multipart_prefers_html(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """Multipart messages: extract and decode the text/html part,
+        matching AppleScript's content-of-msg behavior."""
+        multipart_body = (
+            b"From: alice@example.com\r\n"
+            b"Content-Type: multipart/alternative;\r\n"
+            b' boundary="BOUND"\r\n'
+            b"\r\n"
+            b"--BOUND\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Transfer-Encoding: 7bit\r\n"
+            b"\r\n"
+            b"plain text version\r\n"
+            b"--BOUND\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"Content-Transfer-Encoding: quoted-printable\r\n"
+            b"\r\n"
+            b"<html>price=3D$5</html>\r\n"
+            b"--BOUND--\r\n"
+        )
+        client = self._setup_client(mock_cls, body=b"unused")
+        client.fetch.return_value = {
+            42: {
+                b"ENVELOPE": _fake_envelope(),
+                b"FLAGS": (b"\\Seen",),
+                b"BODY[]": multipart_body,
+            }
+        }
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_message(
+            "abc@x", mailbox="INBOX", include_content=True,
+        )
+
+        assert "=3D" not in result["content"]
+        assert "<html>price=$5</html>" in result["content"]
+        assert "plain text version" not in result["content"]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_no_match_raises_message_not_found(

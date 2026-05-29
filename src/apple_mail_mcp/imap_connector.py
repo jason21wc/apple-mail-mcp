@@ -22,6 +22,8 @@ See ``docs/plans/2026-04-23-imap-connector-design.md``.
 
 from __future__ import annotations
 
+import email as _email
+import email.policy as _email_policy
 import logging
 import re
 import threading
@@ -297,6 +299,39 @@ def _strip_brackets(s: str) -> str:
     if s.startswith("<") and s.endswith(">"):
         return s[1:-1]
     return s
+
+
+def _extract_body_content(raw_rfc822: bytes) -> str:
+    """Parse a raw RFC 822 message and return decoded body text.
+
+    Uses ``get_payload(decode=True)`` which handles
+    content-transfer-encoding (quoted-printable, base64) automatically.
+    For multipart messages, prefers ``text/html`` over ``text/plain`` —
+    matching what AppleScript's ``content of msg`` returns from Mail.app.
+    """
+    msg = _email.message_from_bytes(raw_rfc822, policy=_email_policy.default)
+
+    if not msg.is_multipart():
+        return _decode_part(msg)
+
+    plain: str | None = None
+    for part in msg.walk():
+        ct = part.get_content_type()
+        if ct == "text/html":
+            return _decode_part(part)
+        if ct == "text/plain" and plain is None:
+            plain = _decode_part(part)
+
+    return plain or ""
+
+
+def _decode_part(part: _email.message.Message) -> str:
+    """Decode a single MIME part's payload to a string."""
+    charset = part.get_content_charset() or "utf-8"
+    raw = part.get_payload(decode=True)
+    if not isinstance(raw, bytes):
+        return str(raw) if raw is not None else ""
+    return raw.decode(charset, errors="replace")
 
 
 def _flatten_thread_clusters(tree: Any) -> Iterator[set[int]]:
@@ -684,7 +719,7 @@ class ImapConnector:
         fetch_keys: list[bytes] = [b"ENVELOPE", b"FLAGS"]
         want_body = include_content and not headers_only
         if want_body:
-            fetch_keys.append(b"BODY[TEXT]")
+            fetch_keys.append(b"BODY[]")
         elif headers_only:
             # We don't currently use the raw header block for anything in
             # the response (envelope already gives us subject/sender/date),
@@ -712,8 +747,8 @@ class ImapConnector:
                 entry[b"ENVELOPE"], tuple(entry[b"FLAGS"])
             )
             if want_body:
-                body_bytes = entry.get(b"BODY[TEXT]") or b""
-                result["content"] = _decode(body_bytes)
+                rfc822_bytes = entry.get(b"BODY[]") or b""
+                result["content"] = _extract_body_content(rfc822_bytes)
             else:
                 result["content"] = ""
             if include_attachments:
