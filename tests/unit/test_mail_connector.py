@@ -3764,6 +3764,34 @@ class TestAppleMailConnector:
         script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
         assert "repeat with acc in accounts" in script
 
+    @patch("subprocess.run")
+    def test_get_message_applescript_result_record_balanced_braces(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Regression: the AppleScript result record must have balanced
+        {{ ... }} braces for both RFC and numeric IDs, with and without
+        account+mailbox hints."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"id":"1","rfc_message_id":"x@y","subject":"Hi",'
+                   '"sender":"a@b","date_received":"2026-01-01",'
+                   '"read_status":true,"flagged":false,"content":"body"}',
+            stderr="",
+        )
+        for msg_id in ("12345", "abc@server.com"):
+            for hints in (
+                {},
+                {"account": "iCloud", "mailbox": "INBOX"},
+            ):
+                connector._get_message_applescript(msg_id, True, **hints)
+                script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
+                assert "set resultData to {{" in script, (
+                    f"missing opening {{ for id={msg_id}, hints={hints}"
+                )
+                assert "}}" in script, (
+                    f"missing closing }} for id={msg_id}, hints={hints}"
+                )
+
     def test_get_message_fallback_threads_account_mailbox(
         self, connector: AppleMailConnector
     ) -> None:

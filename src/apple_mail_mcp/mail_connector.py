@@ -1607,7 +1607,7 @@ class AppleMailConnector:
             ' |date_received|:(date received of msg as text),'
             ' |read_status|:(read status of msg),'
             ' |flagged|:(flagged status of msg),'
-            f' |content|:msgContent{attachments_field}}}'
+            f' |content|:msgContent{attachments_field}}}}}'
         )
 
         if account is not None and mailbox is not None:
