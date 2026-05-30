@@ -76,7 +76,11 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
-        assert "|name|:(name of att)" in script
+        # Each property is now read into a variable under its own try
+        # (resilient to Mail.app -10000 on e.g. MIME type), but the record
+        # key must still be |quoted|.
+        assert "|name|:attName" in script
+        assert "set attName to name of att" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_script_quotes_size_key(
@@ -90,8 +94,30 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("msg-1")
         script = mock_run.call_args[0][0]
-        assert "|size|:(file size of att)" in script
-        assert ", size:(file size of att)" not in script
+        assert "|size|:attSize" in script
+        assert "set attSize to (file size of att)" in script
+        # The bare (collision-prone) form must never appear.
+        assert ", size:" not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_attachments_reads_each_property_defensively(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Regression: Mail.app raises -10000 on some attachment properties
+        (e.g. MIME type of certain PDFs). Each property read must be in its
+        own try with a safe default so one throw can't abort the whole
+        enumeration — which returned [] and silently broke save_attachments
+        (it depends on this enumeration for the filenames)."""
+        mock_run.return_value = "[]"
+        connector.get_attachments("msg-1")
+        script = mock_run.call_args[0][0]
+        # The error-prone MIME read is guarded with a default.
+        assert "set attMime to (MIME type of att)" in script
+        assert "on error" in script
+        # All four properties go through a variable (not inline in the record),
+        # so a single failing property can't drop the whole list.
+        for var in ("attName", "attMime", "attSize", "attDownloaded"):
+            assert var in script
 
 
 class TestSaveAttachments:

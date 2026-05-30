@@ -1934,7 +1934,33 @@ class AppleMailConnector:
 
                         set resultData to {{}}
                         repeat with att in attList
-                            set attRecord to {{|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}}
+                            -- Each property is read defensively: Mail.app
+                            -- raises -10000 on some attachments (e.g. MIME
+                            -- type of certain PDFs), and a single throw must
+                            -- not abort the whole enumeration — that returned
+                            -- [] and silently broke save_attachments, which
+                            -- depends on this enumeration for the names.
+                            try
+                                set attName to name of att
+                            on error
+                                set attName to ""
+                            end try
+                            try
+                                set attMime to (MIME type of att)
+                            on error
+                                set attMime to ""
+                            end try
+                            try
+                                set attSize to (file size of att)
+                            on error
+                                set attSize to 0
+                            end try
+                            try
+                                set attDownloaded to (downloaded of att)
+                            on error
+                                set attDownloaded to false
+                            end try
+                            set attRecord to {{|name|:attName, |mime_type|:attMime, |size|:attSize, |downloaded|:attDownloaded}}
                             set end of resultData to attRecord
                         end repeat
                         exit repeat
