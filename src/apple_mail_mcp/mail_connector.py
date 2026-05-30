@@ -1653,7 +1653,18 @@ class AppleMailConnector:
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        return cast(dict[str, Any], parse_applescript_json(result))
+        parsed = parse_applescript_json(result)
+        if not isinstance(parsed, dict):
+            # Defensive: a degenerate/empty AppleScript record serializes to
+            # an empty JSON array, because AppleScript `{}` is ambiguous and
+            # ASObjC bridges an empty record to NSArray (not NSDictionary).
+            # Returning that list would break every dict-expecting caller
+            # (e.g. `.get(...)` → AttributeError). Treat it as not-found.
+            raise MailMessageNotFoundError(
+                f"Message {message_id!r} not found "
+                f"(degenerate AppleScript result)."
+            )
+        return parsed
 
     def auto_template_vars(self, message_id: str | None) -> dict[str, str]:
         """Build the auto-fill variable dict for render_template.
