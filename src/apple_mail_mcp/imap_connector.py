@@ -247,6 +247,41 @@ def _iso_to_imap_before(iso: str, field: str) -> str:
     return f"{d.day:02d}-{_IMAP_MONTHS[d.month - 1]}-{d.year}"
 
 
+def _reject_control_chars(value: str, field: str) -> None:
+    """Raise ValueError if ``value`` contains a C0 control character or DEL.
+
+    IMAP command arguments and RFC 3501 quoted strings must not contain
+    CR/LF. imapclient quotes string args but does NOT promote CR/LF-bearing
+    values to literals (its 8-bit detector only fires on bytes > 127), so a
+    raw CRLF embedded in a value is sent inline on the authenticated control
+    channel and splits the command — letting following bytes be parsed as a
+    new tagged command (IMAP command injection, CWE-93). Applied to every
+    free-text value that becomes an IMAP command argument (SEARCH terms,
+    Message-IDs, mailbox names) before it can reach the wire.
+    """
+    for ch in value:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise ValueError(
+                f"{field} contains a disallowed control character "
+                f"(U+{ord(ch):04X}); control characters are not permitted "
+                f"in IMAP command arguments"
+            )
+
+
+def _bracket_message_id(message_id: str) -> str:
+    """Validate a Message-ID and return it in RFC 5322 bracketed form.
+
+    Rejects control characters (see :func:`_reject_control_chars`), then
+    wraps the id in angle brackets unless it already is. Single chokepoint
+    for every ``SEARCH HEADER "Message-ID" "<id>"`` construction so no call
+    site can build a bracketed id without the CRLF-injection guard.
+    """
+    _reject_control_chars(message_id, "message_id")
+    if message_id.startswith("<") and message_id.endswith(">"):
+        return message_id
+    return f"<{message_id}>"
+
+
 def _build_search_criteria(
     sender_contains: str | None,
     subject_contains: str | None,
@@ -264,8 +299,10 @@ def _build_search_criteria(
     """
     criteria: list[Any] = []
     if sender_contains:
+        _reject_control_chars(sender_contains, "sender_contains")
         criteria.extend(["FROM", sender_contains])
     if subject_contains:
+        _reject_control_chars(subject_contains, "subject_contains")
         criteria.extend(["SUBJECT", subject_contains])
     if read_status is True:
         criteria.append("SEEN")
@@ -280,8 +317,10 @@ def _build_search_criteria(
     if date_to is not None:
         criteria.extend(["BEFORE", _iso_to_imap_before(date_to, "date_to")])
     if body_contains:
+        _reject_control_chars(body_contains, "body_contains")
         criteria.extend(["BODY", body_contains])
     if text_contains:
+        _reject_control_chars(text_contains, "text_contains")
         criteria.extend(["TEXT", text_contains])
     return criteria or ["ALL"]
 
@@ -685,6 +724,7 @@ class ImapConnector:
             body_contains,
             text_contains,
         )
+        _reject_control_chars(mailbox, "mailbox")
 
         with self._session() as client:
             client.select_folder(mailbox, readonly=True)
@@ -774,11 +814,8 @@ class ImapConnector:
                 back to AppleScript.)
             IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
         """
-        bracketed = (
-            message_id
-            if message_id.startswith("<") and message_id.endswith(">")
-            else f"<{message_id}>"
-        )
+        bracketed = _bracket_message_id(message_id)
+        _reject_control_chars(mailbox, "mailbox")
 
         fetch_keys: list[bytes] = [b"ENVELOPE", b"FLAGS"]
         want_body = include_content and not headers_only
@@ -859,11 +896,8 @@ class ImapConnector:
                 the Message-ID.
             IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
         """
-        bracketed = (
-            message_id
-            if message_id.startswith("<") and message_id.endswith(">")
-            else f"<{message_id}>"
-        )
+        bracketed = _bracket_message_id(message_id)
+        _reject_control_chars(mailbox, "mailbox")
 
         with self._session() as client:
             client.select_folder(mailbox, readonly=True)
@@ -1030,6 +1064,7 @@ class ImapConnector:
             ``read_status``, ``flagged``), deduped by Message-ID, sorted
             chronologically ascending.
         """
+        _reject_control_chars(anchor_rfc_message_id, "anchor_rfc_message_id")
         with self._session() as client:
             # Tier 1: Gmail X-GM-THRID via [Gmail]/All Mail
             if self._has_capability(client, b"X-GM-EXT-1"):
@@ -1083,6 +1118,7 @@ class ImapConnector:
             imapclient.exceptions.IMAPClientError: Server-side error
                 (mailbox doesn't exist, permission denied, etc.).
         """
+        _reject_control_chars(name, "name")
         with self._session() as client:
             try:
                 info = client.select_folder(name, readonly=True)
@@ -1128,6 +1164,8 @@ class ImapConnector:
                 (source missing, destination exists, parent missing,
                 permission denied, etc.).
         """
+        _reject_control_chars(old_name, "old_name")
+        _reject_control_chars(new_name, "new_name")
         with self._session() as client:
             client.rename_folder(old_name, new_name)
 
@@ -1171,10 +1209,9 @@ class ImapConnector:
             IMAPClientError: SELECT / SEARCH / MOVE / COPY / STORE /
                 EXPUNGE failed at the protocol level.
         """
-        bracketed_ids = [
-            mid if mid.startswith("<") and mid.endswith(">") else f"<{mid}>"
-            for mid in message_ids
-        ]
+        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _reject_control_chars(source_mailbox, "source_mailbox")
+        _reject_control_chars(destination_mailbox, "destination_mailbox")
 
         with self._session() as client:
             client.select_folder(source_mailbox, readonly=False)
@@ -1249,10 +1286,8 @@ class ImapConnector:
                 SPECIAL-USE or conventional names.
             IMAPClientError: Protocol-level failure.
         """
-        bracketed_ids = [
-            mid if mid.startswith("<") and mid.endswith(">") else f"<{mid}>"
-            for mid in message_ids
-        ]
+        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
             # #199 / #198: do all LIST traffic in AUTHENTICATED state.
@@ -1328,10 +1363,8 @@ class ImapConnector:
             IMAPClientError: SELECT / SEARCH / STORE failed at the
                 protocol level.
         """
-        bracketed_ids = [
-            mid if mid.startswith("<") and mid.endswith(">") else f"<{mid}>"
-            for mid in message_ids
-        ]
+        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
             client.select_folder(source_mailbox, readonly=False)
@@ -1387,10 +1420,8 @@ class ImapConnector:
             IMAPClientError: SELECT / SEARCH / STORE failed at the
                 protocol level.
         """
-        bracketed_ids = [
-            mid if mid.startswith("<") and mid.endswith(">") else f"<{mid}>"
-            for mid in message_ids
-        ]
+        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
             client.select_folder(source_mailbox, readonly=False)
@@ -1523,7 +1554,7 @@ class ImapConnector:
 
         client.select_folder(all_mail, readonly=True)
 
-        bracketed = f"<{anchor_rfc_message_id}>"
+        bracketed = _bracket_message_id(anchor_rfc_message_id)
         try:
             anchor_uids = client.search(["HEADER", "Message-ID", bracketed])
         except IMAPClientError:
@@ -1586,7 +1617,7 @@ class ImapConnector:
         falls through to Tier 2 / Tier 3.
         """
         # Step 1: locate the anchor's UID. Try INBOX first, then \\Sent.
-        bracketed = f"<{anchor_rfc_message_id}>"
+        bracketed = _bracket_message_id(anchor_rfc_message_id)
         anchor_uid: int | None = None
         for folder_name in self._anchor_lookup_folders(client):
             try:
@@ -1685,7 +1716,7 @@ class ImapConnector:
         Returns ``None`` (not raise) when THREAD gets rejected
         mid-flight — dispatcher then falls through to Tier 3.
         """
-        bracketed = f"<{anchor_rfc_message_id}>"
+        bracketed = _bracket_message_id(anchor_rfc_message_id)
         # Pick the algorithm name the server actually advertises.
         if self._has_capability(client, b"THREAD=REFERENCES"):
             algo = "REFERENCES"
@@ -1832,7 +1863,7 @@ class ImapConnector:
             # substring; each search is server-side and indexed.
             uids_found: set[int] = set()
             for id_ in known_ids:
-                id_quoted = f"<{id_}>"
+                id_quoted = _bracket_message_id(id_)
                 for header in ("Message-ID", "In-Reply-To", "References"):
                     try:
                         uids = client.search(["HEADER", header, id_quoted])
