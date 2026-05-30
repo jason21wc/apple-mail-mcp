@@ -6245,3 +6245,30 @@ class TestGetAttachmentContentRouting:
                 )
 
         as_path.assert_not_called()
+
+
+class TestGetMessageDegenerateRecordGuard:
+    """get_message must not return a list when AppleScript emits a
+    degenerate/empty record (which ASObjC bridges to `[]`, not `{}`)."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def test_empty_array_result_raises_not_found(
+        self, connector: AppleMailConnector
+    ) -> None:
+        # No account/mailbox hints → AppleScript path. A degenerate record
+        # serializes to "[]"; the guard must raise rather than return a list.
+        with patch.object(connector, "_run_applescript", return_value="[]"):
+            with pytest.raises(MailMessageNotFoundError):
+                connector.get_message("123")
+
+    def test_normal_record_still_returns_dict(
+        self, connector: AppleMailConnector
+    ) -> None:
+        payload = '{"id": "123", "subject": "Hi", "content": "body"}'
+        with patch.object(connector, "_run_applescript", return_value=payload):
+            result = connector.get_message("123")
+        assert isinstance(result, dict)
+        assert result["id"] == "123"
