@@ -390,6 +390,59 @@ class TestMailIntegration:
             # Documented divergence — IMAP path always reports False.
             assert att["downloaded"] is False
 
+    def test_get_attachment_content_via_imap(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """IMAP byte-fetch reads attachment content straight from the
+        server — works even when Mail.app has NOT downloaded the
+        attachment locally (the AppleScript path raises -10000 on an
+        undownloaded placeholder). This is the fix for the hotel-report
+        PDF extraction path.
+
+        Skips if the account has no IMAP Keychain entry, or if the test
+        inbox has no message carrying an attachment.
+        """
+        from apple_mail_mcp.exceptions import (
+            MailKeychainAccessDeniedError,
+            MailKeychainEntryNotFoundError,
+        )
+        from apple_mail_mcp.keychain import get_imap_password
+
+        try:
+            _, _, email = connector._resolve_imap_config(test_account)
+            get_imap_password(test_account, email)
+        except (
+            MailKeychainEntryNotFoundError,
+            MailKeychainAccessDeniedError,
+        ):
+            pytest.skip(
+                f"No Keychain entry for {test_account!r} — IMAP path "
+                f"can't be exercised. Run `apple-mail-mcp setup-imap` first."
+            )
+
+        matches = connector.search_messages(
+            account=test_account, mailbox="INBOX",
+            has_attachment=True, limit=1,
+        )
+        if not matches:
+            pytest.skip("test inbox has no messages with attachments")
+
+        rfc_id = matches[0].get("rfc_message_id") or matches[0].get("id")
+        assert rfc_id, "search row missing rfc_message_id/id"
+
+        result = connector.get_attachment_content(
+            rfc_id, attachment_index=0,
+            account=test_account, mailbox="INBOX",
+        )
+
+        assert set(result.keys()) >= {
+            "name", "mime_type", "size", "content", "is_binary",
+        }
+        assert isinstance(result["content"], str)
+        assert isinstance(result["is_binary"], bool)
+        # Bytes came from the server regardless of Mail.app download state.
+        assert result["size"] >= 0
+
 
 class TestDraftsLifecycleIntegration:
     """Integration tests for the drafts lifecycle (#134).

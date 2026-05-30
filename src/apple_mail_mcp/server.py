@@ -1391,6 +1391,8 @@ def get_thread(message_id: str) -> dict[str, Any]:
 def get_attachment_content(
     message_id: str,
     attachment_index: int = 0,
+    account: str | None = None,
+    mailbox: str | None = None,
 ) -> dict[str, Any]:
     """
     Read attachment content from a message without saving to disk.
@@ -1399,16 +1401,25 @@ def get_attachment_content(
     Use this to inspect attachment content before deciding on a save location
     or filename.
 
+    Pass ``account`` and ``mailbox`` (the same ones from search_messages) to
+    use the IMAP fast path, which fetches the bytes directly from the server.
+    This works even when Mail.app has not downloaded the attachment locally —
+    the AppleScript fallback fails on undownloaded placeholder attachments.
+
     Args:
-        message_id: Message ID from search results
+        message_id: Message ID from search results. RFC 5322 Message-ID for
+            the IMAP path, Mail.app numeric id for the AppleScript fallback.
         attachment_index: Zero-based index of the attachment to read (default: 0)
+        account: Mail.app account name. With ``mailbox``, enables the IMAP
+            fast path (download-independent).
+        mailbox: Folder to look in for the IMAP fast path (e.g. "INBOX").
 
     Returns:
         Dictionary with name, mime_type, size, content, and is_binary flag
 
     Example:
-        >>> get_attachment_content("12345")
-        {"success": True, "name": "report.txt", "content": "...", "is_binary": False}
+        >>> get_attachment_content("<id@host>", account="iCloud", mailbox="INBOX")
+        {"success": True, "name": "report.pdf", "content": "...", "is_binary": True}
     """
     try:
         rate_err = check_rate_limit("get_attachment_content", {"message_id": message_id})
@@ -1418,6 +1429,8 @@ def get_attachment_content(
         result = mail.get_attachment_content(
             message_id=message_id,
             attachment_index=attachment_index,
+            account=account,
+            mailbox=mailbox,
         )
 
         operation_logger.log_operation(

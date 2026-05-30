@@ -480,6 +480,42 @@ def _bodystructure_extract_attachments(
     return out
 
 
+def _email_attachment_parts(
+    msg: _email.message.Message,
+) -> list[_email.message.Message]:
+    """Walk a stdlib-parsed message and return its attachment parts.
+
+    Mirrors :func:`_bodystructure_extract_attachments`' notion of an
+    "attachment", but operates on a fully-parsed ``email.message`` tree
+    rather than a BODYSTRUCTURE tuple. The stdlib parser handles MIME
+    quirks the tuple walker can miss — notably a binary part that omits
+    ``Content-Disposition`` and carries its filename only in the
+    ``Content-Type`` ``name=`` param (e.g. ``application/pdf`` from some
+    mailers), which is exactly the case where the BODYSTRUCTURE path
+    returned ``[]``.
+
+    A leaf part counts as an attachment when any of:
+      - ``Content-Disposition`` is ``attachment``;
+      - it carries a filename (inline-with-filename or ``name=``);
+      - it is a non-text, non-multipart part (``application/*``,
+        ``image/*``, ``message/rfc822`` forwarded mail, ...).
+
+    Multipart containers and text/* body parts without a filename are
+    skipped. Ordering matches a depth-first walk, the same order
+    ``get_attachments`` enumerates, so ``attachment_index`` lines up.
+    """
+    out: list[_email.message.Message] = []
+    for part in msg.walk():
+        maintype = part.get_content_maintype()
+        if maintype == "multipart":
+            continue
+        disp = part.get_content_disposition()
+        filename = part.get_filename()
+        if disp == "attachment" or filename is not None or maintype != "text":
+            out.append(part)
+    return out
+
+
 def _bodystructure_has_attachment(structure: Any) -> bool:
     """Walk an IMAPClient-parsed BODYSTRUCTURE tree and detect attachments.
 
@@ -816,6 +852,100 @@ class ImapConnector:
             return _bodystructure_extract_attachments(
                 entry.get(b"BODYSTRUCTURE")
             )
+
+    def get_attachment_content(
+        self,
+        message_id: str,
+        attachment_index: int = 0,
+        mailbox: str = "INBOX",
+        *,
+        max_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        """Fetch one attachment's bytes via IMAP and return its content.
+
+        Looks the message up by RFC 5322 Message-ID, fetches the full
+        RFC 822 source (``BODY[]``), and walks the MIME tree with the
+        stdlib ``email`` parser to pull the attachment at
+        ``attachment_index``. The bytes come straight from the server, so
+        — unlike the AppleScript path — this works even when Mail.app has
+        not downloaded the attachment locally (AppleScript's ``save``
+        raises ``-10000`` on an undownloaded placeholder).
+
+        Args:
+            message_id: RFC 5322 Message-ID, with or without ``<>``.
+            attachment_index: Zero-based index into the message's
+                attachment parts, in the same order ``get_attachments``
+                enumerates them.
+            mailbox: Folder to SELECT before fetching.
+            max_bytes: Optional ceiling; raises ``ValueError`` when the
+                decoded attachment exceeds it (mirrors the AppleScript
+                path's size guard).
+
+        Returns:
+            Dict with keys ``name``, ``mime_type``, ``size``, ``content``
+            (text for text/* parts, base64 otherwise), and ``is_binary``.
+
+        Raises:
+            ValueError: ``attachment_index`` is negative or out of range,
+                or the attachment exceeds ``max_bytes``.
+            MailMessageNotFoundError: No message matches the Message-ID.
+            IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
+        """
+        import base64
+
+        if attachment_index < 0:
+            raise ValueError("attachment_index must be non-negative")
+
+        bracketed = (
+            message_id
+            if message_id.startswith("<") and message_id.endswith(">")
+            else f"<{message_id}>"
+        )
+
+        with self._session() as client:
+            client.select_folder(mailbox, readonly=True)
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if not uids:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} not found in mailbox "
+                    f"{mailbox!r} on {self._host}."
+                )
+            fetched = client.fetch(uids[:1], [b"BODY[]"])
+            entry = next(iter(fetched.values()))
+            rfc822_bytes = entry.get(b"BODY[]") or b""
+
+        msg = _email.message_from_bytes(
+            rfc822_bytes, policy=_email_policy.default
+        )
+        parts = _email_attachment_parts(msg)
+        if attachment_index >= len(parts):
+            raise ValueError("Attachment index out of range")
+
+        part = parts[attachment_index]
+        raw = part.get_payload(decode=True)
+        raw = bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
+
+        if max_bytes is not None and len(raw) > max_bytes:
+            raise ValueError(
+                f"Attachment too large ({len(raw) // (1024 * 1024)} MB); "
+                f"use save_attachments to download to disk instead"
+            )
+
+        if part.get_content_maintype() == "text":
+            charset = part.get_content_charset() or "utf-8"
+            content = raw.decode(charset, errors="replace")
+            is_binary = False
+        else:
+            content = base64.b64encode(raw).decode("ascii")
+            is_binary = True
+
+        return {
+            "name": part.get_filename() or "",
+            "mime_type": part.get_content_type(),
+            "size": len(raw),
+            "content": content,
+            "is_binary": is_binary,
+        }
 
     def find_thread_members(
         self,

@@ -72,6 +72,8 @@ class TestGetAttachmentContent:
         mock_mail.get_attachment_content.assert_called_once_with(
             message_id="msg-123",
             attachment_index=0,
+            account=None,
+            mailbox=None,
         )
 
     def test_binary_file_returns_base64_content(
@@ -95,6 +97,8 @@ class TestGetAttachmentContent:
         mock_mail.get_attachment_content.assert_called_once_with(
             message_id="msg-456",
             attachment_index=1,
+            account=None,
+            mailbox=None,
         )
 
     def test_message_not_found_returns_error(
@@ -169,6 +173,35 @@ class TestGetAttachmentContent:
         mock_mail.get_attachment_content.assert_called_once_with(
             message_id="msg-789",
             attachment_index=0,
+            account=None,
+            mailbox=None,
+        )
+
+    def test_account_and_mailbox_passed_through_for_imap_path(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """account + mailbox forward to the connector to enable the IMAP
+        fast path (download-independent attachment fetch)."""
+        mock_mail.get_attachment_content.return_value = {
+            "name": "04 FS.pdf",
+            "mime_type": "application/pdf",
+            "size": 2048,
+            "content": "JVBERi0=",
+            "is_binary": True,
+        }
+
+        result = get_attachment_content(
+            "<id@host>", attachment_index=0,
+            account="iCloud", mailbox="INBOX",
+        )
+
+        assert result["success"] is True
+        assert result["name"] == "04 FS.pdf"
+        mock_mail.get_attachment_content.assert_called_once_with(
+            message_id="<id@host>",
+            attachment_index=0,
+            account="iCloud",
+            mailbox="INBOX",
         )
 
 

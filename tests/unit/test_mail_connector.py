@@ -6129,3 +6129,119 @@ class TestDeleteMailbox:
         mock_cfg.assert_not_called()
         mock_pw.assert_not_called()
         mock_imap_cls.assert_not_called()
+
+
+class TestGetAttachmentContentRouting:
+    """get_attachment_content IMAP-first dispatch + AppleScript fallback.
+
+    Mirrors the get_message routing contract: IMAP only when both account
+    and mailbox are supplied and the breaker is closed; connection/auth
+    failures fall back to AppleScript; ValueError/not-found propagate.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def test_uses_imap_when_account_and_mailbox_given(
+        self, connector: AppleMailConnector
+    ) -> None:
+        imap_result = {"name": "x.pdf", "content": "AAA", "is_binary": True}
+        with patch.object(
+            connector, "_imap_get_attachment_content",
+            return_value=imap_result,
+        ) as imap_path, patch.object(
+            connector, "_get_attachment_content_applescript",
+        ) as as_path:
+            result = connector.get_attachment_content(
+                "id@host", attachment_index=0,
+                account="iCloud", mailbox="INBOX",
+            )
+
+        assert result == imap_result
+        imap_path.assert_called_once()
+        as_path.assert_not_called()
+
+    def test_no_hints_uses_applescript(
+        self, connector: AppleMailConnector
+    ) -> None:
+        with patch.object(
+            connector, "_imap_get_attachment_content",
+        ) as imap_path, patch.object(
+            connector, "_get_attachment_content_applescript",
+            return_value={"name": "x"},
+        ) as as_path:
+            connector.get_attachment_content("123", attachment_index=0)
+
+        imap_path.assert_not_called()
+        as_path.assert_called_once_with("123", 0)
+
+    def test_partial_hint_skips_imap(
+        self, connector: AppleMailConnector
+    ) -> None:
+        with patch.object(
+            connector, "_imap_get_attachment_content",
+        ) as imap_path, patch.object(
+            connector, "_get_attachment_content_applescript",
+            return_value={"name": "x"},
+        ):
+            connector.get_attachment_content("123", account="iCloud")
+            connector.get_attachment_content("123", mailbox="INBOX")
+
+        imap_path.assert_not_called()
+
+    def test_skips_imap_when_breaker_open(
+        self, connector: AppleMailConnector
+    ) -> None:
+        with patch.object(
+            connector, "_imap_breaker_open", return_value=True,
+        ), patch.object(
+            connector, "_imap_get_attachment_content",
+        ) as imap_path, patch.object(
+            connector, "_get_attachment_content_applescript",
+            return_value={"name": "x"},
+        ) as as_path:
+            connector.get_attachment_content(
+                "id@host", account="iCloud", mailbox="INBOX",
+            )
+
+        imap_path.assert_not_called()
+        as_path.assert_called_once()
+
+    def test_falls_back_on_login_error(
+        self, connector: AppleMailConnector
+    ) -> None:
+        with patch.object(
+            connector, "_imap_get_attachment_content",
+            side_effect=LoginError("AUTHENTICATIONFAILED"),
+        ) as imap_path, patch.object(
+            connector, "_get_attachment_content_applescript",
+            return_value={"name": "fallback"},
+        ) as as_path, patch.object(connector, "_log_imap_fallback") as log_fb:
+            result = connector.get_attachment_content(
+                "id@host", account="iCloud", mailbox="INBOX",
+            )
+
+        assert result == {"name": "fallback"}
+        imap_path.assert_called_once()
+        as_path.assert_called_once()
+        log_fb.assert_called_once()
+
+    def test_value_error_propagates_without_fallback(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Index-out-of-range from the IMAP path is a real error, not a
+        connection failure — it must NOT silently fall back to AppleScript."""
+        with patch.object(
+            connector, "_imap_get_attachment_content",
+            side_effect=ValueError("Attachment index out of range"),
+        ), patch.object(
+            connector, "_get_attachment_content_applescript",
+        ) as as_path:
+            with pytest.raises(ValueError, match="out of range"):
+                connector.get_attachment_content(
+                    "id@host", attachment_index=9,
+                    account="iCloud", mailbox="INBOX",
+                )
+
+        as_path.assert_not_called()

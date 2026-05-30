@@ -1868,6 +1868,90 @@ class AppleMailConnector:
         self,
         message_id: str,
         attachment_index: int = 0,
+        *,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> dict[str, Any]:
+        """Read attachment content from a message without saving to disk.
+
+        Tries the IMAP path first when both ``account`` and ``mailbox`` are
+        supplied and the account's circuit breaker is closed. IMAP fetches
+        the attachment bytes straight from the server, so it works even when
+        Mail.app has not downloaded the attachment locally — the AppleScript
+        ``save`` raises ``-10000`` on an undownloaded placeholder. Falls back
+        to AppleScript on any IMAP connection/auth failure, and whenever no
+        account/mailbox hint is given.
+
+        Identifier semantics mirror :meth:`get_message`: the IMAP path
+        matches the RFC 5322 Message-ID, the AppleScript path matches
+        Mail.app's numeric id. Forward the same ``account`` + ``mailbox``
+        you got from ``search_messages`` to stay on the fast,
+        download-independent IMAP path.
+
+        Args:
+            message_id: Message ID. RFC 5322 form for the IMAP path,
+                Mail.app numeric id for the AppleScript path.
+            attachment_index: Zero-based index of the attachment to read.
+            account: Mail.app account name. With ``mailbox``, enables IMAP.
+            mailbox: Folder to look in for the IMAP path.
+
+        Returns:
+            Dict with keys: name, mime_type, size, content (text or
+            base64), is_binary.
+
+        Raises:
+            MailMessageNotFoundError: If the message doesn't exist.
+            ValueError: If attachment_index is out of range or negative,
+                or the attachment exceeds the size limit.
+        """
+        if (
+            account is not None
+            and mailbox is not None
+            and not self._imap_breaker_open(account)
+        ):
+            try:
+                result = self._imap_get_attachment_content(
+                    account=account,
+                    mailbox=mailbox,
+                    message_id=message_id,
+                    attachment_index=attachment_index,
+                )
+                self._imap_clear_breaker(account)
+                return result
+            except _IMAP_FALLBACK_EXCS as exc:
+                self._log_imap_fallback(account, exc)
+                # fall through to AppleScript
+
+        return self._get_attachment_content_applescript(
+            message_id, attachment_index
+        )
+
+    def _imap_get_attachment_content(
+        self,
+        *,
+        account: str,
+        mailbox: str,
+        message_id: str,
+        attachment_index: int,
+    ) -> dict[str, Any]:
+        """Run get_attachment_content through the IMAP path. Mirrors
+        :meth:`_imap_get_message` — propagates fallback-triggering
+        exceptions unchanged so the caller can degrade to AppleScript.
+        """
+        host, port, email = self._resolve_imap_config(account)
+        password = get_imap_password(account, email)
+        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+        return imap.get_attachment_content(
+            message_id,
+            attachment_index=attachment_index,
+            mailbox=mailbox,
+            max_bytes=self._MAX_ATTACHMENT_READ_BYTES,
+        )
+
+    def _get_attachment_content_applescript(
+        self,
+        message_id: str,
+        attachment_index: int = 0,
     ) -> dict[str, Any]:
         """
         Read attachment content from a message without saving to disk.
