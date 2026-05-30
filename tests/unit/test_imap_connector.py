@@ -415,6 +415,13 @@ class TestHasAttachment:
         fetch_keys = mock_client.fetch.call_args[0][1]
         assert b"BODYSTRUCTURE" in fetch_keys
 
+    def test_real_imapclient_multipart_list_shape_detected(self) -> None:
+        """Regression: detect the attachment in a real (list-shaped)
+        IMAPClient multipart structure, not just the bare-tuple test shape."""
+        from apple_mail_mcp.imap_connector import _bodystructure_has_attachment
+
+        assert _bodystructure_has_attachment(_BS_REAL_ICLOUD_MIXED_PDF) is True
+
 
 class TestEnvelopeTranslation:
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
@@ -1066,6 +1073,33 @@ _BS_MANGLED_FILENAME = (
     (b"attachment", (b"filename", b"\xff\xfe\xff.pdf")),
 )
 
+# Verbatim BODYSTRUCTURE captured from a real iCloud message (a multipart/
+# mixed with a multipart/alternative body + an application/pdf attachment).
+# The crucial shape detail: IMAPClient groups multipart children in a LIST
+# at position 0 — ([child1, child2], b"mixed", ...) — NOT as bare tuple
+# elements. The old walker tested `isinstance(s[0], tuple)` and so misread
+# this multipart as a leaf, dropping the attachment (returned []).
+_BS_REAL_ICLOUD_MIXED_PDF = (
+    [
+        (
+            [
+                (b"text", b"plain", (b"CHARSET", b"UTF-8"), None, None,
+                 b"quoted-printable", 454, 27, None, None, None, None),
+                (b"text", b"html", (b"CHARSET", b"UTF-8"), None, None,
+                 b"quoted-printable", 1915, 33, None, None, None, None),
+            ],
+            b"alternative", (b"BOUNDARY", b"000000000000578ec60652f6a8ad"),
+            None, None, None,
+        ),
+        (
+            b"application", b"pdf", (b"NAME", b"04 FS.pdf"),
+            b"<f_mpr37zve0>", None, b"base64", 289236, None,
+            (b"ATTACHMENT", (b"FILENAME", b"04 FS.pdf")), None, None,
+        ),
+    ],
+    b"mixed", (b"BOUNDARY", b"000000000000578ec70652f6a8af"), None, None, None,
+)
+
 
 class TestGetAttachments:
     """ImapConnector.get_attachments — Message-ID lookup + BODYSTRUCTURE walk."""
@@ -1310,6 +1344,27 @@ class TestGetAttachments:
                 "abc@x", mailbox="INBOX",
             )
         client.logout.assert_called_once()
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_real_imapclient_multipart_list_shape_enumerates_pdf(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """Regression for the multipart-as-list bug, using a BODYSTRUCTURE
+        captured verbatim from real iCloud. The old walker returned [] here
+        because it only recognised multipart when child parts were bare
+        tuple elements; IMAPClient groups them in a list at position 0."""
+        self._setup_client(
+            mock_cls, bodystructure=_BS_REAL_ICLOUD_MIXED_PDF
+        )
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
+            "abc@x", mailbox="INBOX",
+        )
+
+        assert len(result) == 1
+        assert result[0]["name"] == "04 FS.pdf"
+        assert result[0]["mime_type"] == "application/pdf"
+        assert result[0]["size"] == 289236
 
 
 # ---------------------------------------------------------------------------
