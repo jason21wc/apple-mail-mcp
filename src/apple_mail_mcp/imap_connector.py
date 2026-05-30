@@ -418,7 +418,16 @@ def _bodystructure_extract_attachments(
         if not isinstance(s, tuple) or not s:
             return
 
-        # Multipart: first element is a child part (also a tuple).
+        # Multipart: IMAPClient groups the child parts in a LIST at
+        # position 0 — ``([child1, child2, ...], subtype, params, ...)``.
+        # (Real iCloud/Gmail BODYSTRUCTUREs take this shape; missing it is
+        # why multipart attachments were silently dropped — see the
+        # regression tests built from a captured real structure.)
+        if isinstance(s[0], list):
+            for child in s[0]:
+                _walk(child)
+            return
+        # Defensive: some inputs nest children as direct tuple elements.
         if isinstance(s[0], tuple):
             for child in s:
                 if isinstance(child, tuple):
@@ -519,9 +528,10 @@ def _email_attachment_parts(
 def _bodystructure_has_attachment(structure: Any) -> bool:
     """Walk an IMAPClient-parsed BODYSTRUCTURE tree and detect attachments.
 
-    IMAPClient represents multipart as a tuple ``(part_tuple, ..., subtype)``
-    where each ``part_tuple`` is either another multipart (starts with a
-    tuple) or a leaf (starts with bytes like ``b"text"``, ``b"application"``).
+    IMAPClient represents multipart as ``([child1, child2, ...], subtype,
+    params, ...)`` — the child parts are grouped in a LIST at position 0.
+    Each child is either another multipart or a leaf (starts with bytes
+    like ``b"text"``, ``b"application"``).
 
     A message "has an attachment" if any leaf carries a disposition of
     ``attachment`` or ``inline`` with a ``filename`` parameter.
@@ -529,7 +539,12 @@ def _bodystructure_has_attachment(structure: Any) -> bool:
     if not isinstance(structure, tuple) or not structure:
         return False
 
-    # Multipart — first element is a nested tuple (sub-part).
+    # Multipart — children grouped in a list at position 0 (IMAPClient).
+    if isinstance(structure[0], list):
+        return any(
+            _bodystructure_has_attachment(child) for child in structure[0]
+        )
+    # Defensive: children nested as direct tuple elements.
     if isinstance(structure[0], tuple):
         for child in structure:
             if isinstance(child, tuple) and _bodystructure_has_attachment(child):
