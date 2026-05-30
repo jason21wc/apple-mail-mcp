@@ -916,10 +916,14 @@ class TestAppleMailConnector:
         )
         connector._resolve_imap_config("iCloud")
         script = mock_run.call_args[0][0]
-        assert "|host|:(server name of acctRef)" in script
-        assert "|port|:(port of acctRef)" in script
+        assert "|host|:acctHost" in script
+        assert "|port|:acctPort" in script
         assert "|user_name|:(user name of acctRef)" in script
         assert "|email_addresses|:acctEmails" in script
+        # server name / port must be coerced for missing value (POP / local
+        # / mid-config accounts) so a dropped key can't KeyError the caller.
+        assert 'if acctHost is missing value then set acctHost to ""' in script
+        assert "if acctPort is missing value then set acctPort to 0" in script
         # Must assign to resultData for _wrap_as_json_script to serialize.
         assert "set resultData to" in script
 
@@ -935,6 +939,24 @@ class TestAppleMailConnector:
         script = mock_run.call_args[0][0]
         # The quote must be escaped; raw quotes would break the script.
         assert 'Weird \\"Name\\" Acct' in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_resolve_imap_config_missing_host_port_degrades_gracefully(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A POP / 'On My Mac' / mid-config account reports `server name`
+        and `port` as `missing value`, dropping those JSON keys. The method
+        must return ('', 0, ...) so the later connect fails with OSError →
+        graceful AppleScript fallback, NOT a KeyError that escapes the
+        _IMAP_FALLBACK_EXCS net. (Anchored to real AppleScript behavior, not
+        the previously-mocked always-complete dict.)"""
+        mock_run.return_value = (
+            '{"user_name":"u@e.com","email_addresses":["u@e.com"]}'
+        )
+        host, port, email = connector._resolve_imap_config("LocalPOP")
+        assert host == ""
+        assert port == 0
+        assert email == "u@e.com"
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_resolve_imap_config_with_uuid_uses_account_id_clause(
@@ -4174,8 +4196,14 @@ class TestAppleMailConnector:
         connector._get_thread_applescript("12345")
         anchor_script = mock_run.call_args_list[0][0][0]
         # All record keys must be |quoted| per the v0.4.1 selector-collision rule.
-        assert "|rfc_message_id|:(message id of msg)" in anchor_script
-        assert "|subject|:(subject of msg)" in anchor_script
+        assert "|rfc_message_id|:anchorMsgId" in anchor_script
+        assert "|subject|:anchorSubject" in anchor_script
+        # subject / message id coerced for missing value (no-subject mail)
+        # so a dropped key can't KeyError on bracket access.
+        assert (
+            'if anchorSubject is missing value then set anchorSubject to ""'
+            in anchor_script
+        )
         # Anchor lookup iterates by internal id; id must be wrapped in
         # AppleScript string quotes (otherwise UUID-style ids tokenize
         # as invalid syntax — see TestWhoseIdQuoting).
@@ -4189,6 +4217,17 @@ class TestAppleMailConnector:
         mock_run.side_effect = MailMessageNotFoundError("Can't get message")
         with pytest.raises(MailMessageNotFoundError):
             connector._get_thread_applescript("99999")
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_thread_anchor_degenerate_record_raises(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A degenerate/empty AppleScript anchor record serializes to `[]`
+        (ASObjC bridges empty record → NSArray). The guard must raise
+        MailMessageNotFoundError instead of KeyError-ing on bracket access."""
+        mock_run.return_value = "[]"
+        with pytest.raises(MailMessageNotFoundError):
+            connector._get_thread_applescript("12345")
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_thread_returns_anchor_plus_replies_sorted(

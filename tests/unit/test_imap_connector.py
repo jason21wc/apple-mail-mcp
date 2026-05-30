@@ -422,6 +422,23 @@ class TestHasAttachment:
 
         assert _bodystructure_has_attachment(_BS_REAL_ICLOUD_MIXED_PDF) is True
 
+    def test_message_rfc822_part_counts_as_attachment(self) -> None:
+        """A forwarded-email (message/rfc822) part must register as an
+        attachment here, matching _bodystructure_extract_attachments — else
+        has_attachment search and the attachment list disagree. Uses the
+        real IMAPClient list-at-0 multipart shape."""
+        from apple_mail_mcp.imap_connector import (
+            _bodystructure_extract_attachments,
+            _bodystructure_has_attachment,
+        )
+
+        structure = (
+            [_BS_PLAIN_TEXT, _BS_FORWARDED_EMAIL_NO_DISP],
+            b"mixed", (b"BOUNDARY", b"X"), None, None, None,
+        )
+        assert _bodystructure_has_attachment(structure) is True
+        assert len(_bodystructure_extract_attachments(structure)) == 1
+
 
 class TestEnvelopeTranslation:
     @patch("apple_mail_mcp.imap_connector.IMAPClient")

@@ -17,6 +17,18 @@ Unit tests mock `_run_applescript()` and test Python logic only. They CANNOT cat
 
 **The OmniFocus project's story:** A variable naming typo went undetected by 400+ unit tests because they all mocked the AppleScript boundary. Only integration tests against the real app caught it. This lesson applies equally to Apple Mail.
 
+## Mock fixtures must come from reality (anti-echo-chamber)
+
+A mock is only as good as its fidelity to what the real layer actually returns. The most dangerous unit-test failure mode here is the **echo chamber**: you hand-author a fixture shape, write code against it, and the test passes — but the shape is one the real layer *never emits*, so the test confirms your assumption instead of reality.
+
+Real case (2026-05): the IMAP attachment walkers assumed multipart BODYSTRUCTURE children were bare tuple elements `(child1, child2, subtype)`. IMAPClient actually groups them in a **list** at position 0 — `([child1, child2], subtype, ...)`. ~15 unit fixtures encoded the impossible bare-tuple shape, so 92%-coverage unit tests stayed green while every multipart attachment was silently dropped on the real IMAP path.
+
+Rules to prevent it:
+- **Derive expected values from the spec or from captured-real output, never from the implementation's observed output.** For this codebase the "spec" of an IMAP/AppleScript response *is* the real server/Mail.app output.
+- **Treat hand-authored fixtures as suspect.** When a fixture stands in for an IMAPClient `BodyData`/`Envelope` or an `NSJSONSerialization` record, confirm its shape against the library's real return type (e.g. run one value through `imapclient`'s `BodyData.create`, or capture a real `BODYSTRUCTURE`/AppleScript-JSON once and keep it verbatim — see `_BS_REAL_ICLOUD_MIXED_PDF` in `tests/unit/test_imap_connector.py`).
+- **Known AppleScript-JSON reality to encode in fixtures:** an empty/degenerate record `{}` bridges to NSArray `[]` (so a "dict" parse can return a list — guard with `isinstance(..., dict)`); a bare `key:` record key is dropped (use `|key|:`); `missing value` must be coerced to a safe default or the key is absent (bracket access then `KeyError`s).
+- When you fix a real-layer bug, add a regression test built from the **captured real** structure, not a reconstructed guess.
+
 ## Three-Tier Testing Strategy
 
 | Tier | Speed | What it catches | When to run |
