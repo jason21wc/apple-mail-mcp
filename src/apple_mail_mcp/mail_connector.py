@@ -1076,7 +1076,11 @@ class AppleMailConnector:
             set acctRef to {account_clause}
             set acctEmails to email addresses of acctRef
             if acctEmails is missing value then set acctEmails to {{}}
-            set resultData to {{|host|:(server name of acctRef), |port|:(port of acctRef), |user_name|:(user name of acctRef), |email_addresses|:acctEmails}}
+            set acctHost to server name of acctRef
+            if acctHost is missing value then set acctHost to ""
+            set acctPort to port of acctRef
+            if acctPort is missing value then set acctPort to 0
+            set resultData to {{|host|:acctHost, |port|:acctPort, |user_name|:(user name of acctRef), |email_addresses|:acctEmails}}
         end tell
         '''
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
@@ -1085,9 +1089,14 @@ class AppleMailConnector:
         email_addresses = cast(list[str], parsed.get("email_addresses") or [])
         user_name = cast(str, parsed.get("user_name") or "")
         email = user_name or (email_addresses[0] if email_addresses else "")
+        # Use .get with safe defaults: accounts without an IMAP server
+        # (POP / "On My Mac" / mid-configuration) report `server name`/`port`
+        # as `missing value`. An empty host makes the later connect fail with
+        # OSError, which IS in _IMAP_FALLBACK_EXCS → graceful AppleScript
+        # fallback, rather than a KeyError that would escape the net.
         return (
-            cast(str, parsed["host"]),
-            cast(int, parsed["port"]),
+            cast(str, parsed.get("host") or ""),
+            cast(int, parsed.get("port") or 0),
             email,
         )
 
@@ -2612,7 +2621,11 @@ class AppleMailConnector:
                                 if hname is "references" then set anchorRefs to (content of h)
                             end repeat
                         end try
-                        set resultData to {{|account|:(name of acc), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |in_reply_to|:anchorInReplyTo, |references_raw|:anchorRefs}}
+                        set anchorSubject to subject of msg
+                        if anchorSubject is missing value then set anchorSubject to ""
+                        set anchorMsgId to message id of msg
+                        if anchorMsgId is missing value then set anchorMsgId to ""
+                        set resultData to {{|account|:(name of acc), |rfc_message_id|:anchorMsgId, |subject|:anchorSubject, |in_reply_to|:anchorInReplyTo, |references_raw|:anchorRefs}}
                         set anchorResult to resultData
                         exit repeat
                     end try
@@ -2628,7 +2641,16 @@ class AppleMailConnector:
 
         anchor_script = _wrap_as_json_script(anchor_body, timeout=self.timeout)
         anchor_raw = self._run_applescript(anchor_script)
-        raw = cast(dict[str, Any], parse_applescript_json(anchor_raw))
+        parsed = parse_applescript_json(anchor_raw)
+        if not isinstance(parsed, dict):
+            # Degenerate/empty AppleScript record serializes to `[]`; treat
+            # as not-found rather than KeyError-ing on bracket access below
+            # (same guard as _get_message_applescript).
+            raise MailMessageNotFoundError(
+                f"Thread anchor {message_id!r} not found "
+                f"(degenerate AppleScript result)."
+            )
+        raw = parsed
 
         in_reply_to_raw = raw.get("in_reply_to") or ""
         references_raw = raw.get("references_raw") or ""
