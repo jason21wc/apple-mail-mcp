@@ -3214,3 +3214,232 @@ class TestFindThreadMembersImapThread:
         # Tier 2 made 2 SEARCHes per folder × 3 folders = 6.
         # BFS adds 3 SEARCHes (1 id × 3 headers) per folder.
         assert client.search.call_count > 6
+
+
+# ---------------------------------------------------------------------------
+# get_attachment_content — IMAP byte-fetch (download-independent)
+# ---------------------------------------------------------------------------
+
+
+def _b64(payload: bytes) -> bytes:
+    """One-line base64 body for a MIME part."""
+    import base64
+    return base64.b64encode(payload)
+
+
+def _multipart_message(parts: list[bytes]) -> bytes:
+    """Assemble a multipart/mixed RFC 822 message from raw part blocks."""
+    body = b""
+    for p in parts:
+        body += b"--BOUNDARY\r\n" + p + b"\r\n"
+    body += b"--BOUNDARY--\r\n"
+    return (
+        b"From: a@example.com\r\n"
+        b"Subject: Test\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n'
+        b"\r\n"
+    ) + body
+
+
+# A text/plain body part (NOT an attachment — no filename).
+_BODY_PART = (
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"Content-Transfer-Encoding: 7bit\r\n"
+    b"\r\n"
+    b"This is the message body."
+)
+
+
+class TestGetAttachmentContent:
+    """ImapConnector.get_attachment_content — BODY[] fetch + MIME walk."""
+
+    def _setup_client(self, mock_cls: MagicMock, rfc822: bytes) -> MagicMock:
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = [42]
+        client.fetch.return_value = {42: {b"BODY[]": rfc822}}
+        return client
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_text_attachment_returns_decoded_text(
+        self, mock_cls: MagicMock
+    ) -> None:
+        part = (
+            b"Content-Type: text/plain; name=\"notes.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"notes.txt\"\r\n"
+            b"\r\n"
+            b"hello from the attachment"
+        )
+        self._setup_client(
+            mock_cls, _multipart_message([_BODY_PART, part])
+        )
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+            "msg@example.com", attachment_index=0, mailbox="INBOX",
+        )
+
+        assert result["name"] == "notes.txt"
+        assert result["mime_type"] == "text/plain"
+        assert result["is_binary"] is False
+        assert result["content"] == "hello from the attachment"
+        assert result["size"] == len(b"hello from the attachment")
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_binary_attachment_returns_base64(
+        self, mock_cls: MagicMock
+    ) -> None:
+        pdf = b"%PDF-1.4 pretend financial statement bytes"
+        part = (
+            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-Disposition: attachment; filename=\"04 FS.pdf\"\r\n"
+            b"\r\n"
+        ) + _b64(pdf)
+        self._setup_client(
+            mock_cls, _multipart_message([_BODY_PART, part])
+        )
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+            "msg@example.com", attachment_index=0,
+        )
+
+        import base64
+        assert result["name"] == "04 FS.pdf"
+        assert result["mime_type"] == "application/pdf"
+        assert result["is_binary"] is True
+        assert base64.b64decode(result["content"]) == pdf
+        assert result["size"] == len(pdf)
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_attachment_without_content_disposition_is_found(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """Regression: a binary part with only a Content-Type name= param
+        and NO Content-Disposition must still count as an attachment — the
+        case the BODYSTRUCTURE enumeration path dropped (returned [])."""
+        pdf = b"%PDF-1.4 no-disposition pdf"
+        part = (
+            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"\r\n"
+        ) + _b64(pdf)
+        self._setup_client(
+            mock_cls, _multipart_message([_BODY_PART, part])
+        )
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+            "msg@example.com", attachment_index=0,
+        )
+
+        import base64
+        assert result["mime_type"] == "application/pdf"
+        assert base64.b64decode(result["content"]) == pdf
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_attachment_index_selects_correct_part(
+        self, mock_cls: MagicMock
+    ) -> None:
+        first = (
+            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
+            b"\r\nAAA"
+        )
+        second = (
+            b"Content-Type: text/plain; name=\"b.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"b.txt\"\r\n"
+            b"\r\nBBB"
+        )
+        self._setup_client(
+            mock_cls, _multipart_message([_BODY_PART, first, second])
+        )
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+            "msg@example.com", attachment_index=1,
+        )
+        assert result["name"] == "b.txt"
+        assert result["content"] == "BBB"
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_body_only_message_has_no_attachments(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """A text/plain body part is not miscounted as an attachment."""
+        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
+
+        with pytest.raises(ValueError, match="out of range"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+                "msg@example.com", attachment_index=0,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_index_out_of_range_raises(self, mock_cls: MagicMock) -> None:
+        part = (
+            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
+            b"\r\nAAA"
+        )
+        self._setup_client(mock_cls, _multipart_message([part]))
+
+        with pytest.raises(ValueError, match="out of range"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+                "msg@example.com", attachment_index=5,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_negative_index_raises(self, mock_cls: MagicMock) -> None:
+        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
+        with pytest.raises(ValueError, match="non-negative"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+                "msg@example.com", attachment_index=-1,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_message_not_found_raises(self, mock_cls: MagicMock) -> None:
+        from apple_mail_mcp.exceptions import MailMessageNotFoundError
+
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = []
+
+        with pytest.raises(MailMessageNotFoundError):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+                "missing@example.com", attachment_index=0,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_max_bytes_exceeded_raises(self, mock_cls: MagicMock) -> None:
+        pdf = b"x" * 5000
+        part = (
+            b"Content-Type: application/pdf; name=\"big.pdf\"\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-Disposition: attachment; filename=\"big.pdf\"\r\n"
+            b"\r\n"
+        ) + _b64(pdf)
+        self._setup_client(mock_cls, _multipart_message([part]))
+
+        with pytest.raises(ValueError, match="too large"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+                "msg@example.com", attachment_index=0, max_bytes=1000,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_search_brackets_id_and_selects_mailbox(
+        self, mock_cls: MagicMock
+    ) -> None:
+        part = (
+            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
+            b"\r\nAAA"
+        )
+        client = self._setup_client(
+            mock_cls, _multipart_message([part])
+        )
+
+        ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
+            "abc@example.com", attachment_index=0, mailbox="Archive",
+        )
+        client.search.assert_called_once_with(
+            ["HEADER", "Message-ID", "<abc@example.com>"]
+        )
+        client.select_folder.assert_called_once_with("Archive", readonly=True)

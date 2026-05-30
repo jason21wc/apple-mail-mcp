@@ -529,6 +529,52 @@ list_mailboxes(account="my gmail account")
 
 ---
 
+### get_attachment_content
+
+Read a single attachment's content into memory (text or base64) without saving to disk.
+
+**Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `message_id` | string | Yes | - | Message ID. RFC 5322 Message-ID for the IMAP path, Mail.app numeric id for the AppleScript fallback. |
+| `attachment_index` | int | No | 0 | Zero-based index of the attachment to read |
+| `account` | string | No | None | Mail.app account name. With `mailbox`, enables the IMAP fast path. |
+| `mailbox` | string | No | None | Folder to look in for the IMAP fast path (e.g. `INBOX`). |
+
+**Returns:**
+
+```json
+{
+  "success": true,
+  "name": "04 FS.pdf",
+  "mime_type": "application/pdf",
+  "size": 20480,
+  "content": "JVBERi0xLjQK...",
+  "is_binary": true
+}
+```
+
+**Notes:**
+
+- Pass `account` + `mailbox` (the same ones from `search_messages`) to use the IMAP fast path. IMAP fetches the bytes straight from the server, so it works **even when Mail.app has not downloaded the attachment locally** — the AppleScript fallback fails (`-10000`) on an undownloaded placeholder attachment.
+- Without hints, falls back to AppleScript, which requires the attachment to be downloaded in Mail.app.
+- `content` is decoded text for `text/*` parts and base64 otherwise (`is_binary` flags which). Attachments over 25 MB are rejected — use `save_attachments` to stream to disk instead.
+
+**Examples:**
+
+```python
+# IMAP fast path (download-independent) — preferred
+get_attachment_content(
+    message_id="<id@host>",
+    attachment_index=0,
+    account="iCloud",
+    mailbox="INBOX",
+)
+```
+
+---
+
 ### save_attachments
 
 Save attachments from a message to a directory.
