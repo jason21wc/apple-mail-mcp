@@ -32,8 +32,7 @@ from .exceptions import (
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
 )
-from .imap_connector import ImapConnectionPool, ImapConnector
-from .keychain import _env_var_name, get_imap_password
+from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
 from .security import (
     check_rate_limit,
@@ -138,125 +137,6 @@ async def _elicit_confirmation(
             "error_type": "cancelled",
         }
     return None
-
-
-@mcp.tool()
-def diagnose_imap(
-    account: str = "iCloud",
-    message_id: str | None = None,
-    mailbox: str = "INBOX",
-) -> dict[str, Any]:
-    """Diagnostic tool: reports IMAP path availability and performs a
-    timed body fetch to identify timeout bottlenecks. Read-only.
-
-    Args:
-        account: Account to test (default: iCloud).
-        message_id: Optional message ID for a body-fetch timing test.
-            If omitted, searches for the most recent message.
-        mailbox: Mailbox to test (default: INBOX).
-    """
-    import os
-    import time
-
-    results: dict[str, Any] = {"account": account, "mailbox": mailbox}
-    env_name = _env_var_name(account)
-    env_val = os.environ.get(env_name)
-    results["env_var_name"] = env_name
-    results["env_var_set"] = env_val is not None
-
-    # 2. Check password availability
-    try:
-        host, port, email_addr = mail._resolve_imap_config(account)
-        results["imap_host"] = host
-        results["imap_port"] = port
-        results["imap_email"] = email_addr
-    except Exception as e:
-        results["resolve_error"] = f"{type(e).__name__}: {e}"
-        return {"success": True, **results}
-
-    try:
-        password = get_imap_password(account, email_addr)
-        results["password_source"] = "env_var" if env_val else "keychain"
-        results["password_available"] = True
-    except Exception as e:
-        results["password_available"] = False
-        results["password_error"] = f"{type(e).__name__}: {e}"
-        return {"success": True, **results}
-
-    # 3. Timed IMAP connection test
-    start = time.time()
-    try:
-        imap = ImapConnector(host, port, email_addr, password, pool=mail._imap_pool)
-        if message_id is None:
-            msgs = imap.search_messages(mailbox=mailbox, limit=1)
-            if msgs:
-                message_id = msgs[0].get("id") or msgs[0].get("rfc_message_id")
-                results["auto_message_id"] = message_id
-            else:
-                results["search_result"] = "no messages found"
-                return {"success": True, **results}
-        results["search_time"] = round(time.time() - start, 2)
-
-        # 4. Timed body fetch
-        assert message_id is not None
-        start = time.time()
-        msg = imap.get_message(
-            message_id, mailbox=mailbox, include_content=True,
-        )
-        results["body_fetch_time"] = round(time.time() - start, 2)
-        results["content_length"] = len(msg.get("content", ""))
-        results["content_preview"] = msg.get("content", "")[:200]
-        results["body_fetch"] = "success"
-    except Exception as e:
-        results["body_fetch_time"] = round(time.time() - start, 2)
-        results["body_fetch"] = "failed"
-        results["body_fetch_error"] = f"{type(e).__name__}: {e}"
-
-    # 5. Circuit breaker state
-    results["breaker_open"] = mail._imap_breaker_open(account)
-
-    # 6. Test through mail.get_message (same path as get_messages)
-    if results.get("body_fetch") == "success" and message_id:
-        start = time.time()
-        try:
-            connector_msg = mail.get_message(
-                message_id, include_content=True,
-                account=account, mailbox=mailbox,
-            )
-            results["connector_fetch_time"] = round(time.time() - start, 2)
-            results["connector_fetch"] = "success"
-            results["connector_content_length"] = len(
-                connector_msg.get("content", "")
-            )
-        except Exception as e:
-            results["connector_fetch_time"] = round(time.time() - start, 2)
-            results["connector_fetch"] = "failed"
-            results["connector_fetch_error"] = f"{type(e).__name__}: {e}"
-
-    # 7. Test get_messages function directly (bypasses MCP transport
-    # but uses the identical code path the MCP tool uses)
-    if results.get("connector_fetch") == "success" and message_id:
-        start = time.time()
-        try:
-            gm_result = get_messages(
-                [message_id], include_content=True,
-                account=account, mailbox=mailbox,
-            )
-            results["get_messages_time"] = round(time.time() - start, 2)
-            results["get_messages_success"] = gm_result.get("success")
-            results["get_messages_count"] = gm_result.get("count")
-            if gm_result.get("messages"):
-                content = gm_result["messages"][0].get("content", "")
-                results["get_messages_content_len"] = len(content)
-                import json as _json
-                results["get_messages_response_bytes"] = len(
-                    _json.dumps(gm_result)
-                )
-        except Exception as e:
-            results["get_messages_time"] = round(time.time() - start, 2)
-            results["get_messages_error"] = f"{type(e).__name__}: {e}"
-
-    return {"success": True, **results}
 
 
 @mcp.tool()
