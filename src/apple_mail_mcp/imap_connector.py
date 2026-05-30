@@ -509,7 +509,20 @@ def _bodystructure_has_attachment(structure: Any) -> bool:
                 return True
         return False
 
-    # Leaf — scan for a disposition tuple whose first element is
+    # Leaf. A message/rfc822 part (forwarded email) counts as an attachment,
+    # matching _bodystructure_extract_attachments — otherwise the
+    # has_attachment search filter and the attachment list disagree (a
+    # forwarded-only message would be filtered out yet report an attachment).
+    type_ = structure[0] if isinstance(structure[0], bytes) else b""
+    subtype = (
+        structure[1]
+        if len(structure) > 1 and isinstance(structure[1], bytes)
+        else b""
+    )
+    if type_.lower() == b"message" and subtype.lower() == b"rfc822":
+        return True
+
+    # Scan for a disposition tuple whose first element is
     # b"attachment" or b"inline".
     for elem in structure:
         if (
