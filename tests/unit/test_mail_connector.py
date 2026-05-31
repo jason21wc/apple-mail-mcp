@@ -3787,12 +3787,16 @@ class TestAppleMailConnector:
         assert "repeat with acc in accounts" in script
 
     @patch("subprocess.run")
-    def test_get_message_applescript_result_record_balanced_braces(
+    def test_get_message_applescript_result_record_is_a_record_not_a_list(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        """Regression: the AppleScript result record must have balanced
-        {{ ... }} braces for both RFC and numeric IDs, with and without
-        account+mailbox hints."""
+        """The result record must be a single AppleScript RECORD
+        ``set resultData to {|id|:...}`` — NOT ``{{...}}``, which is a
+        list-of-one-record that NSJSONSerialization emits as a JSON ARRAY.
+        That array was the real cause of the original "get_message returned a
+        list" failure (it only surfaces when the AppleScript path actually
+        runs). Checked for both RFC and numeric IDs, with and without hints.
+        """
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout='{"id":"1","rfc_message_id":"x@y","subject":"Hi",'
@@ -3801,17 +3805,16 @@ class TestAppleMailConnector:
             stderr="",
         )
         for msg_id in ("12345", "abc@server.com"):
-            for hints in (
-                {},
-                {"account": "iCloud", "mailbox": "INBOX"},
-            ):
+            for hints in ({}, {"account": "iCloud", "mailbox": "INBOX"}):
                 connector._get_message_applescript(msg_id, True, **hints)
-                script = mock_run.call_args.kwargs.get("input") or mock_run.call_args[1].get("input", "")
-                assert "set resultData to {{" in script, (
-                    f"missing opening {{ for id={msg_id}, hints={hints}"
+                script = mock_run.call_args.kwargs.get("input", "")
+                assert "set resultData to {|id|:" in script, (
+                    f"result record is not a single record for "
+                    f"id={msg_id}, hints={hints}"
                 )
-                assert "}}" in script, (
-                    f"missing closing }} for id={msg_id}, hints={hints}"
+                assert "set resultData to {{" not in script, (
+                    f"result record is wrapped in a list (JSON array) for "
+                    f"id={msg_id}, hints={hints}"
                 )
 
     def test_get_message_fallback_threads_account_mailbox(
