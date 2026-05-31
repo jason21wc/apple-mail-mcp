@@ -565,64 +565,16 @@ def _email_attachment_parts(
 
 
 def _bodystructure_has_attachment(structure: Any) -> bool:
-    """Walk an IMAPClient-parsed BODYSTRUCTURE tree and detect attachments.
+    """True if the BODYSTRUCTURE carries any attachment.
 
-    IMAPClient represents multipart as ``([child1, child2, ...], subtype,
-    params, ...)`` — the child parts are grouped in a LIST at position 0.
-    Each child is either another multipart or a leaf (starts with bytes
-    like ``b"text"``, ``b"application"``).
-
-    A message "has an attachment" if any leaf carries a disposition of
-    ``attachment`` or ``inline`` with a ``filename`` parameter.
+    Delegates to :func:`_bodystructure_extract_attachments` so the
+    has-attachment search filter and the attachment list can never disagree
+    on what counts as an attachment — that drift was a real bug (the
+    message/rfc822 case). The two used to duplicate the same tree walk;
+    sharing one keeps them consistent by construction. Attachment lists are
+    tiny, so materializing the list to test emptiness is negligible.
     """
-    if not isinstance(structure, tuple) or not structure:
-        return False
-
-    # Multipart — children grouped in a list at position 0 (IMAPClient).
-    if isinstance(structure[0], list):
-        return any(
-            _bodystructure_has_attachment(child) for child in structure[0]
-        )
-    # Defensive: children nested as direct tuple elements.
-    if isinstance(structure[0], tuple):
-        for child in structure:
-            if isinstance(child, tuple) and _bodystructure_has_attachment(child):
-                return True
-        return False
-
-    # Leaf. A message/rfc822 part (forwarded email) counts as an attachment,
-    # matching _bodystructure_extract_attachments — otherwise the
-    # has_attachment search filter and the attachment list disagree (a
-    # forwarded-only message would be filtered out yet report an attachment).
-    type_ = structure[0] if isinstance(structure[0], bytes) else b""
-    subtype = (
-        structure[1]
-        if len(structure) > 1 and isinstance(structure[1], bytes)
-        else b""
-    )
-    if type_.lower() == b"message" and subtype.lower() == b"rfc822":
-        return True
-
-    # Scan for a disposition tuple whose first element is
-    # b"attachment" or b"inline".
-    for elem in structure:
-        if (
-            isinstance(elem, tuple)
-            and elem
-            and isinstance(elem[0], bytes)
-        ):
-            disp = elem[0].lower()
-            if disp == b"attachment":
-                return True
-            if disp == b"inline":
-                params = elem[1] if len(elem) > 1 else ()
-                if isinstance(params, tuple):
-                    # Params are a flat tuple (key, value, key, value, ...).
-                    for i in range(0, len(params) - 1, 2):
-                        key = params[i]
-                        if isinstance(key, bytes) and key.lower() == b"filename":
-                            return True
-    return False
+    return bool(_bodystructure_extract_attachments(structure))
 
 
 def _envelope_to_dict(
