@@ -955,6 +955,86 @@ class ImapConnector:
         """
         import base64
 
+        part, raw = self._fetch_attachment_part(
+            message_id,
+            attachment_index,
+            mailbox,
+            max_bytes=max_bytes,
+        )
+
+        if part.get_content_maintype() == "text":
+            charset = part.get_content_charset() or "utf-8"
+            content = raw.decode(charset, errors="replace")
+            is_binary = False
+        else:
+            content = base64.b64encode(raw).decode("ascii")
+            is_binary = True
+
+        return {
+            "name": part.get_filename() or "",
+            "mime_type": part.get_content_type(),
+            "size": len(raw),
+            "content": content,
+            "is_binary": is_binary,
+        }
+
+    def get_attachment_bytes(
+        self,
+        message_id: str,
+        attachment_index: int = 0,
+        mailbox: str = "INBOX",
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        """Fetch one attachment's raw, decoded bytes via IMAP.
+
+        Same lookup/extraction path as :meth:`get_attachment_content`, but
+        returns the raw decoded payload bytes directly — no base64/text
+        re-encode — so callers writing to disk (``save_attachments``) get a
+        byte-exact copy. The bytes come straight from the server, so this
+        works even when Mail.app has not downloaded the attachment locally.
+
+        Args:
+            message_id: RFC 5322 Message-ID, with or without ``<>``.
+            attachment_index: Zero-based index into the message's
+                attachment parts, in the same order ``get_attachments``
+                enumerates them.
+            mailbox: Folder to SELECT before fetching.
+            max_bytes: Optional ceiling; raises ``ValueError`` when the
+                decoded attachment exceeds it.
+
+        Returns:
+            The attachment's raw decoded bytes.
+
+        Raises:
+            ValueError: ``attachment_index`` is negative or out of range,
+                or the attachment exceeds ``max_bytes``.
+            MailMessageNotFoundError: No message matches the Message-ID.
+            IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
+        """
+        _part, raw = self._fetch_attachment_part(
+            message_id,
+            attachment_index,
+            mailbox,
+            max_bytes=max_bytes,
+        )
+        return raw
+
+    def _fetch_attachment_part(
+        self,
+        message_id: str,
+        attachment_index: int,
+        mailbox: str,
+        *,
+        max_bytes: int | None,
+    ) -> tuple[_email.message.Message, bytes]:
+        """Look a message up by Message-ID, fetch its RFC 822 source, and
+        return the ``(part, raw_bytes)`` for ``attachment_index``.
+
+        Shared by :meth:`get_attachment_content` (which re-encodes to
+        text/base64) and :meth:`get_attachment_bytes` (which returns the
+        bytes unchanged). Enforces ``max_bytes`` on the decoded payload.
+        """
         if attachment_index < 0:
             raise ValueError("attachment_index must be non-negative")
 
@@ -993,21 +1073,62 @@ class ImapConnector:
                 f"use save_attachments to download to disk instead"
             )
 
-        if part.get_content_maintype() == "text":
-            charset = part.get_content_charset() or "utf-8"
-            content = raw.decode(charset, errors="replace")
-            is_binary = False
-        else:
-            content = base64.b64encode(raw).decode("ascii")
-            is_binary = True
+        return part, raw
 
-        return {
-            "name": part.get_filename() or "",
-            "mime_type": part.get_content_type(),
-            "size": len(raw),
-            "content": content,
-            "is_binary": is_binary,
-        }
+    def get_attachment_payloads(
+        self,
+        message_id: str,
+        mailbox: str = "INBOX",
+        *,
+        max_bytes: int | None = None,
+    ) -> list[tuple[str, bytes]]:
+        """Return ``(filename, raw_bytes)`` for every attachment, in one fetch.
+
+        A single ``BODY[]`` fetch + one MIME parse, so the filenames and the
+        bytes come from the SAME enumeration (:func:`_email_attachment_parts`).
+        Callers like ``save_attachments`` index names and bytes off this one
+        list, so a name can never be paired with another part's bytes — unlike
+        pairing a BODYSTRUCTURE enumeration with per-index byte fetches, whose
+        attachment definitions can differ. ``max_bytes`` is enforced per
+        attachment. Bytes come straight from the server (no Mail.app download
+        required).
+
+        Raises:
+            MailMessageNotFoundError: No message matches the Message-ID.
+            ValueError: An attachment exceeds ``max_bytes``.
+            IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
+        """
+        bracketed = (
+            message_id
+            if message_id.startswith("<") and message_id.endswith(">")
+            else f"<{message_id}>"
+        )
+        with self._session() as client:
+            client.select_folder(mailbox, readonly=True)
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if not uids:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} not found in mailbox "
+                    f"{mailbox!r} on {self._host}."
+                )
+            fetched = client.fetch(uids[:1], [b"BODY[]"])
+            entry = next(iter(fetched.values()))
+            rfc822_bytes = entry.get(b"BODY[]") or b""
+
+        msg = _email.message_from_bytes(
+            rfc822_bytes, policy=_email_policy.default
+        )
+        out: list[tuple[str, bytes]] = []
+        for part in _email_attachment_parts(msg):
+            raw = part.get_payload(decode=True)
+            raw = bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
+            if max_bytes is not None and len(raw) > max_bytes:
+                raise ValueError(
+                    f"Attachment too large ({len(raw) // (1024 * 1024)} MB); "
+                    f"use save_attachments to download to disk instead"
+                )
+            out.append((part.get_filename() or "", raw))
+        return out
 
     def find_thread_members(
         self,

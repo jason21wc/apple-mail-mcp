@@ -219,7 +219,7 @@ class TestSaveAttachmentsOutputFilename:
         """Single attachment with output_filename renames the saved file."""
         # The connector saves to a temp dir; simulate by creating a file
         # in whatever directory it's called with
-        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any) -> int:
+        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any, account: Any = None, mailbox: Any = None) -> int:
             (save_directory / "original_name.txt").write_text("content")
             return 1
 
@@ -271,7 +271,7 @@ class TestSaveAttachmentsOutputFilename:
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
     ) -> None:
         """Path traversal attempts in output_filename are neutralized by sanitize_filename."""
-        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any) -> int:
+        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any, account: Any = None, mailbox: Any = None) -> int:
             (save_directory / "original.txt").write_text("data")
             return 1
 
@@ -293,7 +293,7 @@ class TestSaveAttachmentsOutputFilename:
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
     ) -> None:
         """Dangerous characters in output_filename are replaced."""
-        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any) -> int:
+        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any, account: Any = None, mailbox: Any = None) -> int:
             (save_directory / "original.txt").write_text("data")
             return 1
 
@@ -326,7 +326,7 @@ class TestSaveAttachmentsOutputFilename:
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
     ) -> None:
         """Null bytes in output_filename are stripped by sanitize_filename."""
-        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any) -> int:
+        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any, account: Any = None, mailbox: Any = None) -> int:
             (save_directory / "original.txt").write_text("data")
             return 1
 
@@ -346,7 +346,7 @@ class TestSaveAttachmentsOutputFilename:
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
     ) -> None:
         """If filename is empty after sanitization, it becomes 'unnamed_file'."""
-        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any) -> int:
+        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any, account: Any = None, mailbox: Any = None) -> int:
             (save_directory / "original.txt").write_text("data")
             return 1
 
@@ -367,7 +367,7 @@ class TestSaveAttachmentsOutputFilename:
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
     ) -> None:
         """Leading dots (hidden files) are stripped from output_filename."""
-        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any) -> int:
+        def _mock_save(*, message_id: str, save_directory: Path, attachment_indices: Any, account: Any = None, mailbox: Any = None) -> int:
             (save_directory / "original.txt").write_text("data")
             return 1
 

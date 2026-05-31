@@ -1353,17 +1353,28 @@ def save_attachments(
     save_directory: str,
     attachment_indices: list[int] | None = None,
     output_filename: str | None = None,
+    account: str | None = None,
+    mailbox: str | None = None,
 ) -> dict[str, Any]:
     """
     Save attachments from a message to a directory.
 
+    Pass ``account`` and ``mailbox`` (the same ones from search_messages) to
+    use the IMAP fast path, which fetches the bytes directly from the server.
+    This works even when Mail.app has not downloaded the attachment locally —
+    the AppleScript fallback fails on undownloaded placeholder attachments.
+
     Args:
-        message_id: Message ID from search results
+        message_id: Message ID from search results. RFC 5322 Message-ID for
+            the IMAP path, Mail.app numeric id for the AppleScript fallback.
         save_directory: Directory path to save attachments to
         attachment_indices: Specific attachment indices to save (0-based), None for all
         output_filename: Custom filename for the saved attachment. Only valid when
             saving a single attachment (one index or message has one attachment).
             The filename is sanitized for safety.
+        account: Mail.app account name. With ``mailbox``, enables the IMAP
+            fast path (download-independent).
+        mailbox: Folder to look in for the IMAP fast path (e.g. "INBOX").
 
     Returns:
         Dictionary indicating success and number of attachments saved
@@ -1425,6 +1436,8 @@ def save_attachments(
                     message_id=message_id,
                     save_directory=tmp_path,
                     attachment_indices=attachment_indices,
+                    account=account,
+                    mailbox=mailbox,
                 )
                 if count == 1:
                     saved_files = list(tmp_path.iterdir())
@@ -1443,6 +1456,8 @@ def save_attachments(
                 message_id=message_id,
                 save_directory=save_path,
                 attachment_indices=attachment_indices,
+                account=account,
+                mailbox=mailbox,
             )
 
         operation_logger.log_operation(

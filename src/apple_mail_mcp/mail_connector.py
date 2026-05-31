@@ -2885,14 +2885,34 @@ class AppleMailConnector:
         message_id: str,
         save_directory: Path,
         attachment_indices: list[int] | None = None,
+        *,
+        account: str | None = None,
+        mailbox: str | None = None,
     ) -> int:
         """
         Save attachments from a message to a directory.
 
+        Tries the IMAP path first when both ``account`` and ``mailbox`` are
+        supplied and the account's circuit breaker is closed. IMAP fetches
+        the attachment bytes straight from the server, so it works even when
+        Mail.app has not downloaded the attachment locally (the AppleScript
+        ``save`` raises ``-10000`` on an undownloaded placeholder). Falls
+        back to AppleScript on any IMAP connection/auth failure, and whenever
+        no account/mailbox hint is given.
+
+        Identifier semantics mirror :meth:`get_attachment_content`: the IMAP
+        path matches the RFC 5322 Message-ID (what ``search_messages``
+        returns), the AppleScript path matches Mail.app's numeric id. Forward
+        the same ``account`` + ``mailbox`` you got from ``search_messages``
+        to stay on the fast, download-independent IMAP path.
+
         Args:
-            message_id: Message ID
+            message_id: Message ID. RFC 5322 form for the IMAP path,
+                Mail.app numeric id for the AppleScript path.
             save_directory: Directory to save attachments to
             attachment_indices: Indices of attachments to save (None = all)
+            account: Mail.app account name. With ``mailbox``, enables IMAP.
+            mailbox: Folder to look in for the IMAP path.
 
         Returns:
             Number of attachments saved
@@ -2918,6 +2938,88 @@ class AppleMailConnector:
         except (RuntimeError, OSError) as e:
             raise ValueError(f"Invalid save directory: {e}") from e
 
+        if (
+            account is not None
+            and mailbox is not None
+            and not self._imap_breaker_open(account)
+        ):
+            try:
+                result = self._imap_save_attachments(
+                    account=account,
+                    mailbox=mailbox,
+                    message_id=message_id,
+                    save_directory=save_directory,
+                    attachment_indices=attachment_indices,
+                )
+                self._imap_clear_breaker(account)
+                return result
+            except _IMAP_FALLBACK_EXCS as exc:
+                self._log_imap_fallback(account, exc)
+                # fall through to AppleScript
+
+        return self._save_attachments_applescript(
+            message_id, save_directory, attachment_indices
+        )
+
+    def _imap_save_attachments(
+        self,
+        *,
+        account: str,
+        mailbox: str,
+        message_id: str,
+        save_directory: Path,
+        attachment_indices: list[int] | None,
+    ) -> int:
+        """Save attachments through the IMAP path.
+
+        Enumerates attachment names via ``get_attachments``, computes
+        sanitized, contained target paths with
+        :func:`_compute_attachment_save_targets` (the same CWE-22 guard the
+        AppleScript path uses), then fetches each selected attachment's raw
+        bytes via IMAP and writes them to disk. Propagates
+        fallback-triggering exceptions unchanged so the caller can degrade to
+        AppleScript. ``save_directory`` must already be resolved.
+        """
+        host, port, email = self._resolve_imap_config(account)
+        password = get_imap_password(account, email)
+        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+
+        # Names AND bytes come from one enumeration/fetch so a name can never
+        # be paired with another part's bytes (a BODYSTRUCTURE enumeration +
+        # per-index byte fetches could misalign — the two walkers' attachment
+        # definitions can differ). _compute_attachment_save_targets applies the
+        # CWE-22 containment + sanitized basenames; its 1-based indices map
+        # straight back into the same payloads list.
+        payloads = imap.get_attachment_payloads(
+            message_id,
+            mailbox=mailbox,
+            max_bytes=self._MAX_ATTACHMENT_READ_BYTES,
+        )
+        targets = _compute_attachment_save_targets(
+            [name for name, _ in payloads],
+            save_directory,
+            attachment_indices,
+        )
+        if not targets:
+            return 0
+
+        saved = 0
+        for one_based_idx, target in targets:
+            _name, raw = payloads[one_based_idx - 1]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            saved += 1
+        return saved
+
+    def _save_attachments_applescript(
+        self,
+        message_id: str,
+        save_directory: Path,
+        attachment_indices: list[int] | None = None,
+    ) -> int:
+        """Save attachments via AppleScript. ``save_directory`` must already
+        be validated and resolved by the caller (:meth:`save_attachments`).
+        """
         # Enumerate attachment names first so the (attacker-controlled)
         # filename never reaches a filesystem path unsanitized. The leaf
         # names are reduced to safe basenames and joined under the resolved
