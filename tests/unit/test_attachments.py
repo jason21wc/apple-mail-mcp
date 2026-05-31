@@ -312,3 +312,82 @@ class TestSaveAttachmentsPathTraversal:
         # No traversal sequence survives into the script.
         assert "/tmp/evil.sh" not in save_script
         assert ".." not in save_script
+
+
+class TestAttachmentRecordResilience:
+    """Every site that builds an attachment record must read each property in
+    its own try with a default, so Mail.app's -10000 on e.g. ``MIME type of``
+    a placeholder PDF can't abort the enumeration (returning [] / 'not found'
+    and silently breaking save/include_attachments — see #17). All sites share
+    ``_attachment_record_as`` so the defensive shape can't drift."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def _assert_defensive_record(self, script: str) -> None:
+        # The error-prone MIME read goes through a variable under its own try.
+        assert "set attMime to (MIME type of att)" in script
+        assert "on error" in script
+        # All four properties are read into variables (not inline in the
+        # record), so one failing property can't drop the whole list...
+        for var in ("attName", "attMime", "attSize", "attDownloaded"):
+            assert var in script
+        # ...and the record keys stay |quoted| (NSJSONSerialization drops bare
+        # keys like name:/size:).
+        for key in ("|name|:attName", "|mime_type|:attMime",
+                    "|size|:attSize", "|downloaded|:attDownloaded"):
+            assert key in script
+        # The old inline form (one throw aborts the loop) must be gone.
+        assert "(MIME type of att), |size|:(file size of att)" not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_search_messages_record_is_defensive(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "[]"
+        # Call the AppleScript path directly — search_messages() would try the
+        # IMAP fast path first (different codegen, no attachment record there).
+        connector._search_messages_applescript(
+            account="Gmail", include_attachments=True
+        )
+        self._assert_defensive_record(mock_run.call_args[0][0])
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_applescript_record_is_defensive(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "{}"
+        connector._get_message_applescript(
+            "12345", include_content=False, include_attachments=True
+        )
+        self._assert_defensive_record(mock_run.call_args[0][0])
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_selected_messages_record_is_defensive(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "[]"
+        connector.get_selected_messages(
+            include_content=False, include_attachments=True
+        )
+        self._assert_defensive_record(mock_run.call_args[0][0])
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_attachment_content_bare_read_is_guarded(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        """The single-attachment (non-loop) read in the content path is also
+        guarded: ``MIME type``/``file size`` each get their own try so this
+        path doesn't -10000 on a placeholder either (name reads fine)."""
+        # Force the script-building failure path (no real Mail.app) and capture
+        # the script that was built.
+        mock_run.side_effect = MailMessageNotFoundError("not found")
+        with pytest.raises(MailMessageNotFoundError):
+            connector._get_attachment_content_applescript("12345", 0)
+        script = mock_run.call_args[0][0]
+        assert "set attMime to MIME type of att" in script
+        assert "set attSize to file size of att" in script
+        assert "on error" in script
+        # name stays an unguarded read (it never raises -10000).
+        assert "set attName to name of att" in script

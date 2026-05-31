@@ -321,6 +321,40 @@ def _compute_draft_extract_targets(
     return targets
 
 
+def _attachment_record_as(list_var: str) -> str:
+    """AppleScript that appends a defensively-built attachment record to
+    `list_var` for the current loop variable `att`. Each property is read in
+    its own try with a safe default: Mail.app raises -10000 on some attachment
+    properties (e.g. MIME type of certain PDFs), and one throw must not abort
+    the enclosing enumeration (that returned [] / 'not found' and silently
+    broke save_attachments and get_message's include_attachments — see #17).
+    Record keys stay |quoted| (NSJSONSerialization drops bare keys)."""
+    return (
+        "\n                        try\n"
+        "                            set attName to name of att\n"
+        "                        on error\n"
+        "                            set attName to \"\"\n"
+        "                        end try\n"
+        "                        try\n"
+        "                            set attMime to (MIME type of att)\n"
+        "                        on error\n"
+        "                            set attMime to \"\"\n"
+        "                        end try\n"
+        "                        try\n"
+        "                            set attSize to (file size of att)\n"
+        "                        on error\n"
+        "                            set attSize to 0\n"
+        "                        end try\n"
+        "                        try\n"
+        "                            set attDownloaded to (downloaded of att)\n"
+        "                        on error\n"
+        "                            set attDownloaded to false\n"
+        "                        end try\n"
+        f"                        set end of {list_var} to "
+        "{|name|:attName, |mime_type|:attMime, |size|:attSize, |downloaded|:attDownloaded}\n"
+    )
+
+
 class AppleMailConnector:
     """Interface to Apple Mail via AppleScript."""
 
@@ -1490,12 +1524,9 @@ class AppleMailConnector:
         effective_limit = str(limit) if limit else "999999999"
 
         if include_attachments:
-            attachments_clause = '''
-                    set attList to {}
-                    repeat with att in mail attachments of msg
-                        set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                        set end of attList to attRecord
-                    end repeat'''
+            attachments_clause = f'''
+                    set attList to {{}}
+                    repeat with att in mail attachments of msg{_attachment_record_as("attList")}                    end repeat'''
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
@@ -1669,25 +1700,29 @@ class AppleMailConnector:
         )
 
         if include_attachments:
-            attachments_clause = '''
-                        set attList to {}
-                        repeat with att in mail attachments of msg
-                            set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                            set end of attList to attRecord
-                        end repeat
+            attachments_clause = f'''
+                        set attList to {{}}
+                        repeat with att in mail attachments of msg{_attachment_record_as("attList")}                        end repeat
 '''
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
             attachments_field = ""
 
+        # Single-brace record. `set resultData to {result_record}` already
+        # interpolates this value verbatim, so result_record must itself be a
+        # RECORD `{|id|:...}` — not `{{...}}`, which is an AppleScript
+        # list-of-one-record and serializes to a JSON array. That array was
+        # the real cause of the original "get_message returned a list" failure
+        # (masked first as a `.get` crash, then by the degenerate-result
+        # guard) — it only surfaces when the AppleScript path actually runs.
         result_record = (
-            '{{|id|:(id of msg as text), |rfc_message_id|:(message id of msg),'
+            '{|id|:(id of msg as text), |rfc_message_id|:(message id of msg),'
             ' |subject|:(subject of msg), |sender|:(sender of msg),'
             ' |date_received|:(date received of msg as text),'
             ' |read_status|:(read status of msg),'
             ' |flagged|:(flagged status of msg),'
-            f' |content|:msgContent{attachments_field}}}}}'
+            f' |content|:msgContent{attachments_field}}}'
         )
 
         if account is not None and mailbox is not None:
@@ -1933,36 +1968,7 @@ class AppleMailConnector:
                         set attList to mail attachments of msg
 
                         set resultData to {{}}
-                        repeat with att in attList
-                            -- Each property is read defensively: Mail.app
-                            -- raises -10000 on some attachments (e.g. MIME
-                            -- type of certain PDFs), and a single throw must
-                            -- not abort the whole enumeration — that returned
-                            -- [] and silently broke save_attachments, which
-                            -- depends on this enumeration for the names.
-                            try
-                                set attName to name of att
-                            on error
-                                set attName to ""
-                            end try
-                            try
-                                set attMime to (MIME type of att)
-                            on error
-                                set attMime to ""
-                            end try
-                            try
-                                set attSize to (file size of att)
-                            on error
-                                set attSize to 0
-                            end try
-                            try
-                                set attDownloaded to (downloaded of att)
-                            on error
-                                set attDownloaded to false
-                            end try
-                            set attRecord to {{|name|:attName, |mime_type|:attMime, |size|:attSize, |downloaded|:attDownloaded}}
-                            set end of resultData to attRecord
-                        end repeat
+                        repeat with att in attList{_attachment_record_as("resultData")}                        end repeat
                         exit repeat
                     end try
                 end repeat
@@ -2131,8 +2137,16 @@ class AppleMailConnector:
 
                 set att to item {as_index} of attList
                 set attName to name of att
-                set attMime to MIME type of att
-                set attSize to file size of att
+                try
+                    set attMime to MIME type of att
+                on error
+                    set attMime to ""
+                end try
+                try
+                    set attSize to file size of att
+                on error
+                    set attSize to 0
+                end try
                 save att in POSIX file "{dir_safe}/{safe_save_name}"
 
                 return attName & "|||" & attMime & "|||" & (attSize as text)
@@ -3772,12 +3786,9 @@ class AppleMailConnector:
         )
 
         if include_attachments:
-            attachments_clause = '''
-                set attList to {}
-                repeat with att in mail attachments of msg
-                    set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                    set end of attList to attRecord
-                end repeat'''
+            attachments_clause = f'''
+                set attList to {{}}
+                repeat with att in mail attachments of msg{_attachment_record_as("attList")}                end repeat'''
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
