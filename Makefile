@@ -1,4 +1,4 @@
-.PHONY: help install dev test test-unit test-integration test-e2e test-verbose lint format typecheck complexity audit check-all coverage clean
+.PHONY: help install dev test test-unit test-integration test-e2e test-verbose lint format typecheck complexity audit check-all coverage clean smoke install-hooks
 
 help:
 	@echo "Available targets:"
@@ -35,6 +35,19 @@ test-integration:
 
 test-e2e:
 	MAIL_TEST_MODE=true uv run pytest tests/e2e/ -v
+
+# Real-execution smoke suite: runs osascript against the local Mail.app (and
+# IMAP against the real account) to catch the AppleScript-runtime bug class
+# that mocked unit tests structurally cannot. Self-skips if Mail.app/account
+# aren't available, so it's safe to run anywhere. Wired into the pre-push hook.
+smoke:
+	uv run pytest tests/integration/test_smoke.py --run-integration -q
+
+# Install repo-tracked git hooks into .git/hooks (symlink so they stay in sync).
+install-hooks:
+	@ln -sf ../../scripts/hooks/pre-push .git/hooks/pre-push
+	@chmod +x scripts/hooks/pre-push
+	@echo "Installed pre-push hook -> scripts/hooks/pre-push"
 
 benchmark:
 	MAIL_TEST_MODE=true uv run pytest tests/benchmarks/ --run-benchmark -v -s
