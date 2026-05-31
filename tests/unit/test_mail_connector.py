@@ -4741,6 +4741,211 @@ class TestWhoseIdQuoting:
         )
 
 
+class TestSaveAttachmentsImapPath:
+    """save_attachments IMAP fast path — mirrors get_attachment_content's
+    IMAP-first dispatch, fallback, and CWE-22 containment guarantees."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @patch("apple_mail_mcp.mail_connector.ImapConnector")
+    @patch("apple_mail_mcp.mail_connector.get_imap_password")
+    @patch.object(AppleMailConnector, "_resolve_imap_config")
+    def test_imap_save_writes_right_bytes_to_contained_paths(
+        self,
+        mock_resolve: MagicMock,
+        mock_keychain: MagicMock,
+        mock_imap_cls: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        import tempfile
+        from pathlib import Path
+
+        mock_resolve.return_value = ("imap.mail.me.com", 993, "user@icloud.com")
+        mock_keychain.return_value = "app-password"
+        mock_imap = MagicMock()
+        mock_imap_cls.return_value = mock_imap
+        # Names AND bytes come from one source — get_attachment_payloads —
+        # so a name can never be paired with another part's bytes.
+        mock_imap.get_attachment_payloads.return_value = [
+            ("04 FS.pdf", b"%PDF-ok"),
+            ("notes.txt", b"hey"),
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td).resolve()
+            count = connector.save_attachments(
+                "msg@example.com", tdp,
+                account="iCloud", mailbox="INBOX",
+            )
+
+            assert count == 2
+            # sanitize_filename maps the space to an underscore.
+            assert (tdp / "04_FS.pdf").read_bytes() == b"%PDF-ok"
+            assert (tdp / "notes.txt").read_bytes() == b"hey"
+
+        # IMAP path used — no AppleScript breaker open after success.
+        assert connector._imap_breaker_open("iCloud") is False
+        mock_imap.get_attachment_payloads.assert_called_once_with(
+            "msg@example.com", mailbox="INBOX",
+            max_bytes=connector._MAX_ATTACHMENT_READ_BYTES,
+        )
+
+    @patch("apple_mail_mcp.mail_connector.ImapConnector")
+    @patch("apple_mail_mcp.mail_connector.get_imap_password")
+    @patch.object(AppleMailConnector, "_resolve_imap_config")
+    def test_imap_save_enforces_max_bytes_arg(
+        self,
+        mock_resolve: MagicMock,
+        mock_keychain: MagicMock,
+        mock_imap_cls: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        import tempfile
+        from pathlib import Path
+
+        mock_resolve.return_value = ("imap.mail.me.com", 993, "user@icloud.com")
+        mock_keychain.return_value = "pw"
+        mock_imap = MagicMock()
+        mock_imap_cls.return_value = mock_imap
+        mock_imap.get_attachment_payloads.return_value = [("a.bin", b"x")]
+
+        with tempfile.TemporaryDirectory() as td:
+            connector.save_attachments(
+                "msg@example.com", Path(td),
+                account="iCloud", mailbox="INBOX",
+            )
+
+        # The 25MB cap is enforced at the (single) payload fetch.
+        _, kwargs = mock_imap.get_attachment_payloads.call_args
+        assert kwargs["max_bytes"] == connector._MAX_ATTACHMENT_READ_BYTES
+
+    @patch.object(AppleMailConnector, "_save_attachments_applescript")
+    @patch.object(AppleMailConnector, "_imap_save_attachments")
+    def test_imap_first_dispatch_does_not_call_applescript(
+        self,
+        mock_imap_save: MagicMock,
+        mock_as_save: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        import tempfile
+        from pathlib import Path
+
+        mock_imap_save.return_value = 1
+        with tempfile.TemporaryDirectory() as td:
+            result = connector.save_attachments(
+                "msg@example.com", Path(td),
+                account="iCloud", mailbox="INBOX",
+            )
+        assert result == 1
+        mock_imap_save.assert_called_once()
+        mock_as_save.assert_not_called()
+
+    @patch.object(AppleMailConnector, "_save_attachments_applescript")
+    @patch.object(AppleMailConnector, "_imap_save_attachments")
+    def test_falls_back_to_applescript_on_fallback_exc(
+        self,
+        mock_imap_save: MagicMock,
+        mock_as_save: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        import tempfile
+        from pathlib import Path
+
+        mock_imap_save.side_effect = OSError("network down")
+        mock_as_save.return_value = 3
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            result = connector.save_attachments(
+                "msg@example.com", tdp,
+                account="iCloud", mailbox="INBOX",
+            )
+        assert result == 3
+        mock_imap_save.assert_called_once()
+        mock_as_save.assert_called_once()
+        # The fallback opened the breaker.
+        assert connector._imap_breaker_open("iCloud") is True
+
+    @patch.object(AppleMailConnector, "_save_attachments_applescript")
+    @patch.object(AppleMailConnector, "_imap_save_attachments")
+    def test_open_breaker_skips_imap(
+        self,
+        mock_imap_save: MagicMock,
+        mock_as_save: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        import tempfile
+        from pathlib import Path
+
+        connector._imap_failure_until["iCloud"] = time.monotonic() + 60
+        mock_as_save.return_value = 0
+        with tempfile.TemporaryDirectory() as td:
+            connector.save_attachments(
+                "msg@example.com", Path(td),
+                account="iCloud", mailbox="INBOX",
+            )
+        mock_imap_save.assert_not_called()
+        mock_as_save.assert_called_once()
+
+    @patch.object(AppleMailConnector, "_save_attachments_applescript")
+    @patch.object(AppleMailConnector, "_imap_save_attachments")
+    def test_partial_hint_account_only_skips_imap(
+        self,
+        mock_imap_save: MagicMock,
+        mock_as_save: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        import tempfile
+        from pathlib import Path
+
+        mock_as_save.return_value = 0
+        with tempfile.TemporaryDirectory() as td:
+            connector.save_attachments(
+                "msg@example.com", Path(td), account="iCloud",
+            )
+        mock_imap_save.assert_not_called()
+        mock_as_save.assert_called_once()
+
+    @patch("apple_mail_mcp.mail_connector.ImapConnector")
+    @patch("apple_mail_mcp.mail_connector.get_imap_password")
+    @patch.object(AppleMailConnector, "_resolve_imap_config")
+    def test_imap_containment_drops_traversal_name(
+        self,
+        mock_resolve: MagicMock,
+        mock_keychain: MagicMock,
+        mock_imap_cls: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """A ../ attachment name is sanitized to a contained basename — the
+        write must land inside save_directory, never escape it."""
+        import tempfile
+        from pathlib import Path
+
+        mock_resolve.return_value = ("imap.mail.me.com", 993, "user@icloud.com")
+        mock_keychain.return_value = "pw"
+        mock_imap = MagicMock()
+        mock_imap_cls.return_value = mock_imap
+        mock_imap.get_attachment_payloads.return_value = [
+            ("../../etc/evil.txt", b"evil"),
+        ]
+
+        with tempfile.TemporaryDirectory() as outer:
+            outerp = Path(outer).resolve()
+            save_dir = outerp / "save"
+            save_dir.mkdir()
+            count = connector.save_attachments(
+                "msg@example.com", save_dir,
+                account="iCloud", mailbox="INBOX",
+            )
+            assert count == 1
+            # Nothing escaped save_dir.
+            written = list(save_dir.iterdir())
+            assert len(written) == 1
+            assert written[0].parent == save_dir
+            assert not (outerp / "etc").exists()
+
+
 class TestWrapAsJsonScript:
     def test_wrapper_contains_framework_directive(self) -> None:
         script = _wrap_as_json_script(

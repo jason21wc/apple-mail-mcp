@@ -482,6 +482,71 @@ class TestMailIntegration:
         # Bytes came from the server regardless of Mail.app download state.
         assert result["size"] >= 0
 
+    def test_save_attachments_via_imap_writes_bytes_contained(
+        self, connector: AppleMailConnector, test_account: str, tmp_path: Path
+    ) -> None:
+        """IMAP save path fetches attachment bytes from the server and writes
+        them to disk — works even when Mail.app has NOT downloaded the
+        attachment (the AppleScript path raises -10000 on an undownloaded
+        placeholder). Asserts the write stayed inside save_directory (CWE-22)
+        and that real bytes landed on disk.
+
+        Skips if the account has no IMAP Keychain entry, or if the test
+        inbox has no message carrying an attachment.
+        """
+        from apple_mail_mcp.exceptions import (
+            MailKeychainAccessDeniedError,
+            MailKeychainEntryNotFoundError,
+        )
+        from apple_mail_mcp.keychain import get_imap_password
+
+        try:
+            _, _, email = connector._resolve_imap_config(test_account)
+            get_imap_password(test_account, email)
+        except (
+            MailKeychainEntryNotFoundError,
+            MailKeychainAccessDeniedError,
+        ):
+            pytest.skip(
+                f"No Keychain entry for {test_account!r} — IMAP path "
+                f"can't be exercised. Run `apple-mail-mcp setup-imap` first."
+            )
+
+        matches = connector.search_messages(
+            account=test_account, mailbox="INBOX",
+            has_attachment=True, limit=1,
+        )
+        if not matches:
+            pytest.skip("test inbox has no messages with attachments")
+
+        rfc_id = matches[0].get("rfc_message_id") or matches[0].get("id")
+        assert rfc_id, "search row missing rfc_message_id/id"
+
+        # Confirm the message actually enumerates at least one attachment
+        # via the IMAP BODYSTRUCTURE walk before asserting a write happened.
+        atts = connector.get_attachments(
+            rfc_id, account=test_account, mailbox="INBOX",
+        )
+        if not atts:
+            pytest.skip("first attachment message had no IMAP-visible parts")
+
+        save_dir = (tmp_path / "save").resolve()
+        save_dir.mkdir()
+
+        count = connector.save_attachments(
+            rfc_id, save_dir,
+            attachment_indices=[0],
+            account=test_account, mailbox="INBOX",
+        )
+        assert count == 1
+
+        written = [p for p in save_dir.rglob("*") if p.is_file()]
+        assert len(written) == 1
+        # Containment: the file is strictly inside save_dir, never escaped.
+        assert written[0].resolve().is_relative_to(save_dir)
+        # Real bytes from the server, not an empty placeholder.
+        assert written[0].stat().st_size > 0
+
 
 class TestDraftsLifecycleIntegration:
     """Integration tests for the drafts lifecycle (#134).

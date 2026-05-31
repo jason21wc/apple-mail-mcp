@@ -3515,3 +3515,147 @@ class TestGetAttachmentContent:
             ["HEADER", "Message-ID", "<abc@example.com>"]
         )
         client.select_folder.assert_called_once_with("Archive", readonly=True)
+
+
+class TestGetAttachmentBytes:
+    """ImapConnector.get_attachment_bytes — raw decoded payload for disk writes."""
+
+    def _setup_client(self, mock_cls: MagicMock, rfc822: bytes) -> MagicMock:
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = [42]
+        client.fetch.return_value = {42: {b"BODY[]": rfc822}}
+        return client
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_binary_attachment_returns_raw_bytes(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """No base64 re-encode — the bytes are byte-exact for disk writes."""
+        pdf = b"%PDF-1.4 pretend financial statement bytes"
+        part = (
+            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-Disposition: attachment; filename=\"04 FS.pdf\"\r\n"
+            b"\r\n"
+        ) + _b64(pdf)
+        self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
+
+        raw = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
+            "msg@example.com", attachment_index=0,
+        )
+        assert raw == pdf
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_get_attachment_payloads_returns_name_byte_pairs_one_source(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """Names AND bytes come from one parse, in order — so save_attachments
+        can index both off the same list with no cross-source misalignment."""
+        pdf = b"%PDF-1.4 statement"
+        pdf_part = (
+            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-Disposition: attachment; filename=\"04 FS.pdf\"\r\n"
+            b"\r\n"
+        ) + _b64(pdf)
+        txt_part = (
+            b"Content-Type: text/plain; name=\"notes.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"notes.txt\"\r\n"
+            b"\r\nplain notes"
+        )
+        self._setup_client(
+            mock_cls, _multipart_message([_BODY_PART, pdf_part, txt_part])
+        )
+
+        payloads = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_payloads(
+            "msg@example.com",
+        )
+        assert payloads == [("04 FS.pdf", pdf), ("notes.txt", b"plain notes")]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_get_attachment_payloads_enforces_max_bytes(
+        self, mock_cls: MagicMock
+    ) -> None:
+        big = b"x" * 5000
+        part = (
+            b"Content-Type: application/pdf; name=\"big.pdf\"\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-Disposition: attachment; filename=\"big.pdf\"\r\n"
+            b"\r\n"
+        ) + _b64(big)
+        self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
+        with pytest.raises(ValueError, match="too large"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_payloads(
+                "msg@example.com", max_bytes=1000,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_text_attachment_returns_raw_bytes(
+        self, mock_cls: MagicMock
+    ) -> None:
+        part = (
+            b"Content-Type: text/plain; name=\"notes.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"notes.txt\"\r\n"
+            b"\r\n"
+            b"hello from the attachment"
+        )
+        self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
+
+        raw = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
+            "msg@example.com", attachment_index=0,
+        )
+        assert raw == b"hello from the attachment"
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_index_selects_correct_part(self, mock_cls: MagicMock) -> None:
+        first = (
+            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
+            b"\r\nAAA"
+        )
+        second = (
+            b"Content-Type: text/plain; name=\"b.txt\"\r\n"
+            b"Content-Disposition: attachment; filename=\"b.txt\"\r\n"
+            b"\r\nBBB"
+        )
+        self._setup_client(
+            mock_cls, _multipart_message([_BODY_PART, first, second])
+        )
+
+        raw = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
+            "msg@example.com", attachment_index=1,
+        )
+        assert raw == b"BBB"
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_max_bytes_exceeded_raises(self, mock_cls: MagicMock) -> None:
+        pdf = b"x" * 5000
+        part = (
+            b"Content-Type: application/pdf; name=\"big.pdf\"\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-Disposition: attachment; filename=\"big.pdf\"\r\n"
+            b"\r\n"
+        ) + _b64(pdf)
+        self._setup_client(mock_cls, _multipart_message([part]))
+
+        with pytest.raises(ValueError, match="too large"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
+                "msg@example.com", attachment_index=0, max_bytes=1000,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_negative_index_raises(self, mock_cls: MagicMock) -> None:
+        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
+        with pytest.raises(ValueError, match="non-negative"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
+                "msg@example.com", attachment_index=-1,
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_index_out_of_range_raises(self, mock_cls: MagicMock) -> None:
+        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
+        with pytest.raises(ValueError, match="out of range"):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
+                "msg@example.com", attachment_index=5,
+            )
