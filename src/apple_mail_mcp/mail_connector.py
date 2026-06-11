@@ -20,6 +20,7 @@ from .exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
     MailDraftNotFoundError,
+    MailError,
     MailImapMoveUnsupportedError,
     MailImapRequiredError,
     MailImapTrashNotFoundError,
@@ -539,8 +540,12 @@ class AppleMailConnector:
         except subprocess.TimeoutExpired as e:
             raise MailAppleScriptError(f"Script execution timeout after {self.timeout}s") from e
         except Exception as e:
-            if isinstance(e, (MailAccountNotFoundError, MailMailboxNotFoundError,
-                            MailMessageNotFoundError, MailAppleScriptError)):
+            # Re-raise on the common MailError base rather than an enumerated
+            # allowlist. The previous tuple listed four sibling types and
+            # silently omitted MailRuleNotFoundError (and any future MailError),
+            # re-wrapping it as MailAppleScriptError and defeating the
+            # server-layer error_type routing. One base check cannot drift.
+            if isinstance(e, MailError):
                 raise
             raise MailAppleScriptError(f"Unexpected error: {str(e)}") from e
 

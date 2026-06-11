@@ -20,6 +20,7 @@ from apple_mail_mcp.exceptions import (
     MailKeychainEntryNotFoundError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailRuleNotFoundError,
 )
 from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
 
@@ -114,6 +115,40 @@ class TestAppleMailConnector:
             stderr="Can\u2019t get mailbox \"NonExistent\"",
         )
         with pytest.raises(MailMailboxNotFoundError):
+            connector._run_applescript("test script")
+
+    @patch("subprocess.run")
+    def test_run_applescript_message_not_found_propagates(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Sanity anchor: a typed exception dispatched from the error parser
+        must reach the caller unwrapped (not re-wrapped as MailAppleScriptError
+        by the catch-all)."""
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="Can't get message id 12345",
+        )
+        with pytest.raises(MailMessageNotFoundError):
+            connector._run_applescript("test script")
+
+    @patch("subprocess.run")
+    def test_run_applescript_rule_not_found_propagates(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """RED→GREEN regression: the error parser dispatches
+        MailRuleNotFoundError for "Can't get rule", but the catch-all re-raise
+        allowlist enumerated only four sibling types and omitted this one, so
+        rule-not-found was re-wrapped as MailAppleScriptError — defeating the
+        server-layer rule_not_found error_type routing. The fix re-raises on the
+        common MailError base so every typed dispatch propagates intact.
+        """
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="Can't get rule 99",
+        )
+        with pytest.raises(MailRuleNotFoundError):
             connector._run_applescript("test script")
 
     @patch.object(AppleMailConnector, "_run_applescript")
