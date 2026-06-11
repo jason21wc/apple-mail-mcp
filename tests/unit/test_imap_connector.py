@@ -3574,6 +3574,27 @@ class TestGetAttachmentBytes:
         assert payloads == [("04 FS.pdf", pdf), ("notes.txt", b"plain notes")]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_attachment_fetch_selects_readonly(self, mock_cls: MagicMock) -> None:
+        """The shared id-lookup helper must EXAMINE (readonly=True) so reading an
+        attachment never sets \\Seen on the message. Regression guard for the
+        chokepoint refactor (P0-1): a readonly=False default would silently
+        dirty the mailbox on every attachment read."""
+        part = (
+            b"Content-Type: application/pdf; name=\"x.pdf\"\r\n"
+            b"Content-Disposition: attachment; filename=\"x.pdf\"\r\n\r\n"
+        ) + _b64(b"%PDF-1.4")
+        client = self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
+
+        conn = ImapConnector("h", 993, "u@e.com", "pw")
+        conn.get_attachment_bytes("msg@example.com", attachment_index=0)
+        conn.get_attachment_payloads("msg@example.com")
+
+        for call in client.select_folder.call_args_list:
+            assert call.kwargs.get("readonly") is True, (
+                f"attachment SELECT must be readonly, got {call}"
+            )
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_get_attachment_payloads_enforces_max_bytes(
         self, mock_cls: MagicMock
     ) -> None:
