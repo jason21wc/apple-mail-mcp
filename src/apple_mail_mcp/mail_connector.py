@@ -112,6 +112,48 @@ def _is_rfc_message_id(message_id: str) -> bool:
     return bool(message_id) and "@" in message_id
 
 
+def _any_rfc_message_id(message_ids: list[str]) -> bool:
+    """True if at least one id is an RFC 5322 Message-ID.
+
+    The IMAP write paths resolve ids via ``SEARCH HEADER "Message-ID"``, which
+    can only match RFC ids — a numeric Mail.app id resolves to nothing and the
+    helper returns 0, which the orchestrator (``imap_count is not None``) then
+    mistakes for "0 applicable" and returns as success, never falling through
+    to the AppleScript pass where the numeric id WOULD match (P0-3, silent
+    no-op). When no id is RFC-resolvable, skip IMAP entirely.
+    """
+    return any(_is_rfc_message_id(m) for m in message_ids)
+
+
+def _whose_message_clause(message_id: str) -> str:
+    """Build the AppleScript ``whose`` clause to locate one message by id,
+    handling BOTH id namespaces.
+
+    Mail.app's numeric ids match ``whose id is`` only; RFC 5322 Message-IDs
+    (returned by the IMAP path) match ``whose message id is`` only. A single
+    discriminator (:func:`_is_rfc_message_id`) picks the right form, and for
+    RFC ids both bare and angle-bracketed forms are tried (Mail.app stores the
+    bracketed form, but search results vary). The id is sanitized + escaped
+    here so every call site is injection-safe by construction.
+
+    This is the one resolver; before it was extracted, only get_message
+    discriminated namespaces and five other AppleScript lookup sites used
+    numeric-only ``whose id is``, silently failing on RFC ids (P0-3).
+    """
+    if _is_rfc_message_id(message_id):
+        bare = message_id.strip()
+        if bare.startswith("<") and bare.endswith(">"):
+            bare = bare[1:-1]
+        safe_bare = escape_applescript_string(sanitize_input(bare))
+        safe_bracketed = escape_applescript_string(sanitize_input(f"<{bare}>"))
+        return (
+            f'whose (message id is "{safe_bare}" '
+            f'or message id is "{safe_bracketed}")'
+        )
+    message_id_safe = escape_applescript_string(sanitize_input(message_id))
+    return f'whose id is "{message_id_safe}"'
+
+
 def _applescript_mailbox_ref(mailbox_path: str, account_clause: str) -> str:
     """Build an AppleScript nested mailbox reference from a slash-separated path.
 
@@ -178,6 +220,32 @@ def _wrap_as_json_script(body: str, *, timeout: int) -> str:
     )
 
 
+def _bulk_msg_lookup(container: str, indent: str) -> str:
+    """Emit the AppleScript that binds ``msg`` from the loop variable ``msgId``,
+    handling BOTH id namespaces (P0-3).
+
+    Mirrors :func:`_whose_message_clause` for the bulk loop, where the id is a
+    runtime variable rather than a literal: branch on ``"@"`` (the same RFC-vs-
+    numeric discriminator as :func:`_is_rfc_message_id`) so each comparison is
+    type-matched — ``message id`` (string) vs an RFC string, or ``id`` vs a
+    numeric id — instead of comparing an integer ``id`` to a string in one
+    ``or`` (an unspecified coercion). The RFC branch tries bare and bracketed
+    forms, like the literal helper.
+    """
+    return (
+        f'{indent}if (msgId as text) contains "@" then\n'
+        f"{indent}    set bareId to (msgId as text)\n"
+        f'{indent}    if bareId starts with "<" and bareId ends with ">" then\n'
+        f"{indent}        set bareId to text 2 thru -2 of bareId\n"
+        f"{indent}    end if\n"
+        f"{indent}    set msg to first message of {container} whose "
+        f'(message id is bareId or message id is ("<" & bareId & ">"))\n'
+        f"{indent}else\n"
+        f"{indent}    set msg to first message of {container} whose id is msgId\n"
+        f"{indent}end if"
+    )
+
+
 def _bulk_repeat_block(
     *,
     account: str | None,
@@ -223,11 +291,12 @@ def _bulk_repeat_block(
         action_lines = "\n".join(action_indent + a for a in actions)
         account_clause = applescript_account_clause(account)
         mb_ref = _applescript_mailbox_ref(source_mailbox, account_clause)
+        lookup = _bulk_msg_lookup("sourceMb", " " * 20)
         return (
             f"            set sourceMb to {mb_ref}\n"
             f"            repeat with msgId in idList\n"
             f"                try\n"
-            f"                    set msg to first message of sourceMb whose id is msgId\n"
+            f"{lookup}\n"
             f"{action_lines}\n"
             f"                    set {counter_var} to {counter_var} + 1\n"
             f"                end try\n"
@@ -237,12 +306,13 @@ def _bulk_repeat_block(
     # Cross-scan path (legacy / backwards compat). O(N × M × K).
     action_indent = " " * 28
     action_lines = "\n".join(action_indent + a for a in actions)
+    lookup = _bulk_msg_lookup("mb", " " * 28)
     return (
         f"            repeat with msgId in idList\n"
         f"                repeat with acc in accounts\n"
         f"                    repeat with mb in mailboxes of acc\n"
         f"                        try\n"
-        f"                            set msg to first message of mb whose id is msgId\n"
+        f"{lookup}\n"
         f"{action_lines}\n"
         f"                            set {counter_var} to {counter_var} + 1\n"
         f"                        end try\n"
@@ -1679,24 +1749,7 @@ class AppleMailConnector:
         Message-IDs (``whose message id is``), so callers coming from the
         IMAP path — which returns RFC ids — degrade gracefully.
         """
-        if _is_rfc_message_id(message_id):
-            bare = message_id.strip()
-            if bare.startswith("<") and bare.endswith(">"):
-                bare = bare[1:-1]
-            bracketed = f"<{bare}>"
-            safe_bare = escape_applescript_string(sanitize_input(bare))
-            safe_bracketed = escape_applescript_string(
-                sanitize_input(bracketed)
-            )
-            whose_clause = (
-                f'whose (message id is "{safe_bare}" '
-                f'or message id is "{safe_bracketed}")'
-            )
-        else:
-            message_id_safe = escape_applescript_string(
-                sanitize_input(message_id)
-            )
-            whose_clause = f'whose id is "{message_id_safe}"'
+        whose_clause = _whose_message_clause(message_id)
 
         content_clause = (
             'set msgContent to content of msg'
@@ -1961,7 +2014,7 @@ class AppleMailConnector:
         Callers with a known account+mailbox should provide them to take
         the IMAP path instead.
         """
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        whose_clause = _whose_message_clause(message_id)
 
         tell_body = f'''
         tell application "Mail"
@@ -1969,7 +2022,7 @@ class AppleMailConnector:
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb whose id is "{message_id_safe}"
+                        set msg to first message of mb {whose_clause}
                         set attList to mail attachments of msg
 
                         set resultData to {{}}
@@ -2109,7 +2162,7 @@ class AppleMailConnector:
         if attachment_index < 0:
             raise ValueError("attachment_index must be non-negative")
 
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        whose_clause = _whose_message_clause(message_id)
         as_index = attachment_index + 1  # AppleScript is 1-based
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2124,7 +2177,7 @@ class AppleMailConnector:
                 repeat with acc in accounts
                     repeat with mb in mailboxes of acc
                         try
-                            set foundMsg to first message of mb whose id is "{message_id_safe}"
+                            set foundMsg to first message of mb {whose_clause}
                             exit repeat
                         end try
                     end repeat
@@ -2664,6 +2717,11 @@ class AppleMailConnector:
         Net effect of this helper: 1 call + 1 if-check at the call
         site instead of 3 of each.
         """
+        # All-numeric ids can't be resolved by the IMAP HEADER Message-ID
+        # search; trying IMAP would return 0 and mask the AppleScript fallback
+        # where numeric ids DO match (P0-3). Fall through immediately.
+        if not _any_rfc_message_id(message_ids):
+            return None
         for fast_path in (
             self._maybe_imap_move_only,
             self._maybe_imap_read_only,
@@ -2720,14 +2778,14 @@ class AppleMailConnector:
         """
         from .utils import parse_rfc822_ids
 
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        whose_clause = _whose_message_clause(message_id)
         anchor_body = f'''
         tell application "Mail"
             set anchorResult to missing value
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb whose id is "{message_id_safe}"
+                        set msg to first message of mb {whose_clause}
                         set anchorInReplyTo to ""
                         set anchorRefs to ""
                         try
@@ -3055,7 +3113,7 @@ class AppleMailConnector:
         if not targets:
             return 0
 
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        whose_clause = _whose_message_clause(message_id)
         idx_list = ", ".join(str(idx) for idx, _ in targets)
         path_list = ", ".join(
             f'"{escape_applescript_string(str(path))}"' for _, path in targets
@@ -3067,7 +3125,7 @@ class AppleMailConnector:
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb whose id is "{message_id_safe}"
+                        set msg to first message of mb {whose_clause}
                         -- Re-fetches the attachment list; relies on Mail.app
                         -- returning it in the same order as the earlier
                         -- enumeration used to compute idx/path. A reorder
@@ -3724,7 +3782,14 @@ class AppleMailConnector:
         # mailbox per Message-ID, defeating the speed win. Falls
         # through to the AppleScript pass on any _IMAP_FALLBACK_EXCS
         # exception (incl. capability gaps and trash-not-found).
-        if account is not None and source_mailbox is not None:
+        # All-numeric ids can't be resolved via IMAP HEADER Message-ID search
+        # (they're Mail.app ids, not RFC ids); skip IMAP so the AppleScript
+        # pass — where numeric ids match — runs instead of a silent 0 (P0-3).
+        if (
+            account is not None
+            and source_mailbox is not None
+            and _any_rfc_message_id(message_ids)
+        ):
             imap_count = self._try_imap_delete(
                 message_ids,
                 account=account,

@@ -1154,6 +1154,21 @@ def update_message(
             gmail_mode=gmail_mode,
         )
 
+        # Resolved-zero guard (P0-3): if ids were supplied but none resolved,
+        # the operation found no messages — report an error rather than
+        # success/0, which previously masked a silent no-op (e.g. an IMAP
+        # write path that resolved 0 of N and never fell back).
+        if count == 0:
+            return {
+                "success": False,
+                "error": (
+                    f"None of the {len(message_ids)} requested message(s) "
+                    f"could be located to update."
+                ),
+                "error_type": "no_messages_resolved",
+                "requested": len(message_ids),
+            }
+
         operation_logger.log_operation(
             "update_message",
             {
@@ -1939,6 +1954,26 @@ def delete_messages(
             skip_bulk_check=False,  # Enforce limit
             account=account,
             source_mailbox=source_mailbox,
+        )
+
+        # Resolved-zero guard (P0-3): non-empty request that deleted nothing
+        # means no message was located — surface an error instead of a silent
+        # success/0 (the dangerous failure mode for an unattended pipeline).
+        if count == 0:
+            return {
+                "success": False,
+                "error": (
+                    f"None of the {len(message_ids)} requested message(s) "
+                    f"could be located to delete."
+                ),
+                "error_type": "no_messages_resolved",
+                "requested": len(message_ids),
+            }
+
+        operation_logger.log_operation(
+            "delete_messages",
+            {"count": len(message_ids), "permanent": permanent},
+            "success",
         )
 
         return {

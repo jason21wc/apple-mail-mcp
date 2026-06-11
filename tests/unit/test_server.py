@@ -1461,6 +1461,22 @@ class TestUpdateMessage:
         assert result["error_type"] == "validation_error"
         mock_mail.update_message.assert_not_called()
 
+    # ---- Resolved-zero guard (P0-3) -------------------------------------
+
+    def test_zero_resolved_is_error_not_silent_success(
+        self, mock_mail: MagicMock
+    ) -> None:
+        """A non-empty request that resolves 0 messages must be an error, not
+        success/updated:0 — that silent no-op previously masked an IMAP write
+        path resolving 0 of N and never falling back (P0-3)."""
+        mock_mail.update_message.return_value = 0
+
+        result = update_message(["12345"], read_status=True)
+
+        assert result["success"] is False
+        assert result["error_type"] == "no_messages_resolved"
+        assert result["requested"] == 1
+
     # ---- Individual fields ----------------------------------------------
 
     def test_read_status_only(
@@ -2257,6 +2273,19 @@ class TestDeleteMessages:
             account=None,
             source_mailbox=None,
         )
+
+    def test_zero_resolved_is_error_not_silent_success(
+        self, mock_mail: MagicMock
+    ) -> None:
+        """Non-empty request deleting nothing is an error, not success/0 — the
+        dangerous silent no-op for an unattended pipeline (P0-3)."""
+        mock_mail.delete_messages.return_value = 0
+
+        result = delete_messages(["12345"])
+
+        assert result["success"] is False
+        assert result["error_type"] == "no_messages_resolved"
+        assert result["requested"] == 1
 
     def test_passes_source_mailbox_through(self, mock_mail: MagicMock) -> None:
         mock_mail.delete_messages.return_value = 1

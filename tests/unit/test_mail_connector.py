@@ -3712,6 +3712,47 @@ class TestAppleMailConnector:
         assert _is_rfc_message_id("12345") is False
         assert _is_rfc_message_id("") is False
 
+    def test_whose_message_clause_both_namespaces(self) -> None:
+        """The shared resolver (P0-3): numeric → whose id is; RFC → dual
+        bare+bracketed message-id clause, both forms injection-escaped."""
+        from apple_mail_mcp.mail_connector import _whose_message_clause
+
+        assert _whose_message_clause("506227") == 'whose id is "506227"'
+
+        rfc = _whose_message_clause("abc@server.com")
+        assert rfc == (
+            'whose (message id is "abc@server.com" '
+            'or message id is "<abc@server.com>")'
+        )
+        # A pre-bracketed RFC id normalizes to the same bare+bracketed pair.
+        assert _whose_message_clause("<abc@server.com>") == rfc
+
+    def test_whose_message_clause_escapes_injection(self) -> None:
+        """A quote in the id cannot break out of the AppleScript literal."""
+        from apple_mail_mcp.mail_connector import _whose_message_clause
+
+        clause = _whose_message_clause('1"2')
+        assert '\\"' in clause  # quote escaped, not raw
+
+    def test_any_rfc_message_id(self) -> None:
+        """Fall-through guard input (P0-3): True iff at least one id is RFC."""
+        from apple_mail_mcp.mail_connector import _any_rfc_message_id
+
+        assert _any_rfc_message_id(["1", "2", "3"]) is False
+        assert _any_rfc_message_id(["1", "a@b.com"]) is True
+        assert _any_rfc_message_id([]) is False
+
+    def test_bulk_msg_lookup_handles_both_namespaces(self) -> None:
+        """The bulk loop binds msg from the runtime msgId via an '@' branch —
+        numeric vs RFC compared type-matched, never an integer-vs-string or."""
+        from apple_mail_mcp.mail_connector import _bulk_msg_lookup
+
+        block = _bulk_msg_lookup("sourceMb", " " * 8)
+        assert '(msgId as text) contains "@"' in block
+        assert "whose id is msgId" in block  # numeric branch
+        assert "message id is bareId" in block  # RFC branch (bare)
+        assert 'message id is ("<" & bareId & ">")' in block  # bracketed
+
     @patch("subprocess.run")
     def test_get_message_applescript_numeric_id_uses_whose_id_is(
         self, mock_run: MagicMock, connector: AppleMailConnector
@@ -4758,7 +4799,9 @@ class TestWhoseIdQuoting:
         uuid_id = "CF7C3761-C190-40BA-B94E-3EBC321980ED@icloud.com"
         connector.get_attachments(uuid_id)
         script = mock_run.call_args[0][0]
-        assert f'whose id is "{uuid_id}"' in script
+        # RFC-form id (contains @) → dual message-id clause, matching
+        # get_message (P0-3: get_attachments was numeric-only before).
+        assert f'whose (message id is "{uuid_id}"' in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_save_attachments_quotes_id_in_whose(
@@ -4774,8 +4817,9 @@ class TestWhoseIdQuoting:
         # Multiple AppleScript calls may happen; check at least one
         # contained the quoted-id pattern.
         scripts = [c[0][0] for c in mock_run.call_args_list]
-        assert any(f'whose id is "{uuid_id}"' in s for s in scripts), (
-            f"expected quoted id in one of the scripts: {scripts}"
+        # RFC-form id → dual message-id clause (P0-3 consistency).
+        assert any(f'whose (message id is "{uuid_id}"' in s for s in scripts), (
+            f"expected dual message-id clause in one of the scripts: {scripts}"
         )
 
 
