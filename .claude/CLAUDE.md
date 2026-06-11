@@ -26,7 +26,7 @@ Pin tag: `pin-v0.8.2`. Do not auto-merge upstream changes.
 An MCP server bridging Claude and Apple Mail via AppleScript on macOS.
 
 **Stack:** Python 3.10+, FastMCP, AppleScript (via `osascript`)
-**Version:** v0.8.2 | **Tests:** 1027 unit / 19 e2e / 37 integration | **Coverage:** 92%
+**Version:** v0.8.2 | **Tests:** 1160 unit / 19 e2e / 37 integration | **Coverage:** 92%
 
 ## Commands
 

@@ -337,9 +337,12 @@ Combined patches (move + read, read + flag, etc.) and any patch with `flag_color
 ```json
 {
   "success": true,
-  "count": 3
+  "updated": 3,
+  "requested": 3
 }
 ```
+
+If message IDs are supplied but none can be located, returns `success: false` with `error_type: "no_messages_resolved"` and `requested` — rather than `success: true` with `updated: 0`, which would mask a no-op.
 
 **Examples:**
 
@@ -414,6 +417,8 @@ Delete messages (move to trash).
 - `message_ids`: array[string] - Messages to delete
 - `confirm`: boolean - Require confirmation
 
+If message IDs are supplied but none can be located, returns `success: false` with `error_type: "no_messages_resolved"` rather than `success: true` with `count: 0`.
+
 ---
 
 ## Error Handling
@@ -433,8 +438,11 @@ All tools return a consistent error format:
 - `account_not_found`: Account doesn't exist
 - `mailbox_not_found`: Mailbox doesn't exist
 - `message_not_found`: Message doesn't exist or was deleted
+- `no_messages_resolved`: A write op (`update_message` / `delete_messages`) was given message IDs but located none of them — returned instead of a misleading `success` with a zero count.
+- `rule_not_found`: Rule index is out of range
 - `validation_error`: Invalid parameters
 - `permission_error`: Insufficient permissions
+- `safety_violation`: Blocked by the test-mode safety gate (`MAIL_TEST_MODE`) — wrong account, missing required account on a destructive op, non-reserved send recipient, or unprotected rule name
 - `cancelled`: User cancelled the operation
 - `unknown`: Unexpected error
 
