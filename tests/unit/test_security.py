@@ -503,20 +503,46 @@ class TestCheckTestModeSafety:
     def test_non_send_operation_with_empty_recipients_unchanged(
         self, monkeypatch: Any
     ) -> None:
-        """#175: regression guard — the new empty-recipients reject
-        only fires for operations in SEND_OPERATIONS. Other ops with
-        empty recipients (which is meaningless for them anyway) are
-        unaffected."""
+        """#175: regression guard — the empty-recipients reject only fires for
+        operations in SEND_OPERATIONS. A non-send op with empty recipients is
+        unaffected by that branch. (delete_messages is now a destructive
+        account-gated op (P0-2), so it must name the test account; with the
+        account supplied, empty recipients are irrelevant and it passes.)"""
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
 
-        # delete_messages isn't a send op — the new branch shouldn't fire.
         assert (
-            check_test_mode_safety("delete_messages", recipients=None) is None
+            check_test_mode_safety(
+                "delete_messages", account="TestAccount", recipients=None
+            )
+            is None
         )
         assert (
-            check_test_mode_safety("delete_messages", recipients=[]) is None
+            check_test_mode_safety(
+                "delete_messages", account="TestAccount", recipients=[]
+            )
+            is None
         )
+
+    def test_destructive_op_requires_explicit_account(self, monkeypatch: Any) -> None:
+        """P0-2: destructive account-gated ops must name an account in test
+        mode — account=None would cross-scan and mutate real accounts, so the
+        gate refuses instead of skipping (the old fail-open shape)."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        for op in ("delete_messages", "update_message", "update_mailbox", "delete_mailbox"):
+            result = check_test_mode_safety(op, account=None)
+            assert result is not None, f"{op} must be refused with account=None"
+            assert result["error_type"] == "safety_violation"
+
+    def test_destructive_op_wrong_account_rejected(self, monkeypatch: Any) -> None:
+        """P0-2: delete_messages on a non-test account is refused — closes the
+        hole where delete_messages never reached the gate at all."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        result = check_test_mode_safety("delete_messages", account="RealPersonalAccount")
+        assert result is not None
+        assert result["error_type"] == "safety_violation"
 
     def test_non_gated_operation_returns_none(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")

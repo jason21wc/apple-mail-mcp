@@ -766,9 +766,6 @@ class ImapConnector:
                 back to AppleScript.)
             IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
         """
-        bracketed = _bracket_message_id(message_id)
-        _reject_control_chars(mailbox, "mailbox")
-
         fetch_keys: list[bytes] = [b"ENVELOPE", b"FLAGS"]
         want_body = include_content and not headers_only
         if want_body:
@@ -784,14 +781,9 @@ class ImapConnector:
             fetch_keys.append(b"BODYSTRUCTURE")
 
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
-
-            uids = client.search(["HEADER", "Message-ID", bracketed])
-            if not uids:
-                raise MailMessageNotFoundError(
-                    f"Message-ID {message_id!r} not found in mailbox "
-                    f"{mailbox!r} on {self._host}."
-                )
+            uids = self._select_and_search_message_id(
+                client, mailbox, message_id, readonly=True
+            )
 
             fetched = client.fetch(uids[:1], fetch_keys)
             entry = next(iter(fetched.values()))
@@ -848,18 +840,10 @@ class ImapConnector:
                 the Message-ID.
             IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
         """
-        bracketed = _bracket_message_id(message_id)
-        _reject_control_chars(mailbox, "mailbox")
-
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
-
-            uids = client.search(["HEADER", "Message-ID", bracketed])
-            if not uids:
-                raise MailMessageNotFoundError(
-                    f"Message-ID {message_id!r} not found in mailbox "
-                    f"{mailbox!r} on {self._host}."
-                )
+            uids = self._select_and_search_message_id(
+                client, mailbox, message_id, readonly=True
+            )
 
             fetched = client.fetch(uids[:1], [b"BODYSTRUCTURE"])
             entry = next(iter(fetched.values()))
@@ -972,6 +956,39 @@ class ImapConnector:
         )
         return raw
 
+    def _select_and_search_message_id(
+        self,
+        client: Any,
+        mailbox: str,
+        message_id: str,
+        *,
+        readonly: bool,
+    ) -> list[int]:
+        """Validate, SELECT, and SEARCH a mailbox for a single Message-ID.
+
+        The one chokepoint for "open a folder and look up a message by id":
+        rejects control characters in ``mailbox`` (CWE-93, see
+        :func:`_reject_control_chars`) and routes the id through
+        :func:`_bracket_message_id` so no call site can reach
+        ``select_folder``/``search`` with an unvalidated value. ``readonly``
+        is explicit — every attachment/message read path passes ``True`` so
+        the SELECT (EXAMINE) does not set ``\\Seen``; callers that mutate must
+        opt into ``False`` deliberately.
+
+        Returns the non-empty UID list; raises ``MailMessageNotFoundError`` if
+        the id matches nothing in ``mailbox``.
+        """
+        _reject_control_chars(mailbox, "mailbox")
+        bracketed = _bracket_message_id(message_id)
+        client.select_folder(mailbox, readonly=readonly)
+        uids = cast("list[int]", client.search(["HEADER", "Message-ID", bracketed]))
+        if not uids:
+            raise MailMessageNotFoundError(
+                f"Message-ID {message_id!r} not found in mailbox "
+                f"{mailbox!r} on {self._host}."
+            )
+        return uids
+
     def _fetch_attachment_part(
         self,
         message_id: str,
@@ -990,20 +1007,10 @@ class ImapConnector:
         if attachment_index < 0:
             raise ValueError("attachment_index must be non-negative")
 
-        bracketed = (
-            message_id
-            if message_id.startswith("<") and message_id.endswith(">")
-            else f"<{message_id}>"
-        )
-
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
-            uids = client.search(["HEADER", "Message-ID", bracketed])
-            if not uids:
-                raise MailMessageNotFoundError(
-                    f"Message-ID {message_id!r} not found in mailbox "
-                    f"{mailbox!r} on {self._host}."
-                )
+            uids = self._select_and_search_message_id(
+                client, mailbox, message_id, readonly=True
+            )
             fetched = client.fetch(uids[:1], [b"BODY[]"])
             entry = next(iter(fetched.values()))
             rfc822_bytes = entry.get(b"BODY[]") or b""
@@ -1050,19 +1057,10 @@ class ImapConnector:
             ValueError: An attachment exceeds ``max_bytes``.
             IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
         """
-        bracketed = (
-            message_id
-            if message_id.startswith("<") and message_id.endswith(">")
-            else f"<{message_id}>"
-        )
         with self._session() as client:
-            client.select_folder(mailbox, readonly=True)
-            uids = client.search(["HEADER", "Message-ID", bracketed])
-            if not uids:
-                raise MailMessageNotFoundError(
-                    f"Message-ID {message_id!r} not found in mailbox "
-                    f"{mailbox!r} on {self._host}."
-                )
+            uids = self._select_and_search_message_id(
+                client, mailbox, message_id, readonly=True
+            )
             fetched = client.fetch(uids[:1], [b"BODY[]"])
             entry = next(iter(fetched.values()))
             rfc822_bytes = entry.get(b"BODY[]") or b""

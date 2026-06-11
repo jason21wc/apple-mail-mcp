@@ -265,6 +265,24 @@ ACCOUNT_GATED_OPERATIONS = {
     "search_messages",
     "update_message",
     "create_mailbox",
+    # Destructive account-targeting ops (#P0-2): these were calling the gate
+    # (update_mailbox/delete_mailbox) or not calling it at all (delete_messages)
+    # while absent from this set, so the gate fell through every branch and
+    # allowed them on real accounts in test mode.
+    "update_mailbox",
+    "delete_mailbox",
+    "delete_messages",
+}
+
+# Subset of account-gated ops that MUTATE a real account and cross-scan ALL
+# accounts when account is omitted. In test mode these require an explicit
+# account — account=None is a violation, not a gate-skip — so a test run can
+# never mutate a real account by leaving the routing hint off.
+DESTRUCTIVE_ACCOUNT_OPERATIONS = {
+    "update_message",
+    "update_mailbox",
+    "delete_mailbox",
+    "delete_messages",
 }
 
 SEND_OPERATIONS = {
@@ -286,6 +304,22 @@ RULE_GATED_OPERATIONS = {
 }
 
 RULE_TEST_PREFIX = "[apple-mail-mcp-test]"
+
+# Every state-changing operation the gate is responsible for. Used as a
+# fail-closed denylist: a mutating op that reaches the gate but matches no
+# specific handler set (account/send/rule) is REFUSED in test mode rather than
+# silently allowed. Read-only ops (get_messages, get_thread, list_accounts…)
+# are intentionally absent — they keep returning None (allowed). This is the
+# structural fix for the gate failing open on unregistered operation names.
+MUTATING_OPERATIONS = (
+    ACCOUNT_GATED_OPERATIONS - {"list_mailboxes", "search_messages"}
+) | SEND_OPERATIONS | RULE_GATED_OPERATIONS
+
+# Operations that have a concrete safety check below. MUTATING_OPERATIONS must
+# be a subset of this; the parity test (test_gate_parity.py) enforces it.
+_HANDLED_OPERATIONS = (
+    ACCOUNT_GATED_OPERATIONS | SEND_OPERATIONS | RULE_GATED_OPERATIONS
+)
 
 
 def _is_test_mode_enabled() -> bool:
@@ -391,6 +425,17 @@ def check_test_mode_safety(
     if not _is_test_mode_enabled():
         return None
 
+    # Destructive account-targeting ops must name an explicit account in test
+    # mode. With account=None the connector cross-scans every account, so a
+    # missing routing hint would let a test run mutate real accounts — the gate
+    # must refuse rather than skip (P0-2 / Contrarian Finding 2).
+    if operation in DESTRUCTIVE_ACCOUNT_OPERATIONS and account is None:
+        return _safety_error(
+            operation,
+            f"Test mode: {operation} requires an explicit account; refusing "
+            f"to operate across all accounts when MAIL_TEST_MODE is set.",
+        )
+
     # Account-gated operations: verify target account matches MAIL_TEST_ACCOUNT
     # by either name or UUID (per #61, account-gated tools accept both forms).
     if operation in ACCOUNT_GATED_OPERATIONS and account is not None:
@@ -442,5 +487,16 @@ def check_test_mode_safety(
                 f"Test mode: recipients must use RFC 2606 reserved domains "
                 f"(example.com/.test/.invalid/etc.). Violations: {', '.join(bad)}",
             )
+
+    # Fail-closed net: a state-changing operation that reached the gate but
+    # matched no handler set above is a registration gap — refuse it rather
+    # than fall through to "allowed". Read-only ops are not in
+    # MUTATING_OPERATIONS, so they still return None.
+    if operation in MUTATING_OPERATIONS and operation not in _HANDLED_OPERATIONS:
+        return _safety_error(
+            operation,
+            f"Test mode: {operation} is a state-changing operation with no "
+            f"registered safety check (gate fails closed).",
+        )
 
     return None

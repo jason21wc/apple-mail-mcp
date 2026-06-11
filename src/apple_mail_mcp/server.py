@@ -1114,14 +1114,14 @@ def update_message(
                 "error_type": "validation_error",
             }
 
-        # Test-mode safety: when account is provided (moves, or narrow-path),
-        # gate against MAIL_TEST_ACCOUNT.
-        if account is not None:
-            safety_err = check_test_mode_safety(
-                "update_message", account=account
-            )
-            if safety_err:
-                return safety_err
+        # Test-mode safety: call the gate UNCONDITIONALLY. update_message
+        # mutates, so the gate (a) rejects account=None in test mode — an
+        # omitted hint would cross-scan and mutate real accounts — and
+        # (b) verifies a provided account matches MAIL_TEST_ACCOUNT. Guarding
+        # the call with `if account is not None` was the fail-open shape (P0-2).
+        safety_err = check_test_mode_safety("update_message", account=account)
+        if safety_err:
+            return safety_err
 
         rate_err = check_rate_limit("update_message", {"count": len(message_ids)})
         if rate_err:
@@ -1153,6 +1153,21 @@ def update_message(
             source_mailbox=source_mailbox,
             gmail_mode=gmail_mode,
         )
+
+        # Resolved-zero guard (P0-3): if ids were supplied but none resolved,
+        # the operation found no messages — report an error rather than
+        # success/0, which previously masked a silent no-op (e.g. an IMAP
+        # write path that resolved 0 of N and never fell back).
+        if count == 0:
+            return {
+                "success": False,
+                "error": (
+                    f"None of the {len(message_ids)} requested message(s) "
+                    f"could be located to update."
+                ),
+                "error_type": "no_messages_resolved",
+                "requested": len(message_ids),
+            }
 
         operation_logger.log_operation(
             "update_message",
@@ -1910,6 +1925,14 @@ def delete_messages(
                 "message": "No messages to delete",
             }
 
+        # Test-mode safety (P0-2): delete_messages previously never called the
+        # gate at all, so a test run could trash up to 100 messages in any real
+        # account. Call it unconditionally — account=None is refused in test
+        # mode, and a provided account must match MAIL_TEST_ACCOUNT.
+        safety_err = check_test_mode_safety("delete_messages", account=account)
+        if safety_err:
+            return safety_err
+
         rate_err = check_rate_limit("delete_messages", {"count": len(message_ids)})
         if rate_err:
             return rate_err
@@ -1931,6 +1954,26 @@ def delete_messages(
             skip_bulk_check=False,  # Enforce limit
             account=account,
             source_mailbox=source_mailbox,
+        )
+
+        # Resolved-zero guard (P0-3): non-empty request that deleted nothing
+        # means no message was located — surface an error instead of a silent
+        # success/0 (the dangerous failure mode for an unattended pipeline).
+        if count == 0:
+            return {
+                "success": False,
+                "error": (
+                    f"None of the {len(message_ids)} requested message(s) "
+                    f"could be located to delete."
+                ),
+                "error_type": "no_messages_resolved",
+                "requested": len(message_ids),
+            }
+
+        operation_logger.log_operation(
+            "delete_messages",
+            {"count": len(message_ids), "permanent": permanent},
+            "success",
         )
 
         return {
