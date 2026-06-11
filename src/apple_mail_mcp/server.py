@@ -1114,14 +1114,14 @@ def update_message(
                 "error_type": "validation_error",
             }
 
-        # Test-mode safety: when account is provided (moves, or narrow-path),
-        # gate against MAIL_TEST_ACCOUNT.
-        if account is not None:
-            safety_err = check_test_mode_safety(
-                "update_message", account=account
-            )
-            if safety_err:
-                return safety_err
+        # Test-mode safety: call the gate UNCONDITIONALLY. update_message
+        # mutates, so the gate (a) rejects account=None in test mode — an
+        # omitted hint would cross-scan and mutate real accounts — and
+        # (b) verifies a provided account matches MAIL_TEST_ACCOUNT. Guarding
+        # the call with `if account is not None` was the fail-open shape (P0-2).
+        safety_err = check_test_mode_safety("update_message", account=account)
+        if safety_err:
+            return safety_err
 
         rate_err = check_rate_limit("update_message", {"count": len(message_ids)})
         if rate_err:
@@ -1909,6 +1909,14 @@ def delete_messages(
                 "count": 0,
                 "message": "No messages to delete",
             }
+
+        # Test-mode safety (P0-2): delete_messages previously never called the
+        # gate at all, so a test run could trash up to 100 messages in any real
+        # account. Call it unconditionally — account=None is refused in test
+        # mode, and a provided account must match MAIL_TEST_ACCOUNT.
+        safety_err = check_test_mode_safety("delete_messages", account=account)
+        if safety_err:
+            return safety_err
 
         rate_err = check_rate_limit("delete_messages", {"count": len(message_ids)})
         if rate_err:
