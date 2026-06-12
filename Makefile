@@ -1,4 +1,4 @@
-.PHONY: help install dev test test-unit test-integration test-e2e test-verbose lint format typecheck complexity audit check-all coverage clean smoke install-hooks
+.PHONY: help install dev test test-unit test-integration test-e2e test-verbose lint format typecheck complexity audit check-all coverage clean smoke install-hooks test-hooks
 
 help:
 	@echo "Available targets:"
@@ -43,11 +43,15 @@ test-e2e:
 smoke:
 	uv run pytest tests/integration/test_smoke.py --run-integration -q
 
-# Install repo-tracked git hooks into .git/hooks (symlink so they stay in sync).
+# Install repo-tracked git hooks into .git/hooks (symlinks, stay in sync).
+# Single installer — scripts/git-hooks/ is the one home for git hooks;
+# scripts/hooks/ holds Claude-harness hooks, which are NOT git hooks.
 install-hooks:
-	@ln -sf ../../scripts/hooks/pre-push .git/hooks/pre-push
-	@chmod +x scripts/hooks/pre-push
-	@echo "Installed pre-push hook -> scripts/hooks/pre-push"
+	@./scripts/install-git-hooks.sh
+
+# Pin the pre-push gate's decision matrix (vacuous-pass guard etc.).
+test-hooks:
+	@./scripts/test_pre_push_hook.sh
 
 benchmark:
 	MAIL_TEST_MODE=true uv run pytest tests/benchmarks/ --run-benchmark -v -s
@@ -82,6 +86,7 @@ coverage:
 check-all: lint typecheck test complexity
 	@./scripts/check_version_sync.sh
 	@./scripts/check_client_server_parity.sh
+	@./scripts/test_pre_push_hook.sh
 	@echo ""
 	@echo "All checks passed."
 
