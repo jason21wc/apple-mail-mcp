@@ -438,6 +438,27 @@ class TestLimitWithHasAttachmentFilter:
         assert [r["subject"] for r in result] == ["Subject 3"]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_entry_without_envelope_is_skipped(self, mock_cls):
+        """Some servers return a partial FETCH entry (key present, no
+        ENVELOPE) for a message mutated mid-search — skip it like a
+        missing one instead of KeyError-ing. (Upstream #314 semantics.)"""
+        client = self._setup(
+            mock_cls, uids=range(1, 11), attachment_uids={3, 7}
+        )
+        inner = client.fetch.side_effect
+
+        def degrade(chunk, keys):
+            out = inner(chunk, keys)
+            if 7 in out:
+                out[7] = {b"FLAGS": (b"\\Seen",)}  # entry, no ENVELOPE
+            return out
+
+        client.fetch.side_effect = degrade
+        conn = ImapConnector("h", 993, "u@e.com", "pw")
+        result = conn.search_messages(has_attachment=True, limit=5)
+        assert [r["subject"] for r in result] == ["Subject 3"]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_no_limit_with_filter_fetches_all_once(self, mock_cls):
         """Filter without limit keeps the single-FETCH fast path."""
         client = self._setup(
