@@ -1,19 +1,139 @@
 #!/bin/bash
-# Pre-push hook: run unit tests before every push.
-set -euo pipefail
+# Git pre-push hook — THE single pre-push gate for this repo.
+#
+# Two layers:
+#   1. Unit tests (fast, ~2s) — always run.
+#   2. Real-execution smoke suite (`make smoke`) — only when the push
+#      touches src/apple_mail_mcp/{mail_connector,imap_connector}.py.
+#      The connector's AppleScript/IMAP paths are the one layer mocked
+#      unit tests structurally cannot cover (osascript -10000 property
+#      errors, record-vs-list result shapes, does-save-actually-write) —
+#      every such bug in 2026-05 shipped because no AppleScript ran in CI.
+#
+# Vacuous-pass guard: the smoke suite SELF-SKIPS per test when Mail.app /
+# the account / credentials aren't available, and pytest exits 0 on an
+# all-skip run. "0 passed" must not read as a green gate on a machine
+# that HAS Mail.app (typo'd MAIL_SMOKE_ACCOUNT, Mail hiccup, broken
+# creds) — that's the smoke layer silently switched off. Decision matrix:
+#   smoke exit != 0                          -> BLOCK (real failure)
+#   >=1 passed                               -> allow
+#   0 passed + SMOKE_SKIP_OK=1               -> allow (explicit opt-out)
+#   0 passed + Mail.app present              -> BLOCK (vacuous run)
+#   0 passed + no Mail.app (CI/other clones) -> allow with notice
+#
+# Install: `make install-hooks` (delegates to scripts/install-git-hooks.sh,
+# which symlinks every hook in scripts/git-hooks/ into .git/hooks/).
+# History: this file merges the upstream unit-test hook with the fork's
+# smoke gate (formerly scripts/hooks/pre-push) — the two used to compete
+# for .git/hooks/pre-push and whichever installer ran last silently
+# replaced the other.
 
-echo "Running unit tests before push..."
+set -uo pipefail
 
-if command -v uv &> /dev/null; then
-    uv run pytest tests/unit/ -q --no-header 2>&1
-else
-    pytest tests/unit/ -q --no-header 2>&1
+CONNECTOR_RE='src/apple_mail_mcp/(mail_connector|imap_connector)\.py'
+ZERO='0000000000000000000000000000000000000000'
+# Test seams: the harness (scripts/test_pre_push_hook.sh) overrides these.
+UNIT_TEST_CMD="${PRE_PUSH_UNIT_CMD:-uv run pytest tests/unit/ -q --no-header}"
+SMOKE_CMD="${PRE_PUSH_SMOKE_CMD:-make smoke}"
+
+repo_root="$(git rev-parse --show-toplevel)"
+# Fail CLOSED: if we can't reach the repo root, we can't verify anything.
+cd "$repo_root" || { echo "[pre-push] cannot cd to repo root — push blocked." >&2; exit 1; }
+
+if [ -n "${PRE_PUSH_UNIT_CMD:-}${PRE_PUSH_SMOKE_CMD:-}" ]; then
+    # A seam leaked into a shell profile would neuter the gate on every
+    # future push — make it impossible to miss.
+    echo "[pre-push] NOTICE: test seams active — gate is NOT running the real suites."
 fi
 
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "ERROR: Unit tests failed. Cannot push."
+# ---- Layer 1: unit tests ----------------------------------------------------
+echo "[pre-push] running unit tests..."
+if ! $UNIT_TEST_CMD; then
+    echo "" >&2
+    echo "[pre-push] UNIT TESTS FAILED — push blocked." >&2
     exit 1
 fi
 
-echo "Tests passed."
+# ---- Layer 2: connector smoke gate -------------------------------------------
+connector_changed=0
+
+# stdin: <local_ref> <local_sha> <remote_ref> <remote_sha> per ref being pushed.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "$ZERO" ] && continue   # branch deletion — nothing to test
+
+    if [ "$remote_sha" = "$ZERO" ]; then
+        # New branch on the remote: diff against its merge-base with origin/main
+        # (fall back to the root commit if origin/main is unknown).
+        base="$(git merge-base origin/main "$local_sha" 2>/dev/null)"
+        if [ -z "$base" ]; then
+            base="$(git rev-list --max-parents=0 "$local_sha" | tail -1)"
+        fi
+        range="$base..$local_sha"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    if git diff --name-only "$range" 2>/dev/null | grep -qE "$CONNECTOR_RE"; then
+        connector_changed=1
+    fi
+done
+
+if [ "$connector_changed" -ne 1 ]; then
+    exit 0
+fi
+
+machine_has_mail() {
+    # Test seam: PRE_PUSH_ASSUME_MAIL=1/0 forces the answer.
+    case "${PRE_PUSH_ASSUME_MAIL:-auto}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    [ -d "/System/Applications/Mail.app" ] || [ -d "/Applications/Mail.app" ]
+}
+
+echo "[pre-push] connector AppleScript/IMAP code changed -> running smoke suite..."
+# Stream output live (the suite takes ~60s; silence invites Ctrl-C +
+# --no-verify) while keeping a copy for the passed-count parse. With
+# pipefail, $? is the smoke command's status, not tee's.
+smoke_log="$(mktemp)"
+$SMOKE_CMD 2>&1 | tee "$smoke_log"
+smoke_status=$?
+smoke_out="$(cat "$smoke_log")"
+rm -f "$smoke_log"
+
+if [ "$smoke_status" -ne 0 ]; then
+    echo "" >&2
+    echo "[pre-push] SMOKE SUITE FAILED — push blocked." >&2
+    echo "  The AppleScript/IMAP connector changed and a real round-trip failed." >&2
+    echo "  Debug with: make smoke" >&2
+    echo "  Override (NOT recommended) with: git push --no-verify" >&2
+    exit 1
+fi
+
+# pytest summary line: "7 passed in 24.00s" / "7 skipped in 0.11s" / mixes.
+passed_count="$(echo "$smoke_out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)"
+passed_count="${passed_count:-0}"
+
+if [ "$passed_count" -ge 1 ]; then
+    echo "[pre-push] smoke suite passed ($passed_count real round-trips)."
+    exit 0
+fi
+
+if [ "${SMOKE_SKIP_OK:-0}" = "1" ]; then
+    echo "[pre-push] NOTICE: smoke suite ran ZERO tests; allowed by SMOKE_SKIP_OK=1."
+    exit 0
+fi
+
+if machine_has_mail; then
+    echo "" >&2
+    echo "[pre-push] SMOKE SUITE RAN ZERO TESTS — push blocked." >&2
+    echo "  This machine has Mail.app, but every smoke test SKIPPED — the" >&2
+    echo "  gate verified nothing (check MAIL_SMOKE_ACCOUNT, Mail.app state," >&2
+    echo "  IMAP credentials). A vacuous pass here is the gate silently OFF." >&2
+    echo "  If this machine genuinely can't run smoke right now:" >&2
+    echo "    SMOKE_SKIP_OK=1 git push" >&2
+    exit 1
+fi
+
+echo "[pre-push] NOTICE: no Mail.app on this machine; smoke suite skipped (0 run)."
+exit 0
