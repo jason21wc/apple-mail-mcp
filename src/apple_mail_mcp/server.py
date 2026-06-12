@@ -19,6 +19,7 @@ from .exceptions import (
     MailDraftError,
     MailDraftInvalidIdError,
     MailDraftNotFoundError,
+    MailError,
     MailImapRequiredError,
     MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
@@ -2307,6 +2308,71 @@ def _resolve_draft_seed(
     return "new", None, False
 
 
+def _finalize_draft_update(
+    *,
+    store: DraftStateStore,
+    old_draft_id: str,
+    new_draft_id: str,
+    seed_kind: str,
+    seed_id: str | None,
+    reply_all: bool,
+    send_now: bool,
+) -> list[str]:
+    """Post-create cleanup for update_draft: delete the superseded draft,
+    move seed state to the new id, write the audit log.
+
+    create_draft success is the point of no return — everything here is
+    bookkeeping and degrades to WARNINGS (returned for the response's
+    ``details``), never an exception: an error response after the
+    irreversible mutation would hide the new draft_id from the caller
+    (retrying with the old id then fails, and the new draft is orphaned
+    without seed state).
+    """
+    warnings: list[str] = []
+    outcome = "message sent" if send_now else "replacement draft created"
+    try:
+        mail.delete_draft(old_draft_id)
+    except MailDraftNotFoundError:
+        # The original vanished concurrently — that's the goal state,
+        # not an error.
+        pass
+    except MailError as e:
+        warnings.append(
+            f"{outcome}, but the superseded draft {old_draft_id!r} could "
+            f"not be deleted and may linger in Drafts: {e}"
+        )
+    try:
+        # Old seed entry is dropped even when the mail-delete failed:
+        # the lingering draft is declared superseded, and keeping two
+        # entries for one logical draft leaks state once the user
+        # trashes it in Mail.app. (Cost: a later update_draft on the
+        # lingering copy falls back to the slow header scan.)
+        store.delete(old_draft_id)
+        _persist_draft_seed(
+            new_draft_id, seed_kind, seed_id, reply_all, send_now,
+        )
+    except Exception as e:
+        warnings.append(
+            f"{outcome}, but draft seed bookkeeping failed (reply/forward "
+            f"threading may degrade on the next update): {e}"
+        )
+    for w in warnings:
+        logger.warning(w)
+    try:
+        operation_logger.log_operation(
+            "update_draft",
+            {
+                "old_draft_id": old_draft_id,
+                "new_draft_id": new_draft_id,
+                "send_now": send_now,
+            },
+            "success",
+        )
+    except Exception:
+        logger.exception("update_draft audit logging failed")
+    return warnings
+
+
 def _resolve_draft_attachments(
     draft_id: str,
     attachment_paths: list[str] | None,
@@ -2836,16 +2902,14 @@ async def update_draft(
             if gate_err:
                 return gate_err
 
-        # Delete + recreate. Clear stale state first so a connector failure
-        # doesn't leave orphan entries.
-        try:
-            mail.delete_draft(draft_id)
-        except MailDraftNotFoundError:
-            return _draft_error_response(
-                MailDraftNotFoundError(f"no draft with id {draft_id!r}")
-            )
-        store.delete(draft_id)
-
+        # Recreate THEN delete. The replacement is created first so a
+        # connector failure (bad attachment path, AppleScript error,
+        # timeout) leaves the original draft and its seed state fully
+        # intact — Trash is effectively one-way for drafts, so the old
+        # delete-first ordering destroyed the user's draft on any
+        # recreate failure. The price is a brief two-drafts window (and
+        # a lingering superseded draft if the delete fails — recoverable
+        # clutter, reported via a warning detail).
         result = mail.create_draft(
             seed=seed_kind,
             seed_id=seed_id,
@@ -2861,24 +2925,26 @@ async def update_draft(
         )
         new_draft_id = result.get("draft_id", "")
 
-        _persist_draft_seed(
-            new_draft_id, seed_kind, seed_id, reply_all, send_now,
+        warnings = _finalize_draft_update(
+            store=store,
+            old_draft_id=draft_id,
+            new_draft_id=new_draft_id,
+            seed_kind=seed_kind,
+            seed_id=seed_id,
+            reply_all=reply_all,
+            send_now=send_now,
         )
-
-        operation_logger.log_operation(
-            "update_draft",
-            {
-                "old_draft_id": draft_id,
-                "new_draft_id": new_draft_id,
-                "send_now": send_now,
-            },
-            "success",
-        )
+        details: dict[str, Any] = {
+            "seed_kind": seed_kind,
+            "send_now": send_now,
+        }
+        if warnings:
+            details["warning"] = "; ".join(warnings)
         return {
             "success": True,
             "draft_id": new_draft_id,
             "sent_message_id": result.get("sent_message_id", ""),
-            "details": {"seed_kind": seed_kind, "send_now": send_now},
+            "details": details,
         }
 
     except Exception as e:

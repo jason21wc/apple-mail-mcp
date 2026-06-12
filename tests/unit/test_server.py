@@ -2861,6 +2861,163 @@ class TestUpdateDraftTool:
             lambda *a, **kw: None,
         )
 
+    _STATE = {
+        "draft_id": "160991",
+        "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "Quarterly report", "body": "old body",
+        "in_reply_to": "", "references": "",
+        "attachment_names": [],
+    }
+
+    @pytest.mark.asyncio
+    async def test_create_failure_preserves_old_draft(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """update is delete+recreate under the hood; a recreate failure
+        must NOT have deleted the original first — otherwise a bad
+        attachment path or AppleScript error destroys the user's draft
+        (Trash is effectively one-way for drafts). Create the
+        replacement FIRST; touch the original only after success."""
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+        from apple_mail_mcp.exceptions import MailDraftError
+        from apple_mail_mcp.server import update_draft
+
+        store = DraftStateStore()
+        store.set_seed(
+            "160991",
+            SeedRecord(seed_kind="reply", seed_id="160000", reply_all=False),
+        )
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.side_effect = MailDraftError("boom")
+
+        result = await update_draft(draft_id="160991", body="new body")
+
+        assert result["success"] is False
+        mock_mail.delete_draft.assert_not_called()
+        # Seed state for the surviving draft must remain on disk.
+        assert store.get_seed("160991") is not None
+
+    @pytest.mark.asyncio
+    async def test_old_delete_failure_after_create_still_succeeds(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """If the replacement was created but the superseded draft can't
+        be deleted, the update SUCCEEDED — the new draft exists and is
+        returned. A lingering superseded draft is recoverable clutter,
+        reported via a warning detail; failing the call would point the
+        user at the OLD id and orphan the new draft."""
+        from apple_mail_mcp.exceptions import MailDraftError
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+        mock_mail.delete_draft.side_effect = MailDraftError("locked")
+
+        result = await update_draft(draft_id="160991", body="new body")
+
+        assert result["success"] is True
+        assert result["draft_id"] == "161000"
+        assert "warning" in result.get("details", {})
+        assert "160991" in result["details"]["warning"]
+
+    @pytest.mark.asyncio
+    async def test_success_path_moves_seed_state_to_new_id(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """Bookkeeping half of the matrix: success removes the old seed
+        entry and persists one under the NEW id — even when the
+        mail-delete of the superseded draft failed (it's declared
+        superseded either way)."""
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+        from apple_mail_mcp.exceptions import MailDraftError
+        from apple_mail_mcp.server import update_draft
+
+        store = DraftStateStore()
+        store.set_seed(
+            "160991",
+            SeedRecord(seed_kind="reply", seed_id="160000", reply_all=True),
+        )
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+        mock_mail.delete_draft.side_effect = MailDraftError("locked")
+
+        result = await update_draft(draft_id="160991", body="x")
+
+        assert result["success"] is True
+        assert store.get_seed("160991") is None
+        new_seed = store.get_seed("161000")
+        assert new_seed is not None
+        assert new_seed.seed_kind == "reply"
+        assert new_seed.seed_id == "160000"
+
+    @pytest.mark.asyncio
+    async def test_bookkeeping_failure_after_create_still_returns_new_id(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+        monkeypatch: Any,
+    ) -> None:
+        """create_draft success is the point of no return: a seed-store
+        write failure afterwards must degrade to a warning, NOT an error
+        response — an error here would hide the new draft_id while the
+        old draft is already gone (the exact confusion the reorder
+        eliminates)."""
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+        monkeypatch.setattr(
+            "apple_mail_mcp.server._persist_draft_seed",
+            lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        result = await update_draft(draft_id="160991", body="x")
+
+        assert result["success"] is True
+        assert result["draft_id"] == "161000"
+        assert "bookkeeping" in result["details"]["warning"]
+
+    @pytest.mark.asyncio
+    async def test_old_draft_vanished_before_delete_is_clean_success(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """The original disappearing between state-read and delete
+        (e.g. removed in Mail.app concurrently) is the goal state, not
+        an error — clean success, no warning."""
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
+        mock_mail.delete_draft.side_effect = MailDraftNotFoundError("gone")
+
+        result = await update_draft(draft_id="160991", body="new body")
+
+        assert result["success"] is True
+        assert result["draft_id"] == "161000"
+        assert "warning" not in result.get("details", {})
+
     @pytest.mark.asyncio
     async def test_update_uses_disk_seed_state(
         self,
@@ -3705,9 +3862,13 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        """If the draft is somehow deleted between get_draft_state and
-        the orchestrator's own delete_draft call, return a typed error
-        rather than crash."""
+        """If the draft vanishes between get_draft_state and the
+        orchestrator's own delete_draft call, the update still succeeds
+        — the replacement exists and the original being gone IS the goal
+        state. (Contract flipped with the create-then-delete reorder:
+        this used to be a draft_not_found error because the delete ran
+        FIRST, where NotFound meant the caller's id was bad. The
+        bad-caller-id case is now caught by get_draft_state up front.)"""
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
         from apple_mail_mcp.server import update_draft
 
@@ -3716,9 +3877,13 @@ class TestDraftToolErrorPaths:
             "subject": "", "body": "", "in_reply_to": "",
             "references": "", "attachment_names": [],
         }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
         mock_mail.delete_draft.side_effect = MailDraftNotFoundError("gone")
         result = await update_draft(draft_id="160991", body="x")
-        assert result["error_type"] == "draft_not_found"
+        assert result["success"] is True
+        assert result["draft_id"] == "161000"
 
     @pytest.mark.asyncio
     async def test_update_draft_template_success_renders(
