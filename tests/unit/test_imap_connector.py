@@ -1423,14 +1423,17 @@ class TestGetAttachments:
         assert result[0]["name"] == ""
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_legacy_name_param_without_disposition_is_not_an_attachment(
+    def test_legacy_name_param_without_disposition_is_an_attachment(
         self, mock_cls: MagicMock
     ) -> None:
         """A leaf with `name` in content-type params but no disposition
-        and not message/rfc822: matches the existing has_attachment
-        helper's behavior (which only triggers on disposition). Skipping
-        this case keeps both helpers consistent — if we want to broaden
-        attachment detection, we do it for both at once."""
+        IS an attachment. This flips the earlier contract ("not an
+        attachment") deliberately: the byte-fetch walker always counted
+        these (it's how name=-only PDFs were fetchable at all), so
+        excluding them here made get_attachments disagree with
+        get_attachment_content's indices. Broadened for both walkers at
+        once via the shared _is_attachment_part predicate — exactly the
+        path the old docstring prescribed."""
         bs = (_BS_PLAIN_TEXT, _BS_LEGACY_NAME_PARAM_ONLY, b"mixed")
         self._setup_client(mock_cls, bodystructure=bs)
 
@@ -1438,7 +1441,8 @@ class TestGetAttachments:
             "abc@x", mailbox="INBOX",
         )
 
-        assert result == []
+        assert [a["name"] for a in result] == ["old.zip"]
+        assert result[0]["mime_type"] == "application/zip"
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_unicode_filename_is_decoded(
@@ -3479,6 +3483,277 @@ _BODY_PART = (
     b"\r\n"
     b"This is the message body."
 )
+
+
+class TestAttachmentEnumerationParity:
+    """The BODYSTRUCTURE walker (get_attachments — the index the user
+    sees) and the stdlib email walker (get_attachment_content /
+    save_attachments — the index that selects the bytes) MUST agree on
+    what counts as an attachment. When they diverge, attachment_index
+    silently selects the WRONG part: enumeration shows [PDF] at index 0
+    while the fetcher counts [inline-image, PDF] and returns the image.
+    """
+
+    _PNG_BYTES = b"\x89PNG fake signature image"
+    _PDF_BYTES = b"%PDF-1.4 the real report"
+
+    def _message(self) -> bytes:
+        """Body + inline signature image (no filename, no disposition —
+        the ubiquitous corporate-signature pattern) + a real PDF
+        attachment."""
+        inline_img = (
+            b"Content-Type: image/png\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-ID: <sig1@example.com>\r\n"
+            b"\r\n"
+        ) + _b64(self._PNG_BYTES)
+        pdf = (
+            b'Content-Type: application/pdf; name="04 FS.pdf"\r\n'
+            b"Content-Transfer-Encoding: base64\r\n"
+            b'Content-Disposition: attachment; filename="04 FS.pdf"\r\n'
+            b"\r\n"
+        ) + _b64(self._PDF_BYTES)
+        return _multipart_message([_BODY_PART, inline_img, pdf])
+
+    # The same logical message as a real-shape BODYSTRUCTURE (children
+    # in a list at position 0, per captured iCloud structures).
+    _BS_SAME_MESSAGE = (
+        [
+            (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
+             b"7bit", 25, 1, None, None, None, None),
+            (b"image", b"png", (), b"<sig1@example.com>", None,
+             b"base64", 36, None, None, None, None),
+            (b"application", b"pdf", (b"NAME", b"04 FS.pdf"), None, None,
+             b"base64", 32, None,
+             (b"ATTACHMENT", (b"FILENAME", b"04 FS.pdf")), None, None),
+        ],
+        b"mixed", (b"BOUNDARY", b"BOUNDARY"), None, None, None,
+    )
+
+    def test_bodystructure_walker_excludes_inline_unnamed_image(self):
+        from apple_mail_mcp.imap_connector import (
+            _bodystructure_extract_attachments,
+        )
+        names = [
+            a["name"]
+            for a in _bodystructure_extract_attachments(self._BS_SAME_MESSAGE)
+        ]
+        assert names == ["04 FS.pdf"]
+
+    def test_email_walker_excludes_inline_unnamed_image(self):
+        import email
+
+        from apple_mail_mcp.imap_connector import _email_attachment_parts
+
+        msg = email.message_from_bytes(self._message())
+        names = [p.get_filename() or "" for p in _email_attachment_parts(msg)]
+        assert names == ["04 FS.pdf"]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_index_0_returns_the_pdf_not_the_signature_image(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """The wrong-bytes regression: enumeration shows the PDF at
+        index 0, so fetching index 0 must return the PDF — not the
+        inline signature image the old stdlib walker counted first."""
+        import base64
+
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = [42]
+        client.fetch.return_value = {42: {b"BODY[]": self._message()}}
+
+        result = ImapConnector(
+            "h", 993, "u@e.com", "pw"
+        ).get_attachment_content("msg@example.com", attachment_index=0)
+
+        assert result["name"] == "04 FS.pdf"
+        assert base64.b64decode(result["content"]) == self._PDF_BYTES
+
+    def test_walkers_agree_on_name_param_only_attachment(self):
+        """The legacy name=-param-only PDF (no disposition): both walkers
+        must include it. The stdlib side always did (it's how byte-fetch
+        worked for these); the BODYSTRUCTURE side now matches, closing
+        the enumeration gap where get_attachments returned [] for a
+        message whose attachment was perfectly fetchable."""
+        import email
+
+        from apple_mail_mcp.imap_connector import (
+            _bodystructure_extract_attachments,
+            _email_attachment_parts,
+        )
+
+        bs = (
+            [
+                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
+                 b"7bit", 25, 1, None, None, None, None),
+                (b"application", b"pdf", (b"NAME", b"report.pdf"),
+                 None, None, b"base64", 32, None, None, None, None),
+            ],
+            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
+        )
+        pdf_part = (
+            b'Content-Type: application/pdf; name="report.pdf"\r\n'
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"\r\n"
+        ) + _b64(b"%PDF-1.4 x")
+        msg = email.message_from_bytes(
+            _multipart_message([_BODY_PART, pdf_part])
+        )
+
+        bs_names = [
+            a["name"] for a in _bodystructure_extract_attachments(bs)
+        ]
+        email_names = [
+            p.get_filename() or "" for p in _email_attachment_parts(msg)
+        ]
+        assert bs_names == email_names == ["report.pdf"]
+
+    def test_rfc2231_filename_star_visible_to_both_walkers(self):
+        """RFC 2231 extended filename (filename*=utf-8''...) — used for
+        non-ASCII names — must be decoded by BOTH walkers. The stdlib
+        parser always decoded it; the BODYSTRUCTURE side matching only
+        the exact b"filename" key made these parts invisible to
+        enumeration while fetchable — the residual index-divergence."""
+        import email
+
+        from apple_mail_mcp.imap_connector import (
+            _bodystructure_extract_attachments,
+            _email_attachment_parts,
+        )
+
+        bs = (
+            [
+                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
+                 b"7bit", 25, 1, None, None, None, None),
+                (b"application", b"pdf", (), None, None, b"base64", 32,
+                 None,
+                 (b"inline", (b"FILENAME*", b"utf-8''r%C3%A9sum%C3%A9.pdf")),
+                 None, None),
+            ],
+            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
+        )
+        pdf_part = (
+            b"Content-Type: application/pdf\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"Content-Disposition: inline; "
+            b"filename*=utf-8''r%C3%A9sum%C3%A9.pdf\r\n"
+            b"\r\n"
+        ) + _b64(b"%PDF-1.4 x")
+        msg = email.message_from_bytes(
+            _multipart_message([_BODY_PART, pdf_part])
+        )
+
+        bs_names = [
+            a["name"] for a in _bodystructure_extract_attachments(bs)
+        ]
+        email_names = [
+            p.get_filename() or "" for p in _email_attachment_parts(msg)
+        ]
+        assert bs_names == email_names == ["résumé.pdf"]
+
+    def test_rfc2231_continuation_segments_reassemble(self):
+        """Long encoded filenames split across filename*0*/filename*1*
+        continuation segments reassemble into one decoded name."""
+        from apple_mail_mcp.imap_connector import (
+            _bodystructure_extract_attachments,
+        )
+
+        bs = (
+            [
+                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
+                 b"7bit", 25, 1, None, None, None, None),
+                (b"application", b"pdf", (), None, None, b"base64", 32,
+                 None,
+                 (b"attachment",
+                  (b"FILENAME*0*", b"utf-8''r%C3%A9s",
+                   b"FILENAME*1*", b"um%C3%A9.pdf")),
+                 None, None),
+            ],
+            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
+        )
+        names = [a["name"] for a in _bodystructure_extract_attachments(bs)]
+        assert names == ["résumé.pdf"]
+
+    def test_unknown_disposition_token_with_filename_is_attachment(self):
+        """RFC 2183 §2.8: an unrecognized disposition token carrying a
+        filename still names an attachment — and the stdlib side agrees
+        (it sees disposition "x-foo", filename present → included via
+        the filename rule)."""
+        from apple_mail_mcp.imap_connector import (
+            _bodystructure_extract_attachments,
+        )
+
+        bs = (
+            [
+                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
+                 b"7bit", 25, 1, None, None, None, None),
+                (b"application", b"pdf", (), None, None, b"base64", 32,
+                 None,
+                 (b"X-UNKNOWN", (b"FILENAME", b"a.pdf")),
+                 None, None),
+            ],
+            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
+        )
+        names = [a["name"] for a in _bodystructure_extract_attachments(bs)]
+        assert names == ["a.pdf"]
+
+    def test_email_walker_includes_inline_with_filename(self):
+        """Inline disposition WITH a filename is an attachment on the
+        stdlib side too (the BS side has long pinned this)."""
+        import email
+
+        from apple_mail_mcp.imap_connector import _email_attachment_parts
+
+        img = (
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b'Content-Disposition: inline; filename="image001.jpg"\r\n'
+            b"\r\n"
+        ) + _b64(b"\xff\xd8 jpeg")
+        msg = email.message_from_bytes(
+            _multipart_message([_BODY_PART, img])
+        )
+        names = [p.get_filename() or "" for p in _email_attachment_parts(msg)]
+        assert names == ["image001.jpg"]
+
+    def test_email_walker_does_not_descend_into_forwarded_message(self):
+        """A forwarded message (message/rfc822) is ONE attachment, like
+        the BODYSTRUCTURE leaf — its inner parts must not be enumerated
+        as additional attachments, or indices shift relative to
+        get_attachments."""
+        import email
+
+        from apple_mail_mcp.imap_connector import _email_attachment_parts
+
+        inner = (
+            b"From: fwd@example.com\r\n"
+            b"Subject: Inner\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/mixed; boundary="INNER"\r\n'
+            b"\r\n"
+            b"--INNER\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"inner body\r\n"
+            b"--INNER\r\n"
+            b'Content-Type: application/pdf; name="inner.pdf"\r\n'
+            b'Content-Disposition: attachment; filename="inner.pdf"\r\n'
+            b"\r\n"
+            b"%PDF-1.4 inner\r\n"
+            b"--INNER--\r\n"
+        )
+        fwd_part = (
+            b"Content-Type: message/rfc822\r\n"
+            b"Content-Disposition: attachment\r\n"
+            b"\r\n"
+        ) + inner
+        msg = email.message_from_bytes(
+            _multipart_message([_BODY_PART, fwd_part])
+        )
+        parts = _email_attachment_parts(msg)
+        assert len(parts) == 1
+        assert parts[0].get_content_type() == "message/rfc822"
 
 
 class TestGetAttachmentContent:

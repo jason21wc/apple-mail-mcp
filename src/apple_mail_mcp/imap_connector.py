@@ -35,6 +35,7 @@ from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from typing import Any, cast
+from urllib.parse import unquote_to_bytes
 
 from imapclient import IMAPClient
 from imapclient.exceptions import IMAPClientError, LoginError
@@ -427,17 +428,51 @@ def _format_sender(envelope: Envelope) -> str:
     return f"{name} <{email}>" if name else email
 
 
+def _is_attachment_part(
+    disposition: str | None,
+    filename: str | None,
+    maintype: str,
+    subtype: str,
+) -> bool:
+    """THE single definition of "this MIME part is an attachment".
+
+    Both attachment walkers — :func:`_bodystructure_extract_attachments`
+    (feeds ``get_attachments``, the index the user sees) and
+    :func:`_email_attachment_parts` (feeds ``get_attachment_content`` /
+    ``save_attachments``, the index that selects the bytes) — MUST call
+    this. When the two used separate inline-coded rules they drifted:
+    the stdlib side counted any non-text part, so a message with an
+    inline no-filename signature image enumerated as ``[PDF]`` but
+    fetched index 0 as the *image* — silently wrong attachment bytes.
+
+    A part is an attachment when any of:
+    - explicit ``attachment`` disposition;
+    - it carries a filename (disposition ``filename`` or legacy
+      Content-Type ``name=`` param — some mailers send binary parts
+      with no disposition at all);
+    - it is ``message/rfc822`` (forwarded email, conventionally an
+      attachment per RFC 2046 §5.2.1).
+
+    Deliberately NOT an attachment: a no-filename, no-disposition
+    non-text part (the inline-signature-image pattern). Such a part was
+    never visible in enumeration, so making it unfetchable-by-index
+    loses nothing and keeps the two index spaces identical.
+    """
+    if disposition == "attachment":
+        return True
+    if filename:
+        return True
+    return maintype == "message" and subtype == "rfc822"
+
+
 def _bodystructure_extract_attachments(
     structure: Any,
 ) -> list[dict[str, Any]]:
     """Walk a BODYSTRUCTURE tuple and emit attachment metadata.
 
-    A part counts as an attachment if any of:
-    - Its disposition is ``attachment``.
-    - Its disposition is ``inline`` AND it has a ``filename`` param.
-    - It's a ``message/rfc822`` part (forwarded email — conventionally
-      an attachment per RFC 2046 §5.2.1, and the case Mail.app's
-      AppleScript surface sometimes silently drops).
+    Inclusion is decided by :func:`_is_attachment_part` — the shared
+    predicate that keeps this enumeration aligned with the stdlib
+    byte-fetch walker (same indices by construction).
 
     Returns dicts with keys: ``name``, ``mime_type``, ``size``,
     ``downloaded``. ``downloaded`` is always False on the IMAP path —
@@ -448,16 +483,53 @@ def _bodystructure_extract_attachments(
     out: list[dict[str, Any]] = []
 
     def _filename_from_params(params: Any, key_name: bytes) -> str | None:
-        """Pull a value out of a flat (k, v, k, v, ...) param tuple."""
+        """Pull a value out of a flat (k, v, k, v, ...) param tuple.
+
+        Handles the plain form (``filename=``) and RFC 2231 extended
+        forms: ``filename*=charset'lang'pct-encoded`` and continuation
+        segments ``filename*0*=`` / ``filename*1=`` / ... (used for
+        non-ASCII and long names). The stdlib parser on the byte-fetch
+        side decodes these natively — missing them here re-opened the
+        enumeration/fetch index divergence for such messages.
+        """
         if not isinstance(params, tuple):
             return None
+        plain: str | None = None
+        segments: list[tuple[int, bool, bytes]] = []  # (seq, encoded, val)
         for i in range(0, len(params) - 1, 2):
-            k = params[i]
-            if isinstance(k, bytes) and k.lower() == key_name:
-                v = params[i + 1]
-                if isinstance(v, (bytes, bytearray)):
-                    return _decode(v)
-        return None
+            k, v = params[i], params[i + 1]
+            if not isinstance(k, bytes) or not isinstance(
+                v, (bytes, bytearray)
+            ):
+                continue
+            kl = k.lower()
+            if kl == key_name:
+                plain = _decode(v)
+            elif kl.startswith(key_name + b"*"):
+                suffix = kl[len(key_name):]  # b"*", b"*0*", b"*1", ...
+                encoded = suffix.endswith(b"*")
+                digits = suffix.strip(b"*")
+                seq = int(digits) if digits.isdigit() else 0
+                segments.append((seq, encoded, bytes(v)))
+        if not segments:
+            return plain
+        segments.sort(key=lambda t: t[0])
+        charset = "utf-8"
+        pieces: list[str] = []
+        for idx, (_seq, encoded, val) in enumerate(segments):
+            if encoded:
+                if idx == 0 and val.count(b"'") >= 2:
+                    cs, rest = val.split(b"'", 1)
+                    _lang, rest = rest.split(b"'", 1)
+                    charset = _decode(cs) or "utf-8"
+                    val = rest
+                pieces.append(
+                    unquote_to_bytes(val.decode("ascii", errors="replace"))
+                    .decode(charset, errors="replace")
+                )
+            else:
+                pieces.append(_decode(val))
+        return "".join(pieces) or plain
 
     def _walk(s: Any) -> None:
         if not isinstance(s, tuple) or not s:
@@ -496,31 +568,43 @@ def _bodystructure_extract_attachments(
         disp_kind: bytes | None = None
         disp_filename: str | None = None
         for elem in leaf:
-            if (
+            if not (
                 isinstance(elem, tuple)
                 and elem
                 and isinstance(elem[0], bytes)
-                and elem[0].lower() in (b"attachment", b"inline")
             ):
-                disp_kind = elem[0].lower()
-                disp_params = elem[1] if len(elem) > 1 else ()
+                continue
+            head = elem[0].lower()
+            disp_params = elem[1] if len(elem) > 1 else None
+            if head in (b"attachment", b"inline"):
+                disp_kind = head
                 disp_filename = _filename_from_params(disp_params, b"filename")
                 break
-
-        is_rfc822 = (
-            type_.lower() == b"message" and subtype.lower() == b"rfc822"
-        )
-        is_attachment = (
-            disp_kind == b"attachment"
-            or (disp_kind == b"inline" and disp_filename is not None)
-            or is_rfc822
-        )
-        if not is_attachment:
-            return
+            # Unknown disposition token (RFC 2183 §2.8) carrying params —
+            # discriminated from ct_params/extension elements by shape:
+            # a disposition tuple's second element is a params TUPLE,
+            # never bytes. Harvest its filename so a `X-Foo;
+            # filename="a.pdf"` part stays visible to enumeration (the
+            # stdlib walker sees it via get_filename()).
+            if isinstance(disp_params, tuple):
+                harvested = _filename_from_params(disp_params, b"filename")
+                if harvested is not None:
+                    disp_kind = head
+                    disp_filename = harvested
+                    break
 
         # Filename precedence: disposition's filename → content-type's
         # `name` param (legacy mailers) → empty string.
         name = disp_filename or _filename_from_params(ct_params, b"name") or ""
+
+        if not _is_attachment_part(
+            _decode(disp_kind) if disp_kind is not None else None,
+            name or None,
+            _decode(type_).lower(),
+            _decode(subtype).lower(),
+        ):
+            return
+
         mime_type = f"{_decode(type_)}/{_decode(subtype)}"
 
         out.append({
@@ -539,34 +623,38 @@ def _email_attachment_parts(
 ) -> list[_email.message.Message]:
     """Walk a stdlib-parsed message and return its attachment parts.
 
-    Mirrors :func:`_bodystructure_extract_attachments`' notion of an
-    "attachment", but operates on a fully-parsed ``email.message`` tree
-    rather than a BODYSTRUCTURE tuple. The stdlib parser handles MIME
-    quirks the tuple walker can miss — notably a binary part that omits
-    ``Content-Disposition`` and carries its filename only in the
-    ``Content-Type`` ``name=`` param (e.g. ``application/pdf`` from some
-    mailers), which is exactly the case where the BODYSTRUCTURE path
-    returned ``[]``.
+    Operates on a fully-parsed ``email.message`` tree rather than a
+    BODYSTRUCTURE tuple; inclusion is decided by the SAME
+    :func:`_is_attachment_part` predicate the BODYSTRUCTURE walker uses,
+    so ``attachment_index`` selects the same part the user saw in
+    ``get_attachments`` — by construction, not by parallel maintenance.
 
-    A leaf part counts as an attachment when any of:
-      - ``Content-Disposition`` is ``attachment``;
-      - it carries a filename (inline-with-filename or ``name=``);
-      - it is a non-text, non-multipart part (``application/*``,
-        ``image/*``, ``message/rfc822`` forwarded mail, ...).
-
-    Multipart containers and text/* body parts without a filename are
-    skipped. Ordering matches a depth-first walk, the same order
-    ``get_attachments`` enumerates, so ``attachment_index`` lines up.
+    Walk shape also mirrors the BODYSTRUCTURE walker: multipart
+    containers recurse, ``message/rfc822`` is ONE attachment leaf (its
+    inner parts are NOT enumerated — descending would shift indices
+    relative to the BODYSTRUCTURE view, which treats the forward as a
+    single leaf).
     """
     out: list[_email.message.Message] = []
-    for part in msg.walk():
-        maintype = part.get_content_maintype()
-        if maintype == "multipart":
-            continue
-        disp = part.get_content_disposition()
-        filename = part.get_filename()
-        if disp == "attachment" or filename is not None or maintype != "text":
+
+    def _walk(part: _email.message.Message) -> None:
+        if part.get_content_maintype() == "multipart":
+            payload = part.get_payload()
+            if isinstance(payload, list):
+                for sub in payload:
+                    if isinstance(sub, _email.message.Message):
+                        _walk(sub)
+            return
+        if _is_attachment_part(
+            part.get_content_disposition(),
+            part.get_filename(),
+            part.get_content_maintype(),
+            part.get_content_subtype(),
+        ):
             out.append(part)
+        # message/rfc822 (or anything else): leaf — never descend.
+
+    _walk(msg)
     return out
 
 
