@@ -437,6 +437,16 @@ class AppleMailConnector:
     minute. Class constant — no public knob; tune by subclassing if
     really needed. See issue #118."""
 
+    _IMAP_CONFIG_TTL_S: float = 300.0
+    """How long a resolved (host, port, email) account config stays cached.
+    Resolving spawns an osascript subprocess, which serializes behind any
+    in-flight Mail.app AppleScript — without this cache, every "pure IMAP"
+    call stalls when Mail.app is busy (observed: ~60s IMAP-path hangs
+    behind an orphaned cross-mailbox get_thread scan). 5 min bounds how
+    long an edit to account settings in Mail.app goes unseen; a stale
+    entry that no longer connects fails into the existing AppleScript
+    fallback (_IMAP_FALLBACK_EXCS) rather than erroring."""
+
     def __init__(
         self,
         timeout: int = 60,
@@ -466,6 +476,9 @@ class AppleMailConnector:
         # (the orchestrator goes straight to the AppleScript path without
         # paying the connect/login round trip).
         self._imap_failure_until: dict[str, float] = {}
+        # Per-account (resolved_at_monotonic, (host, port, email)) entries
+        # for _resolve_imap_config. See _IMAP_CONFIG_TTL_S.
+        self._imap_config_cache: dict[str, tuple[float, tuple[str, int, str]]] = {}
 
     def _imap_breaker_open(self, account: str) -> bool:
         """True if a recent IMAP failure on this account is still cooling
@@ -524,10 +537,14 @@ class AppleMailConnector:
             )
             return
 
-        # Non-benign failure: open the breaker.
+        # Non-benign failure: open the breaker, and evict any cached
+        # account config so the retry after breaker expiry re-resolves
+        # from Mail.app instead of reusing a possibly-stale host/login
+        # for the rest of the config TTL.
         self._imap_failure_until[account] = (
             time.monotonic() + self._IMAP_BREAKER_TTL_S
         )
+        self._imap_config_cache.pop(account, None)
 
         if account not in self._imap_failures:
             self._imap_failures.add(account)
@@ -1250,6 +1267,12 @@ class AppleMailConnector:
         Raises:
             MailAccountNotFoundError: If the account doesn't exist.
         """
+        cached = self._imap_config_cache.get(account)
+        if cached is not None:
+            resolved_at, config = cached
+            if time.monotonic() - resolved_at < self._IMAP_CONFIG_TTL_S:
+                return config
+
         account_clause = applescript_account_clause(account)
         tell_body = f'''
         tell application "Mail"
@@ -1274,11 +1297,13 @@ class AppleMailConnector:
         # as `missing value`. An empty host makes the later connect fail with
         # OSError, which IS in _IMAP_FALLBACK_EXCS → graceful AppleScript
         # fallback, rather than a KeyError that would escape the net.
-        return (
+        config = (
             cast(str, parsed.get("host") or ""),
             cast(int, parsed.get("port") or 0),
             email,
         )
+        self._imap_config_cache[account] = (time.monotonic(), config)
+        return config
 
     def _imap_search(
         self,

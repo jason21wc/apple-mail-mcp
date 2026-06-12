@@ -1006,6 +1006,80 @@ class TestAppleMailConnector:
         script = mock_run.call_args[0][0]
         assert f'set acctRef to account id "{uuid}"' in script
 
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_resolve_imap_config_caches_result_per_account(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Account config (host/port/login) is static between Mail.app
+        edits, but resolving it spawns an osascript subprocess — which
+        serializes behind any in-flight Mail.app AppleScript. Without a
+        cache, every \"pure IMAP\" call stalls when Mail.app is busy
+        (observed: ~60s IMAP-path hangs behind an orphaned get_thread
+        scan). Repeat calls within the TTL must not re-run AppleScript."""
+        mock_run.return_value = (
+            '{"host":"imap.mail.me.com","port":993,'
+            '"user_name":"u@e.com","email_addresses":["u@e.com"]}'
+        )
+        first = connector._resolve_imap_config("iCloud")
+        second = connector._resolve_imap_config("iCloud")
+        assert first == second == ("imap.mail.me.com", 993, "u@e.com")
+        assert mock_run.call_count == 1
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_resolve_imap_config_cache_is_per_account(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.side_effect = [
+            '{"host":"imap.mail.me.com","port":993,'
+            '"user_name":"a@e.com","email_addresses":["a@e.com"]}',
+            '{"host":"imap.gmail.com","port":993,'
+            '"user_name":"b@g.com","email_addresses":["b@g.com"]}',
+        ]
+        assert connector._resolve_imap_config("iCloud")[0] == "imap.mail.me.com"
+        assert connector._resolve_imap_config("Gmail")[0] == "imap.gmail.com"
+        assert connector._resolve_imap_config("iCloud")[0] == "imap.mail.me.com"
+        assert mock_run.call_count == 2
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_resolve_imap_config_cache_expires_after_ttl(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A user editing account settings in Mail.app must be picked up
+        within the TTL window; an expired entry re-resolves."""
+        mock_run.return_value = (
+            '{"host":"imap.mail.me.com","port":993,'
+            '"user_name":"u@e.com","email_addresses":["u@e.com"]}'
+        )
+        connector._resolve_imap_config("iCloud")
+        # Age the entry past the TTL.
+        cached_at, value = connector._imap_config_cache["iCloud"]
+        connector._imap_config_cache["iCloud"] = (
+            cached_at - connector._IMAP_CONFIG_TTL_S - 1,
+            value,
+        )
+        connector._resolve_imap_config("iCloud")
+        assert mock_run.call_count == 2
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_resolve_imap_config_does_not_cache_failures(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """An account-not-found (or any raise) must not poison the cache —
+        the next call retries against Mail.app."""
+        mock_run.side_effect = [
+            MailAccountNotFoundError('Can\'t get account "iCloud".'),
+            '{"host":"imap.mail.me.com","port":993,'
+            '"user_name":"u@e.com","email_addresses":["u@e.com"]}',
+        ]
+        with pytest.raises(MailAccountNotFoundError):
+            connector._resolve_imap_config("iCloud")
+        assert connector._resolve_imap_config("iCloud") == (
+            "imap.mail.me.com",
+            993,
+            "u@e.com",
+        )
+        assert mock_run.call_count == 2
+
     # --- _imap_failures state + _log_imap_fallback -----------------------
 
     def test_imap_failures_starts_empty(
@@ -1124,6 +1198,35 @@ class TestAppleMailConnector:
         assert deadline > before + connector._IMAP_BREAKER_TTL_S - 1
         assert deadline <= before + connector._IMAP_BREAKER_TTL_S + 1
         assert connector._imap_breaker_open("iCloud") is True
+
+    def test_non_benign_failure_evicts_cached_imap_config(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Breaker and config cache must compose: after the 30s breaker
+        expires, the retry should re-resolve config from Mail.app rather
+        than reuse a possibly-stale host/login for the rest of the 300s
+        config TTL (up to ~10 failure cycles with a misleading LoginError
+        warning otherwise)."""
+        connector._imap_config_cache["iCloud"] = (
+            time.monotonic(),
+            ("imap.stale-host.example", 993, "u@e.com"),
+        )
+        connector._log_imap_fallback("iCloud", LoginError("bad pw"))
+        assert "iCloud" not in connector._imap_config_cache
+
+    def test_benign_fallback_keeps_cached_imap_config(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """A permanent capability gap (no Keychain entry) says nothing
+        about config staleness — don't evict."""
+        connector._imap_config_cache["iCloud"] = (
+            time.monotonic(),
+            ("imap.mail.me.com", 993, "u@e.com"),
+        )
+        connector._log_imap_fallback(
+            "iCloud", MailKeychainEntryNotFoundError("missing")
+        )
+        assert "iCloud" in connector._imap_config_cache
 
     def test_breaker_does_not_open_for_keychain_miss(
         self, connector: AppleMailConnector
