@@ -74,6 +74,12 @@ that while still amortizing connect cost across realistic interactive
 bursts (a series of search → get_message → get_attachments calls within
 a couple minutes of each other reuses one connection)."""
 
+_FILTER_FETCH_CHUNK: int = 100
+"""FETCH batch size when a limited search needs post-FETCH filtering
+(has_attachment). Matches the project-wide bulk-operation cap of 100.
+Newest chunks are fetched first and the scan stops at `limit` matches,
+so this bounds the per-round-trip cost, not the total scan depth."""
+
 _FLAG_SEEN = b"\\Seen"
 _FLAG_FLAGGED = b"\\Flagged"
 
@@ -682,7 +688,16 @@ class ImapConnector:
             client.select_folder(mailbox, readonly=True)
 
             uids = client.search(criteria)
-            if limit is not None:
+            # `limit` bounds MATCHING results. With no post-filter, every
+            # candidate matches, so truncating the window up front is both
+            # correct and the cheapest possible FETCH. With has_attachment
+            # (only expressible by inspecting BODYSTRUCTURE after FETCH),
+            # pre-truncating would change limit's meaning to "whichever of
+            # the newest N happen to match" — silently dropping matches the
+            # AppleScript path (per-match limit) would return. There the
+            # walk below scans newest-first in bounded chunks instead.
+            post_filter = has_attachment is not None
+            if limit is not None and not post_filter:
                 uids = uids[-limit:]
 
             if not uids:
@@ -692,16 +707,51 @@ class ImapConnector:
             # BODYSTRUCTURE bundles into the same FETCH (no extra round-trip)
             # whether we need it for has_attachment filtering or for the
             # include_attachments output field — only fetch once.
-            need_bodystructure = (
-                has_attachment is not None or include_attachments
-            )
+            need_bodystructure = post_filter or include_attachments
             if need_bodystructure:
                 fetch_keys.append(b"BODYSTRUCTURE")
-            fetched = client.fetch(uids, fetch_keys)
 
-            results: list[dict[str, Any]] = []
-            for uid in uids:
-                entry = fetched[uid]
+            return self._collect_search_rows(
+                client,
+                uids,
+                fetch_keys,
+                has_attachment=has_attachment,
+                include_attachments=include_attachments,
+                limit=limit if post_filter else None,
+            )
+
+    def _collect_search_rows(
+        self,
+        client: Any,
+        uids: list[int],
+        fetch_keys: list[bytes],
+        *,
+        has_attachment: bool | None,
+        include_attachments: bool,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        """FETCH candidate UIDs and build result rows, newest first.
+
+        When ``limit`` is set (only passed for post-filtered searches),
+        candidates are fetched in chunks of ``_FILTER_FETCH_CHUNK`` from
+        the newest end and the walk stops as soon as ``limit`` rows match
+        — so a mailbox where the newest messages match never pays for
+        fetching the old ones. Results are returned oldest-first to match
+        every other search path. ``limit=None`` degenerates to a single
+        FETCH of all candidates (the pre-existing fast path).
+        """
+        chunk_size = _FILTER_FETCH_CHUNK if limit is not None else len(uids)
+        newest_first: list[dict[str, Any]] = []
+        for end in range(len(uids), 0, -chunk_size):
+            chunk = uids[max(0, end - chunk_size) : end]
+            fetched = client.fetch(chunk, fetch_keys)
+            for uid in reversed(chunk):
+                # A message expunged by another session between SEARCH and
+                # FETCH is silently absent from the response (RFC 3501) —
+                # a vanished message is not a match, not an error.
+                entry = fetched.get(uid)
+                if entry is None:
+                    continue
                 if has_attachment is not None:
                     has = _bodystructure_has_attachment(
                         entry.get(b"BODYSTRUCTURE")
@@ -717,8 +767,10 @@ class ImapConnector:
                     row["attachments"] = _bodystructure_extract_attachments(
                         entry.get(b"BODYSTRUCTURE")
                     )
-                results.append(row)
-            return results
+                newest_first.append(row)
+                if limit is not None and len(newest_first) >= limit:
+                    return list(reversed(newest_first))
+        return list(reversed(newest_first))
 
     def get_message(
         self,
