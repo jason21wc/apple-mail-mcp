@@ -748,9 +748,11 @@ class ImapConnector:
             for uid in reversed(chunk):
                 # A message expunged by another session between SEARCH and
                 # FETCH is silently absent from the response (RFC 3501) —
-                # a vanished message is not a match, not an error.
+                # a vanished message is not a match, not an error. The
+                # ENVELOPE guard also covers servers returning a partial
+                # entry for a mid-search-mutated message (upstream #314).
                 entry = fetched.get(uid)
-                if entry is None:
+                if entry is None or b"ENVELOPE" not in entry:
                     continue
                 if has_attachment is not None:
                     has = _bodystructure_has_attachment(
