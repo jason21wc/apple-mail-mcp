@@ -598,6 +598,135 @@ class TestHasAttachment:
         assert len(_bodystructure_extract_attachments(structure)) == 1
 
 
+class TestHeaderDecoding:
+    """Charset discipline at the IMAP boundary. Three real failure modes,
+    one cause: ENVELOPE bytes were decoded as plain utf-8 (RFC 2047
+    encoded words passed through raw — observed on 9 of 30 real INBOX
+    messages), SEARCH got no charset (non-ASCII input crashed with
+    UnicodeEncodeError), and a bogus MIME charset name raised LookupError
+    before errors="replace" could apply."""
+
+    def test_b_encoded_subject_is_decoded(self):
+        from apple_mail_mcp.imap_connector import _envelope_to_dict
+        env = _fake_envelope(
+            subject=b"=?UTF-8?B?8J+RgA==?= Devs love and hate Fable 5"
+        )
+        row = _envelope_to_dict(env, ())
+        assert row["subject"] == "\U0001f440 Devs love and hate Fable 5"
+
+    def test_q_encoded_sender_name_is_decoded(self):
+        from apple_mail_mcp.imap_connector import _envelope_to_dict
+        env = _fake_envelope(
+            sender_name=b"=?UTF-8?Q?Superhuman_=E2=80=93_Zain_Kahn?=",
+            sender_mailbox=b"superhuman",
+            sender_host=b"example.com",
+        )
+        row = _envelope_to_dict(env, ())
+        assert row["sender"] == (
+            "Superhuman – Zain Kahn <superhuman@example.com>"
+        )
+
+    def test_multifragment_encoded_subject_joins(self):
+        from apple_mail_mcp.imap_connector import _decode_header
+        s = (
+            "=?UTF-8?B?RG9u4oCZdCBmb3JnZXQgdGhpcyBpbXBvcnRhbnQgYWNjb3VudCBk?="
+            " =?UTF-8?B?ZXRhaWw=?="
+        )
+        assert _decode_header(s) == (
+            "Don’t forget this important account detail"
+        )
+
+    def test_unknown_charset_in_encoded_word_does_not_raise(self):
+        from apple_mail_mcp.imap_connector import _decode_header
+        out = _decode_header("=?x-bogus-charset?B?aGVsbG8=?=")
+        assert isinstance(out, str)
+        assert "hello" in out  # bytes fall back to utf-8/replace
+
+    def test_plain_header_passes_through(self):
+        from apple_mail_mcp.imap_connector import _decode_header
+        assert _decode_header("Quarterly report") == "Quarterly report"
+        assert _decode_header(b"plain bytes") == "plain bytes"
+        assert _decode_header(None) == ""
+
+    def test_malformed_base64_encoded_word_does_not_raise(self):
+        """A truncated base64 encoded-word makes stdlib decode_header
+        raise HeaderParseError — a sender-controlled crash that would
+        escape the IMAP fallback net. Pass the header through verbatim
+        instead (the pre-cluster behavior for these bytes)."""
+        from apple_mail_mcp.imap_connector import _decode_header
+        out = _decode_header("=?utf-8?B?a?=")
+        assert isinstance(out, str)
+        assert out == "=?utf-8?B?a?="
+
+    def test_space_between_plain_and_encoded_fragment_is_kept(self):
+        """Pins a subtle stdlib behavior: the separating space stays
+        attached to the unencoded fragment, so a plain "".join is
+        correct. Guards against CPython decode_header changes."""
+        from apple_mail_mcp.imap_connector import _decode_header
+        assert _decode_header("Hello =?utf-8?B?d29ybGQ=?=") == "Hello world"
+
+    def test_safe_charset_decode_empty_charset_falls_back(self):
+        from apple_mail_mcp.imap_connector import _safe_charset_decode
+        assert _safe_charset_decode(b"x", "") == "x"
+        assert _safe_charset_decode(b"x", None) == "x"
+
+    def test_unknown_part_charset_falls_back_not_lookup_error(self):
+        import email as em
+
+        from apple_mail_mcp.imap_connector import _decode_part
+        raw = (
+            b'Content-Type: text/plain; charset="x-no-such-charset"\r\n'
+            b"\r\n"
+            b"body bytes"
+        )
+        part = em.message_from_bytes(raw)
+        assert _decode_part(part) == "body bytes"
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_non_ascii_search_passes_utf8_charset(self, mock_cls):
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.search.return_value = []
+        ImapConnector("h", 993, "u@e.com", "pw").search_messages(
+            subject_contains="café"
+        )
+        assert mock_client.search.call_args.kwargs.get("charset") == "UTF-8"
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_ascii_search_passes_no_charset(self, mock_cls):
+        """ASCII-only criteria keep today's wire format — maximally
+        compatible with servers lacking SEARCH CHARSET support."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.search.return_value = []
+        ImapConnector("h", 993, "u@e.com", "pw").search_messages(
+            subject_contains="invoice"
+        )
+        assert mock_client.search.call_args.kwargs.get("charset") is None
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_attachment_text_with_bogus_charset_does_not_raise(
+        self, mock_cls
+    ):
+        part = (
+            b'Content-Type: text/plain; charset="x-not-real"; '
+            b'name="notes.txt"\r\n'
+            b'Content-Disposition: attachment; filename="notes.txt"\r\n'
+            b"\r\n"
+            b"attachment text"
+        )
+        client = MagicMock()
+        mock_cls.return_value = client
+        client.search.return_value = [42]
+        client.fetch.return_value = {
+            42: {b"BODY[]": _multipart_message([_BODY_PART, part])}
+        }
+        result = ImapConnector(
+            "h", 993, "u@e.com", "pw"
+        ).get_attachment_content("m@x", attachment_index=0)
+        assert result["content"] == "attachment text"
+
+
 class TestEnvelopeTranslation:
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_strips_angle_brackets_from_message_id(self, mock_cls):
