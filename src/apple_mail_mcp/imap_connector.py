@@ -23,6 +23,8 @@ See ``docs/plans/2026-04-23-imap-connector-design.md``.
 from __future__ import annotations
 
 import email as _email
+import email.errors
+import email.header
 import email.policy as _email_policy
 import logging
 import re
@@ -341,6 +343,55 @@ def _decode(b: bytes | bytearray | str | None) -> str:
     return b.decode("utf-8", errors="replace")
 
 
+def _safe_charset_decode(raw: bytes, charset: str | None) -> str:
+    """Decode ``raw`` with ``charset``, never raising on a bad name.
+
+    THE chokepoint for "decode these bytes with a sender-supplied
+    charset". ``bytes.decode(charset, errors="replace")`` raises
+    LookupError BEFORE ``errors=`` applies when the charset name itself
+    is unknown ("x-mac-foo", "unknown-8bit", typos) — sender-controlled
+    input crashing the read path. Unknown names fall back to utf-8;
+    undecodable bytes are replaced, both directions covered.
+    """
+    try:
+        return raw.decode(charset or "utf-8", errors="replace")
+    except (LookupError, ValueError):
+        # LookupError: unknown name. ValueError: codecs.lookup rejects
+        # names with embedded NULs (reachable via a crafted charset=).
+        return raw.decode("utf-8", errors="replace")
+
+
+def _decode_header(value: bytes | bytearray | str | None) -> str:
+    """Decode an RFC 2047 header (subject, display name) to readable text.
+
+    ENVELOPE fields arrive as raw header bytes — an encoded-word subject
+    like ``=?UTF-8?B?...?=`` is pure ASCII, so a plain utf-8 decode
+    passes the gibberish through verbatim (observed on 9 of 30 real
+    INBOX messages). Fragments with unknown charsets go through
+    :func:`_safe_charset_decode` instead of raising. The AppleScript
+    path returns Mail.app-decoded headers, so this also restores
+    cross-path parity.
+    """
+    s = _decode(value)
+    if "=?" not in s:
+        return s
+    try:
+        fragments = _email.header.decode_header(s)
+    except _email.errors.HeaderParseError:
+        # Malformed encoded-word (e.g. truncated base64): pass the header
+        # through verbatim. Raising here is a sender-controlled crash
+        # that would escape the IMAP→AppleScript fallback net — the same
+        # threat class as the LookupError this module defends against.
+        return s
+    parts: list[str] = []
+    for frag, charset in fragments:
+        if isinstance(frag, bytes):
+            parts.append(_safe_charset_decode(frag, charset))
+        else:
+            parts.append(frag)
+    return "".join(parts)
+
+
 def _strip_brackets(s: str) -> str:
     if s.startswith("<") and s.endswith(">"):
         return s[1:-1]
@@ -373,11 +424,10 @@ def _extract_body_content(raw_rfc822: bytes) -> str:
 
 def _decode_part(part: _email.message.Message) -> str:
     """Decode a single MIME part's payload to a string."""
-    charset = part.get_content_charset() or "utf-8"
     raw = part.get_payload(decode=True)
     if not isinstance(raw, bytes):
         return str(raw) if raw is not None else ""
-    return raw.decode(charset, errors="replace")
+    return _safe_charset_decode(raw, part.get_content_charset())
 
 
 def _flatten_thread_clusters(tree: Any) -> Iterator[set[int]]:
@@ -421,7 +471,7 @@ def _format_sender(envelope: Envelope) -> str:
     if not from_:
         return ""
     first = from_[0]
-    name = _decode(first.name)
+    name = _decode_header(first.name)
     mailbox = _decode(first.mailbox)
     host = _decode(first.host)
     email = f"{mailbox}@{host}" if mailbox and host else mailbox or ""
@@ -689,7 +739,7 @@ def _envelope_to_dict(
     return {
         "id": rfc_id,
         "rfc_message_id": rfc_id,
-        "subject": _decode(envelope.subject),
+        "subject": _decode_header(envelope.subject),
         "sender": _format_sender(envelope),
         "date_received": date_str,
         "read_status": _FLAG_SEEN in flags,
@@ -775,7 +825,19 @@ class ImapConnector:
         with self._session() as client:
             client.select_folder(mailbox, readonly=True)
 
-            uids = client.search(criteria)
+            # IMAP SEARCH is US-ASCII unless a CHARSET is declared;
+            # non-ASCII filter text (subject_contains="café") otherwise
+            # dies in imapclient with a raw UnicodeEncodeError. ASCII-only
+            # criteria keep today's wire format — maximally compatible
+            # with servers lacking SEARCH CHARSET support; a server that
+            # rejects UTF-8 fails into the AppleScript fallback.
+            needs_utf8 = any(
+                isinstance(c, str) and not c.isascii() for c in criteria
+            )
+            if needs_utf8:
+                uids = client.search(criteria, charset="UTF-8")
+            else:
+                uids = client.search(criteria)
             # `limit` bounds MATCHING results. With no post-filter, every
             # candidate matches, so truncating the window up front is both
             # correct and the cheapest possible FETCH. With has_attachment
@@ -1041,8 +1103,7 @@ class ImapConnector:
         )
 
         if part.get_content_maintype() == "text":
-            charset = part.get_content_charset() or "utf-8"
-            content = raw.decode(charset, errors="replace")
+            content = _safe_charset_decode(raw, part.get_content_charset())
             is_binary = False
         else:
             content = base64.b64encode(raw).decode("ascii")
