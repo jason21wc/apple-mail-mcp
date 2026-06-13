@@ -727,6 +727,171 @@ class TestHeaderDecoding:
         assert result["content"] == "attachment text"
 
 
+class TestExtractBodyContent:
+    """_extract_body_content must return the MESSAGE body, not the
+    "best HTML anywhere in the MIME tree". The old walk() descended
+    into attachments and forwarded messages preferring text/html, so an
+    attached .html file or a forward's HTML body REPLACED the real
+    body in get_message output."""
+
+    @staticmethod
+    def _extract(raw: bytes) -> str:
+        from apple_mail_mcp.imap_connector import _extract_body_content
+        return _extract_body_content(raw)
+
+    def test_attached_html_file_is_not_the_body(self):
+        """Plain body + attached .html file: the body is the plain
+        text, not the attachment's HTML."""
+        html_attachment = (
+            b'Content-Type: text/html; name="report.html"\r\n'
+            b'Content-Disposition: attachment; filename="report.html"\r\n'
+            b"\r\n"
+            b"<html>ATTACHED FILE, NOT THE BODY</html>"
+        )
+        raw = _multipart_message([_BODY_PART, html_attachment])
+        body = self._extract(raw)
+        assert "This is the message body." in body
+        assert "ATTACHED FILE" not in body
+
+    def test_forwarded_email_html_is_not_the_body(self):
+        """Plain body + forwarded message (message/rfc822) whose own
+        body is HTML: the outer plain body wins; the walker must not
+        descend into the forward."""
+        inner = (
+            b"From: fwd@example.com\r\n"
+            b"Subject: Inner\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"\r\n"
+            b"<html>FORWARDED BODY</html>\r\n"
+        )
+        fwd_part = (
+            b"Content-Type: message/rfc822\r\n"
+            b"Content-Disposition: attachment\r\n"
+            b"\r\n"
+        ) + inner
+        raw = _multipart_message([_BODY_PART, fwd_part])
+        body = self._extract(raw)
+        assert "This is the message body." in body
+        assert "FORWARDED BODY" not in body
+
+    def test_multipart_alternative_still_prefers_html(self):
+        """Pins the existing contract: alternative bodies prefer the
+        HTML rendition (matches AppleScript content-of-msg)."""
+        raw = (
+            b"From: a@example.com\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/alternative; boundary="ALT"\r\n'
+            b"\r\n"
+            b"--ALT\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"plain version\r\n"
+            b"--ALT\r\n"
+            b"Content-Type: text/html\r\n"
+            b"\r\n"
+            b"<html>html version</html>\r\n"
+            b"--ALT--\r\n"
+        )
+        body = self._extract(raw)
+        assert "html version" in body
+        assert "plain version" not in body
+
+    def test_non_multipart_plain_unchanged(self):
+        raw = (
+            b"From: a@example.com\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n"
+            b"just a simple body"
+        )
+        assert self._extract(raw) == "just a simple body"
+
+    def test_attachment_only_message_returns_empty(self):
+        pdf = (
+            b'Content-Type: application/pdf; name="x.pdf"\r\n'
+            b'Content-Disposition: attachment; filename="x.pdf"\r\n'
+            b"\r\n"
+            b"%PDF-1.4"
+        )
+        raw = _multipart_message([pdf])
+        assert self._extract(raw) == ""
+
+    def test_malformed_message_does_not_raise(self):
+        """Sender-controlled bytes must not crash the read path (the
+        PR #29 discipline). Garbage parses to SOMETHING via the email
+        package; the contract here is no exception, str out."""
+        out = self._extract(b"\x00\xff garbage not an email \xfe")
+        assert isinstance(out, str)
+
+    def test_get_body_exception_yields_empty_not_crash(self):
+        """Exercises the actual except branch: stdlib get_body has a
+        history of AttributeError/ValueError escapes on crafted
+        Content-Type values — sender-controlled, must yield ""."""
+        from email.message import EmailMessage
+
+        with patch.object(
+            EmailMessage, "get_body", side_effect=ValueError("crafted")
+        ):
+            raw = _multipart_message([_BODY_PART])
+            assert self._extract(raw) == ""
+
+    def test_mixed_alternative_plus_attachment_returns_html_body(self):
+        """The canonical business email: mixed[alternative[plain, html],
+        pdf attachment] → the alternative's html rendition, never the
+        attachment."""
+        raw = (
+            b"From: a@example.com\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/mixed; boundary="MIX"\r\n'
+            b"\r\n"
+            b"--MIX\r\n"
+            b'Content-Type: multipart/alternative; boundary="ALT"\r\n'
+            b"\r\n"
+            b"--ALT\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"plain version\r\n"
+            b"--ALT\r\n"
+            b"Content-Type: text/html\r\n"
+            b"\r\n"
+            b"<html>real body</html>\r\n"
+            b"--ALT--\r\n"
+            b"--MIX\r\n"
+            b'Content-Type: application/pdf; name="r.pdf"\r\n'
+            b'Content-Disposition: attachment; filename="r.pdf"\r\n'
+            b"\r\n"
+            b"%PDF-1.4\r\n"
+            b"--MIX--\r\n"
+        )
+        body = self._extract(raw)
+        assert "real body" in body
+        assert "%PDF" not in body
+
+    def test_related_html_root_with_inline_image_returns_html(self):
+        """multipart/related (html + inline images): the html root is
+        the body. Pins the stdlib's related-descend branch, which our
+        ("html","plain") preferencelist relies on."""
+        raw = (
+            b"From: a@example.com\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/related; boundary="REL"\r\n'
+            b"\r\n"
+            b"--REL\r\n"
+            b"Content-Type: text/html\r\n"
+            b"\r\n"
+            b'<html><img src="cid:i1">body with image</html>\r\n'
+            b"--REL\r\n"
+            b"Content-Type: image/png\r\n"
+            b"Content-ID: <i1>\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b"\r\n"
+            b"iVBORw0=\r\n"
+            b"--REL--\r\n"
+        )
+        body = self._extract(raw)
+        assert "body with image" in body
+
+
 class TestEnvelopeTranslation:
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_strips_angle_brackets_from_message_id(self, mock_cls):
