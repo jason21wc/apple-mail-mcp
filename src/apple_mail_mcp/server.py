@@ -761,10 +761,13 @@ def search_messages(
         date_from: Inclusive lower bound on date received. ISO 8601 YYYY-MM-DD.
         date_to: Inclusive upper bound on date received (full day included). ISO 8601 YYYY-MM-DD.
         has_attachment: Filter messages with (true) or without (false) attachments.
-        limit: Maximum results to return (default: 50).
+        limit: Maximum results to return (default: 50, max: 100). Values
+            above 100 are rejected (validation_error) rather than silently
+            truncated — narrow the query or page instead.
         source: Optional list of message ids (with optional ``"SELECTED"``
             sentinel) to restrict the search to. ``None`` (default)
-            searches the account/mailbox normally.
+            searches the account/mailbox normally. Capped at 100 ids per
+            call (validation_error above that).
         include_attachments: When True, each row includes an ``attachments``
             field listing per-attachment metadata (name, mime_type, size,
             downloaded). Default False — opt-in because the AppleScript
@@ -800,7 +803,26 @@ def search_messages(
     try:
         warnings: list[str] = []
 
+        # Bulk cap (P2): bound both fetch vectors at 100 — `limit` (account
+        # path) and len(source) (source path). Reject rather than silently
+        # clamp; silent truncation is the bug class PR #24 fixed.
+        if limit > 100:
+            return {
+                "success": False,
+                "error": f"limit must be 100 or fewer (got {limit})",
+                "error_type": "validation_error",
+            }
+
         if source is not None:
+            if len(source) > 100:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Cannot search {len(source)} source ids at once "
+                        "(max: 100)"
+                    ),
+                    "error_type": "validation_error",
+                }
             # body/text filters need bodies on the resolved messages so the
             # post-filter can match content. Force include_content=True for
             # the per-id fetch when these filters are set.
@@ -974,7 +996,8 @@ def get_messages(
             Mixed lists like ``["SELECTED", "12345"]`` are valid. Empty
             list is a no-op (returns empty result, no error). Missing ids
             drop out silently (partial-results convention) — the response
-            contains whatever was found.
+            contains whatever was found. Capped at 100 ids per call
+            (validation_error above that); an empty list is a no-op.
         include_content: Include message bodies (default: True).
         headers_only: Skip body fetch on the IMAP path for explicit ids
             (default: False). Silently ignored on the AppleScript fallback.
@@ -1006,6 +1029,24 @@ def get_messages(
         )
         if rate_err:
             return rate_err
+
+        # Bulk cap (P2): same 100-item ceiling as delete_messages /
+        # update_message. Upper-bound only — an empty list stays a valid
+        # no-op (returns []), preserving the documented contract. The cap is
+        # on list cardinality, not resolved-message count: a single
+        # ``"SELECTED"`` token may expand to >100 messages by design —
+        # clamping post-expansion would silently drop user-selected messages
+        # (the truncation behavior PR #24 forbids), so it is intentionally
+        # not enforced here.
+        if len(message_ids) > 100:
+            return {
+                "success": False,
+                "error": (
+                    f"Cannot fetch {len(message_ids)} messages at once "
+                    "(max: 100)"
+                ),
+                "error_type": "validation_error",
+            }
 
         logger.info(f"Getting messages: {len(message_ids)} ids")
 
