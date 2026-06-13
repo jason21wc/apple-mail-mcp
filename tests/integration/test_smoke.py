@@ -20,6 +20,7 @@ Account: override with MAIL_SMOKE_ACCOUNT (default "iCloud").
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,153 @@ class TestAppleScriptSmoke:
         for p in written:
             assert p.resolve().is_relative_to(tmp_path.resolve())
             assert "/" not in p.name and ".." not in p.name
+
+
+# ---------------------------------------------------------------------------
+# Write tier — real-execution coverage for the AppleScript WRITE codegen,
+# the half of the connector the read tiers never touch. Same osascript bug
+# class lives here (a bad brace, a -10000 on `set flagged`, a recipient
+# block that silently no-ops, a `whose id is` write scan that finds
+# nothing). No IMAP credentials needed — drafts are pure AppleScript.
+#
+# SAFETY (human-in-the-loop): every test is fully self-contained. It only
+# touches a scratch draft it creates and then trashes — no sends
+# (send_now stays False), no deletes of real mail, no mutation of any
+# pre-existing message. Recipient is the reserved @example.invalid domain.
+# ---------------------------------------------------------------------------
+
+_SCRATCH_TO = "write-smoke@example.invalid"
+_SCRATCH_SUBJECT = "apple-mail-mcp write-path smoke (safe to delete)"
+_SCRATCH_BODY = "write-path smoke body — created and trashed by the test"
+
+
+def _make_scratch_draft(connector: AppleMailConnector) -> str:
+    """Create a scratch draft and return its id, skipping if Mail.app
+    is unreachable (keeps the write tier as resilient as the rest)."""
+    try:
+        result = connector.create_draft(
+            to=[_SCRATCH_TO],
+            subject=_SCRATCH_SUBJECT,
+            body=_SCRATCH_BODY,
+            send_now=False,
+        )
+    except Exception as e:  # noqa: BLE001 — Mail.app not reachable → skip
+        pytest.skip(f"create_draft (Mail.app) not reachable: {e}")
+    draft_id = result.get("draft_id", "")
+    if not draft_id:
+        pytest.skip("create_draft returned no draft_id")
+    return draft_id
+
+
+def _settle_whose(fn: Any) -> int:
+    """Run a `whose id is`-dependent write, tolerating the documented lag
+    where a freshly-created draft is not yet queryable by whose-clause
+    (see get_draft_state's docstring). Returns the first count >= 1, or
+    the last result after a bounded wait — never sleeps once it succeeds.
+
+    Wall-clock worst case is dominated by the retried op, not the sleeps:
+    up to 12 calls of ``fn`` (each a real osascript write) plus 11×0.5s.
+    On the happy path it returns after one call with no sleep.
+    """
+    last = 0
+    for _ in range(12):
+        last = fn()
+        if last >= 1:
+            return last
+        time.sleep(0.5)
+    return last
+
+
+def _settle_delete(connector: AppleMailConnector, draft_id: str) -> bool:
+    """Delete a freshly-created scratch draft, tolerating the same
+    whose-clause lag: delete_draft matches via `whose id is`, which can
+    briefly miss a just-created draft. Returns True once trashed; re-raises
+    MailDraftNotFoundError only after the lag window, where a persistent
+    miss is a genuine failure (the draft was never deletable)."""
+    from apple_mail_mcp.exceptions import MailDraftNotFoundError
+
+    last_exc: MailDraftNotFoundError | None = None
+    for _ in range(12):
+        try:
+            return connector.delete_draft(draft_id)
+        except MailDraftNotFoundError as e:
+            last_exc = e
+            time.sleep(0.5)
+    assert last_exc is not None
+    raise last_exc
+
+
+class TestWriteSmoke:
+    def test_create_get_delete_draft_roundtrip(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """create_draft's AppleScript actually WRITES the recipients,
+        subject, and body (the does-save-actually-write bug class, write
+        side); get_draft_state reads them back; delete_draft trashes it;
+        a second delete reports not-found. All pure AppleScript."""
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+
+        draft_id = _make_scratch_draft(connector)
+        deleted = False
+        try:
+            state = connector.get_draft_state(draft_id)
+            # Spec: create_draft persists exactly what it was given.
+            assert state["subject"] == _SCRATCH_SUBJECT
+            assert _SCRATCH_BODY in state["body"]  # signature may be appended
+            assert state["to"] == [_SCRATCH_TO]
+
+            # delete_draft matches via `whose id is`; tolerate the fresh-
+            # draft lag (same guard test 2 uses) so this never flakes red.
+            assert _settle_delete(connector, draft_id) is True
+            deleted = True
+
+            # Spec: deleting an already-trashed draft reports not-found.
+            # (Un-retried: not-found is the EXPECTED outcome here, and it
+            # also proves the delete above actually removed the draft.)
+            with pytest.raises(MailDraftNotFoundError):
+                connector.delete_draft(draft_id)
+        finally:
+            if not deleted:
+                try:
+                    _settle_delete(connector, draft_id)
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
+
+    def test_update_message_flag_write(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """update_message's AppleScript write codegen (_bulk_repeat_block
+        + _build_flag_actions + the `whose id is` write scan) runs against
+        a real message and reports it updated. A numeric id forces the
+        AppleScript path — the IMAP fast path is RFC-id-only (P0-3). Target
+        is a scratch draft so no pre-existing mail is touched.
+
+        count == 1 is a strong signal: `set flagged status` runs inside
+        the repeat block's `try`, and the counter increments only AFTER
+        it, so a -10000 on the property-set would yield 0. One direction
+        (set) exercises the codegen; clearing would only repeat the same
+        cross-scan, and cleanup trashes the draft regardless of flag
+        state. The set is wrapped to tolerate the documented whose-clause
+        lag on a freshly-created draft."""
+        draft_id = _make_scratch_draft(connector)
+        cleaned = False
+        try:
+            # Spec: update_message returns the count of messages updated.
+            n_set = _settle_whose(
+                lambda: connector.update_message([draft_id], flagged=True)
+            )
+            assert n_set == 1, "flag-set write found/updated no message"
+            # Verified cleanup: delete_draft returning True is itself an
+            # AppleScript claim worth asserting (self-policing the leak
+            # invariant), not just a best-effort finally.
+            assert _settle_delete(connector, draft_id) is True
+            cleaned = True
+        finally:
+            if not cleaned:
+                try:
+                    _settle_delete(connector, draft_id)
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
 
 
 # ---------------------------------------------------------------------------
