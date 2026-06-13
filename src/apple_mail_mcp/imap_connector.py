@@ -399,27 +399,40 @@ def _strip_brackets(s: str) -> str:
 
 
 def _extract_body_content(raw_rfc822: bytes) -> str:
-    """Parse a raw RFC 822 message and return decoded body text.
+    """Parse a raw RFC 822 message and return the decoded BODY text.
 
-    Uses ``get_payload(decode=True)`` which handles
-    content-transfer-encoding (quoted-printable, base64) automatically.
-    For multipart messages, prefers ``text/html`` over ``text/plain`` —
-    matching what AppleScript's ``content of msg`` returns from Mail.app.
+    Body selection uses ``EmailMessage.get_body(("html", "plain"))`` —
+    the stdlib's RFC-aware body finder. The previous ``msg.walk()``
+    scan preferred text/html from ANYWHERE in the MIME tree, so an
+    attached ``.html`` file or a forwarded message's HTML body silently
+    REPLACED the real body. ``get_body`` skips attachment-disposition
+    parts and does not descend into ``message/rfc822``. The
+    html-over-plain preference matches what AppleScript's ``content of
+    msg`` returns from Mail.app.
+
+    Never raises on sender-controlled bytes (the PR #29 discipline): a
+    message ``get_body`` can't make sense of yields ``""``.
     """
     msg = _email.message_from_bytes(raw_rfc822, policy=_email_policy.default)
 
     if not msg.is_multipart():
         return _decode_part(msg)
 
-    plain: str | None = None
-    for part in msg.walk():
-        ct = part.get_content_type()
-        if ct == "text/html":
-            return _decode_part(part)
-        if ct == "text/plain" and plain is None:
-            plain = _decode_part(part)
-
-    return plain or ""
+    try:
+        # policy=default guarantees an EmailMessage, which has get_body.
+        body_part = msg.get_body(preferencelist=("html", "plain"))
+    except Exception:  # noqa: BLE001 — malformed MIME must not crash reads
+        logger.debug("get_body failed on malformed message", exc_info=True)
+        return ""
+    if body_part is None:
+        # Distinguishable-from-bug trace: e.g. a forward-as-attachment
+        # with no cover text genuinely has no body.
+        logger.debug(
+            "get_body found no body part (content-type=%s)",
+            msg.get_content_type(),
+        )
+        return ""
+    return _decode_part(body_part)
 
 
 def _decode_part(part: _email.message.Message) -> str:
