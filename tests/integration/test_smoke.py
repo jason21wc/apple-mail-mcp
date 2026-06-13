@@ -201,6 +201,43 @@ def _make_scratch_draft(connector: AppleMailConnector) -> str:
     return draft_id
 
 
+def _locate_scratch_draft(
+    connector: AppleMailConnector, draft_id: str
+) -> tuple[str, str, str]:
+    """Return (account_name, mailbox_name, rfc_message_id) for a scratch
+    draft. A draft lands in the DEFAULT sending account's Drafts — NOT
+    necessarily the smoke account — so discover the location from the
+    draft itself rather than guess, which keeps the narrow-path write
+    test robust across machines. Read-only scan; the draft_id is our own
+    freshly-minted id (no injection surface)."""
+    script = f"""
+    tell application "Mail"
+        repeat with acc in accounts
+            try
+                repeat with mb in mailboxes of acc
+                    if name of mb contains "Drafts" then
+                        repeat with m in messages of mb
+                            if (id of m as text) is "{draft_id}" then
+                                return (name of acc) & "||" & (name of mb) ¬
+                                    & "||" & (message id of m as text)
+                            end if
+                        end repeat
+                    end if
+                end repeat
+            end try
+        end repeat
+        return "<<not found>>"
+    end tell
+    """
+    out = connector._run_applescript(script).strip()
+    if "||" not in out:
+        pytest.skip("could not locate freshly-created scratch draft")
+    acct, mbname, msgid = out.split("||")
+    if "@" not in msgid:
+        pytest.skip("scratch draft has no RFC Message-ID to write against")
+    return acct, mbname, msgid
+
+
 def _settle_whose(fn: Any) -> int:
     """Run a `whose id is`-dependent write, tolerating the documented lag
     where a freshly-created draft is not yet queryable by whose-clause
@@ -305,6 +342,51 @@ class TestWriteSmoke:
             assert _settle_delete(connector, draft_id) is True
             cleaned = True
         finally:
+            if not cleaned:
+                try:
+                    _settle_delete(connector, draft_id)
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
+
+    def test_update_message_rfc_id_flag_write(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Covers the RFC-id branch of _bulk_msg_lookup — the `whose
+        message id is` write codegen that was the P0-3 fix — and the
+        NARROW _bulk_repeat_block branch, the two highest-risk write
+        paths the numeric flag test doesn't reach.
+
+        Forces the AppleScript fallback by opening the IMAP circuit
+        breaker — the real production condition under which this branch
+        runs: an RFC-id write when IMAP is unavailable (the IMAP fast
+        path is RFC-id-only and otherwise handles these). Narrow-scoped
+        to the draft's own account/mailbox so it's a fast single-mailbox
+        `whose message id is` scan, not the no-hints cross-scan (which
+        line-scans every mailbox with no early-exit and times out)."""
+        draft_id = _make_scratch_draft(connector)
+        acct, mbname, msgid = _locate_scratch_draft(connector, draft_id)
+        breaker_was = connector._imap_failure_until.get(acct)
+        cleaned = False
+        try:
+            # Simulate IMAP-unavailable so update_message takes the
+            # AppleScript RFC-id branch, not the IMAP fast path.
+            connector._imap_failure_until[acct] = time.monotonic() + 300
+            n = _settle_whose(
+                lambda: connector.update_message(
+                    [msgid], flagged=True,
+                    account=acct, source_mailbox=mbname,
+                )
+            )
+            assert n == 1, "RFC-id `whose message id is` write found no message"
+            assert _settle_delete(connector, draft_id) is True
+            cleaned = True
+        finally:
+            # Restore breaker state so the IMAP tier (run after this) isn't
+            # left skipping IMAP for this account.
+            if breaker_was is None:
+                connector._imap_failure_until.pop(acct, None)
+            else:
+                connector._imap_failure_until[acct] = breaker_was
             if not cleaned:
                 try:
                     _settle_delete(connector, draft_id)
