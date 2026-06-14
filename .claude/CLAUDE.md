@@ -6,10 +6,10 @@
 >
 > **Fork modifications kept on top of upstream** — everything else converged INTO upstream and was dropped (get_attachment_content, nested-mailbox resolution, attachment path-traversal hardening, and the save_attachments IMAP fast path are all upstream now):
 > 1. `save_attachments` `output_filename` — save a single attachment under a caller-chosen, sanitized name (used by the hotel-report skill).
-> 2. `content_is_untrusted` / `security_notice` marking on `get_messages` + `get_attachment_content` (composes with upstream's #225 per-message `prompt_injection`).
+> 2. `content_is_untrusted` / `security_notice` marking on `get_messages` + `get_attachment_content`. Deliberately kept (not dropped for #225): upstream's #225 `prompt_injection` covers message *bodies*, not *attachment payloads* — and attachment payloads are this fork's primary threat surface (external-sender hotel PDFs). Convergence path: propose attachment-untrusted marking upstream, then drop ours.
 > 3. Fork infra: governance integration, the hotel-report extraction skill, and `tests/integration/test_fork_extensions_integration.py` — live coverage of the two mods above. Run: `MAIL_TEST_ACCOUNT=iCloud uv run pytest tests/integration/test_fork_extensions_integration.py --run-integration`. (The old heavyweight smoke suite + pre-push hook were intentionally NOT re-ported: they guarded fork *connector* changes, and the fork no longer modifies the connector — upstream owns and integration-tests it.)
 >
-> **Upstream sync:** `git fetch upstream && git log upstream/main --oneline -5`. Do not auto-merge.
+> **Upstream sync posture (changed after the v0.10.2 re-baseline):** the fork is now THIN and current, so sync **small and often** — `git fetch upstream && git rev-list --left-right --count main...upstream/main`, then a normal `git merge upstream/main` (the conflict surface is tiny while the fork stays thin). The old "pinned at v0.8.2, do not auto-merge" posture is retired: letting the fork drift 68 commits behind in the same hot files upstream churns is exactly what made the last sync a 109-conflict ordeal. Don't let it drift far again. Keep net-new fork work minimal and prefer contributing upstream.
 
 An MCP server bridging Claude and Apple Mail via AppleScript on macOS.
 
