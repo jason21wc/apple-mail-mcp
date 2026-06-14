@@ -7,7 +7,7 @@
 > **Fork modifications kept on top of upstream** — everything else converged INTO upstream and was dropped (get_attachment_content, nested-mailbox resolution, attachment path-traversal hardening, and the save_attachments IMAP fast path are all upstream now):
 > 1. `save_attachments` `output_filename` — save a single attachment under a caller-chosen, sanitized name (used by the hotel-report skill).
 > 2. `content_is_untrusted` / `security_notice` marking on `get_messages` + `get_attachment_content` (composes with upstream's #225 per-message `prompt_injection`).
-> 3. Fork infra: governance integration + the hotel-report extraction skill. (Re-port pending: the real-execution smoke suite + pre-push hook — upstream's integration tests cover the gap meanwhile.)
+> 3. Fork infra: governance integration, the hotel-report extraction skill, and `tests/integration/test_fork_extensions_integration.py` — live coverage of the two mods above. Run: `MAIL_TEST_ACCOUNT=iCloud uv run pytest tests/integration/test_fork_extensions_integration.py --run-integration`. (The old heavyweight smoke suite + pre-push hook were intentionally NOT re-ported: they guarded fork *connector* changes, and the fork no longer modifies the connector — upstream owns and integration-tests it.)
 >
 > **Upstream sync:** `git fetch upstream && git log upstream/main --oneline -5`. Do not auto-merge.
 
