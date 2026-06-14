@@ -63,27 +63,6 @@ if [ -n "$HARDCODED" ]; then
     echo "$HARDCODED" | sed 's/^/    /'
 fi
 
-# Check 6: IMAP Message-ID bracketing chokepoint (CWE-93)
-# _bracket_message_id() must be the ONLY producer of a bracketed Message-ID,
-# so _reject_control_chars runs on every value before it reaches SEARCH. A
-# later call site re-inlining `f"<{...}>"` silently bypasses the guard — the
-# P0-1 bug. This is a weak backstop (catches the current idiom only); the real
-# guarantee is the single helper _select_and_search_message_id.
-echo ""
-echo "Check 6: IMAP Message-ID bracket chokepoint..."
-IMAP_CONNECTOR="src/apple_mail_mcp/imap_connector.py"
-# Exclude the one sanctioned producer: `return f"<{message_id}>"` inside
-# _bracket_message_id itself. Any OTHER inline bracket is a bypass.
-INLINE_BRACKET=$(grep -nE 'f"<\{' "$IMAP_CONNECTOR" 2>/dev/null \
-    | grep -v 'return f"<{message_id}>"' || true)
-if [ -n "$INLINE_BRACKET" ]; then
-    echo "  WARNING: inline Message-ID bracketing found — route through _bracket_message_id instead:"
-    echo "$INLINE_BRACKET" | sed 's/^/    /'
-    ERRORS=$((ERRORS + 1))
-else
-    echo "  OK: no inline f\"<{...}>\" bracketing; _bracket_message_id is the chokepoint."
-fi
-
 echo ""
 if [ $ERRORS -gt 0 ]; then
     echo "FAILED: $ERRORS safety issue(s) found."

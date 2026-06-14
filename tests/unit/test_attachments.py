@@ -76,11 +76,7 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
-        # Each property is now read into a variable under its own try
-        # (resilient to Mail.app -10000 on e.g. MIME type), but the record
-        # key must still be |quoted|.
-        assert "|name|:attName" in script
-        assert "set attName to name of att" in script
+        assert "|name|:(name of att)" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_script_quotes_size_key(
@@ -94,30 +90,8 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("msg-1")
         script = mock_run.call_args[0][0]
-        assert "|size|:attSize" in script
-        assert "set attSize to (file size of att)" in script
-        # The bare (collision-prone) form must never appear.
-        assert ", size:" not in script
-
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_get_attachments_reads_each_property_defensively(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        """Regression: Mail.app raises -10000 on some attachment properties
-        (e.g. MIME type of certain PDFs). Each property read must be in its
-        own try with a safe default so one throw can't abort the whole
-        enumeration — which returned [] and silently broke save_attachments
-        (it depends on this enumeration for the filenames)."""
-        mock_run.return_value = "[]"
-        connector.get_attachments("msg-1")
-        script = mock_run.call_args[0][0]
-        # The error-prone MIME read is guarded with a default.
-        assert "set attMime to (MIME type of att)" in script
-        assert "on error" in script
-        # All four properties go through a variable (not inline in the record),
-        # so a single failing property can't drop the whole list.
-        for var in ("attName", "attMime", "attSize", "attDownloaded"):
-            assert var in script
+        assert "|size|:(file size of att)" in script
+        assert ", size:(file size of att)" not in script
 
 
 class TestSaveAttachments:
@@ -146,7 +120,8 @@ class TestSaveAttachments:
             attachment_indices=[0]
         )
 
-        assert result == 1
+        assert result["saved"] == 1
+        assert result["rejected"] == []
         call_args = mock_run.call_args_list[-1][0][0]
         assert str(tmp_path) in call_args
 
@@ -167,7 +142,90 @@ class TestSaveAttachments:
             save_directory=tmp_path
         )
 
-        assert result == 3
+        assert result["saved"] == 3
+        assert result["rejected"] == []
+
+    # --- Byte caps (#236) ---------------------------------------------------
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_per_attachment_cap_rejects_oversized(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """An attachment whose reported size exceeds the per-attachment cap is
+        rejected before any save runs (only the enumerate AppleScript fires)."""
+        connector = AppleMailConnector(timeout=30, max_attachment_bytes=10)
+        mock_run.side_effect = [
+            '[{"name":"huge.bin","mime_type":"application/octet-stream",'
+            '"size":100,"downloaded":true}]',
+        ]
+        result = connector.save_attachments("12345", tmp_path)
+        assert result["saved"] == 0
+        assert len(result["rejected"]) == 1
+        assert result["rejected"][0]["name"] == "huge.bin"
+        assert result["rejected"][0]["reason"] == "per_attachment_cap"
+        # No save script — enumerate only.
+        assert mock_run.call_count == 1
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_aggregate_cap_rejects_when_total_exceeded(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        connector = AppleMailConnector(
+            timeout=30, max_attachment_bytes=1000, max_total_attachment_bytes=150
+        )
+        mock_run.side_effect = [
+            '[{"name":"a.bin","mime_type":"application/octet-stream",'
+            '"size":100,"downloaded":true},'
+            '{"name":"b.bin","mime_type":"application/octet-stream",'
+            '"size":100,"downloaded":true}]',
+            "1",
+        ]
+        result = connector.save_attachments("12345", tmp_path)
+        assert result["saved"] == 1
+        assert [r["reason"] for r in result["rejected"]] == ["aggregate_cap"]
+        assert result["rejected"][0]["name"] == "b.bin"
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_fail_open_on_unknown_size(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """A reported size of 0 is treated as under-cap and saved (the
+        post-write net would still delete it if it turned out oversized)."""
+        connector = AppleMailConnector(timeout=30, max_attachment_bytes=10)
+        mock_run.side_effect = [
+            '[{"name":"unknown.bin","mime_type":"application/octet-stream",'
+            '"size":0,"downloaded":false}]',
+            "1",
+        ]
+        result = connector.save_attachments("12345", tmp_path)
+        assert result["saved"] == 1
+        assert result["rejected"] == []
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_postwrite_net_deletes_oversized_written_file(
+        self, mock_run: MagicMock, tmp_path: Path
+    ) -> None:
+        """Even if the reported size passed the pre-check, a written file that
+        exceeds the cap on disk is deleted and reported (covers Mail
+        under-reporting size for a not-yet-downloaded attachment)."""
+        connector = AppleMailConnector(timeout=30, max_attachment_bytes=10)
+        # Reported size 5 passes the pre-check...
+        mock_run.side_effect = [
+            '[{"name":"big.bin","mime_type":"application/octet-stream",'
+            '"size":5,"downloaded":false}]',
+            "1",
+        ]
+        # ...but the actual written file is 100 bytes (> 10-byte cap).
+        written = tmp_path / "big.bin"
+        written.write_bytes(b"x" * 100)
+
+        result = connector.save_attachments("12345", tmp_path)
+
+        assert result["saved"] == 0
+        assert not written.exists()  # post-write net deleted it
+        assert [r["reason"] for r in result["rejected"]] == [
+            "per_attachment_cap_postwrite"
+        ]
 
     def test_save_to_invalid_directory(self, connector: AppleMailConnector) -> None:
         """Test error when save directory is invalid."""
@@ -193,6 +251,31 @@ class TestSaveAttachments:
 
 class TestAttachmentSecurity:
     """Tests for attachment security features."""
+
+    def test_validates_file_type_restrictions(self) -> None:
+        """Test that dangerous file types are restricted."""
+        from apple_mail_mcp.security import validate_attachment_type
+
+        # Dangerous types should be rejected by default
+        assert validate_attachment_type("malware.exe") is False
+        assert validate_attachment_type("script.bat") is False
+        assert validate_attachment_type("script.sh") is False
+        assert validate_attachment_type("document.scr") is False
+
+        # Safe types should be allowed
+        assert validate_attachment_type("document.pdf") is True
+        assert validate_attachment_type("image.jpg") is True
+        assert validate_attachment_type("data.csv") is True
+
+    def test_validates_file_size(self) -> None:
+        """Test file size validation."""
+        from apple_mail_mcp.security import validate_attachment_size
+
+        # Within limit
+        assert validate_attachment_size(1024 * 1024, max_size=10 * 1024 * 1024) is True
+
+        # Exceeds limit
+        assert validate_attachment_size(30 * 1024 * 1024, max_size=25 * 1024 * 1024) is False
 
     def test_sanitizes_filename(self) -> None:
         """Test filename sanitization."""
@@ -276,7 +359,7 @@ class TestSaveAttachmentsPathTraversal:
         ]
         result = connector.save_attachments(message_id="123", save_directory=tmp_path)
 
-        assert result == 1
+        assert result["saved"] == 1
         save_script = mock_run.call_args_list[-1][0][0]
         # The vulnerable runtime path concatenation must be gone.
         assert "& attName" not in save_script
@@ -289,80 +372,150 @@ class TestSaveAttachmentsPathTraversal:
         assert ".." not in save_script
 
 
-class TestAttachmentRecordResilience:
-    """Every site that builds an attachment record must read each property in
-    its own try with a default, so Mail.app's -10000 on e.g. ``MIME type of``
-    a placeholder PDF can't abort the enumeration (returning [] / 'not found'
-    and silently breaking save/include_attachments — see #17). All sites share
-    ``_attachment_record_as`` so the defensive shape can't drift."""
+class TestGetAttachmentContent:
+    """#250: read a single attachment's bytes inline (no caller-facing disk)."""
 
     @pytest.fixture
     def connector(self) -> AppleMailConnector:
         return AppleMailConnector(timeout=30)
 
-    def _assert_defensive_record(self, script: str) -> None:
-        # The error-prone MIME read goes through a variable under its own try.
-        assert "set attMime to (MIME type of att)" in script
-        assert "on error" in script
-        # All four properties are read into variables (not inline in the
-        # record), so one failing property can't drop the whole list...
-        for var in ("attName", "attMime", "attSize", "attDownloaded"):
-            assert var in script
-        # ...and the record keys stay |quoted| (NSJSONSerialization drops bare
-        # keys like name:/size:).
-        for key in ("|name|:attName", "|mime_type|:attMime",
-                    "|size|:attSize", "|downloaded|:attDownloaded"):
-            assert key in script
-        # The old inline form (one throw aborts the loop) must be gone.
-        assert "(MIME type of att), |size|:(file size of att)" not in script
+    @staticmethod
+    def _raw_with_attachments(tmp_path: Path) -> bytes:
+        """Build a real RFC822 message with a text + a binary attachment."""
+        from apple_mail_mcp.draft_builder import build_draft_mime
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_search_messages_record_is_defensive(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        mock_run.return_value = "[]"
-        # Call the AppleScript path directly — search_messages() would try the
-        # IMAP fast path first (different codegen, no attachment record there).
-        connector._search_messages_applescript(
-            account="Gmail", include_attachments=True
+        txt = tmp_path / "notes.txt"
+        txt.write_text("hello from a text attachment\n")
+        binf = tmp_path / "blob.bin"
+        binf.write_bytes(b"\x00\x01\x02\xff\xfe")
+        _mid, raw = build_draft_mime(
+            sender="me@example.invalid",
+            to=["you@example.invalid"],
+            subject="with attachments",
+            body="see attached",
+            attachments=[txt, binf],
         )
-        self._assert_defensive_record(mock_run.call_args[0][0])
+        return raw
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_get_message_applescript_record_is_defensive(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        mock_run.return_value = "{}"
-        connector._get_message_applescript(
-            "12345", include_content=False, include_attachments=True
+    def _imap_patches(self, connector, mock_imap):
+        from unittest.mock import patch
+        return [
+            patch("apple_mail_mcp.mail_connector.ImapConnector",
+                  return_value=mock_imap),
+            patch.object(AppleMailConnector, "_get_imap_password_with_fallback",
+                         return_value="pw"),
+            patch.object(AppleMailConnector, "_resolve_imap_config",
+                         return_value=("h", 993, "me@example.invalid")),
+        ]
+
+    def test_imap_path_text_attachment(self, connector, tmp_path):
+        import contextlib
+        raw = self._raw_with_attachments(tmp_path)
+        mock_imap = MagicMock()
+        mock_imap.fetch_raw_message.return_value = raw
+        with contextlib.ExitStack() as stack:
+            for p in self._imap_patches(connector, mock_imap):
+                stack.enter_context(p)
+            result = connector.get_attachment_content(
+                "<m@x>", 0, account="iCloud", mailbox="INBOX"
+            )
+        assert result["name"] == "notes.txt"
+        assert result["mime_type"] == "text/plain"
+        assert result["payload"] == b"hello from a text attachment\n"
+        mock_imap.fetch_raw_message.assert_called_once_with("<m@x>", "INBOX")
+
+    def test_imap_path_binary_attachment(self, connector, tmp_path):
+        import contextlib
+        raw = self._raw_with_attachments(tmp_path)
+        mock_imap = MagicMock()
+        mock_imap.fetch_raw_message.return_value = raw
+        with contextlib.ExitStack() as stack:
+            for p in self._imap_patches(connector, mock_imap):
+                stack.enter_context(p)
+            result = connector.get_attachment_content(
+                "<m@x>", 1, account="iCloud", mailbox="INBOX"
+            )
+        assert result["name"] == "blob.bin"
+        assert result["payload"] == b"\x00\x01\x02\xff\xfe"
+
+    def test_imap_index_out_of_range_raises(self, connector, tmp_path):
+        import contextlib
+
+        from apple_mail_mcp.exceptions import MailAttachmentIndexError
+        raw = self._raw_with_attachments(tmp_path)
+        mock_imap = MagicMock()
+        mock_imap.fetch_raw_message.return_value = raw
+        with contextlib.ExitStack() as stack:
+            for p in self._imap_patches(connector, mock_imap):
+                stack.enter_context(p)
+            with pytest.raises(MailAttachmentIndexError):
+                connector.get_attachment_content(
+                    "<m@x>", 9, account="iCloud", mailbox="INBOX"
+                )
+
+    def test_imap_oversize_raises_before_returning(self, tmp_path):
+        import contextlib
+
+        from apple_mail_mcp.exceptions import MailAttachmentTooLargeError
+        connector = AppleMailConnector(timeout=30, max_inline_attachment_bytes=4)
+        raw = self._raw_with_attachments(tmp_path)
+        mock_imap = MagicMock()
+        mock_imap.fetch_raw_message.return_value = raw
+        with contextlib.ExitStack() as stack:
+            for p in self._imap_patches(connector, mock_imap):
+                stack.enter_context(p)
+            with pytest.raises(MailAttachmentTooLargeError):
+                connector.get_attachment_content(
+                    "<m@x>", 0, account="iCloud", mailbox="INBOX"
+                )
+
+    @patch.object(AppleMailConnector, "_get_attachments_applescript")
+    def test_applescript_path_reads_saved_bytes(
+        self, mock_meta, connector, monkeypatch
+    ):
+        mock_meta.return_value = [
+            {"name": "notes.txt", "mime_type": "text/plain",
+             "size": 12, "downloaded": True},
+        ]
+
+        def fake_save(message_id, one_based_index, dest_path):
+            assert one_based_index == 1
+            Path(dest_path).write_bytes(b"on-disk text")
+            return True
+
+        monkeypatch.setattr(
+            connector, "_save_one_attachment_applescript", fake_save
         )
-        self._assert_defensive_record(mock_run.call_args[0][0])
+        result = connector.get_attachment_content("12345", 0)
+        assert result["name"] == "notes.txt"
+        assert result["mime_type"] == "text/plain"
+        assert result["payload"] == b"on-disk text"
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_get_selected_messages_record_is_defensive(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        mock_run.return_value = "[]"
-        connector.get_selected_messages(
-            include_content=False, include_attachments=True
+    @patch.object(AppleMailConnector, "_get_attachments_applescript")
+    def test_applescript_oversize_rejected_without_save(
+        self, mock_meta, monkeypatch
+    ):
+        from apple_mail_mcp.exceptions import MailAttachmentTooLargeError
+        connector = AppleMailConnector(timeout=30, max_inline_attachment_bytes=10)
+        mock_meta.return_value = [
+            {"name": "big.bin", "mime_type": "application/octet-stream",
+             "size": 100, "downloaded": True},
+        ]
+        save_calls = []
+        monkeypatch.setattr(
+            connector, "_save_one_attachment_applescript",
+            lambda *a, **k: save_calls.append(1),
         )
-        self._assert_defensive_record(mock_run.call_args[0][0])
+        with pytest.raises(MailAttachmentTooLargeError):
+            connector.get_attachment_content("12345", 0)
+        assert save_calls == [], "must not save when over the inline cap"
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_get_attachment_content_bare_read_is_guarded(
-        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
-    ) -> None:
-        """The single-attachment (non-loop) read in the content path is also
-        guarded: ``MIME type``/``file size`` each get their own try so this
-        path doesn't -10000 on a placeholder either (name reads fine)."""
-        # Force the script-building failure path (no real Mail.app) and capture
-        # the script that was built.
-        mock_run.side_effect = MailMessageNotFoundError("not found")
-        with pytest.raises(MailMessageNotFoundError):
-            connector._get_attachment_content_applescript("12345", 0)
-        script = mock_run.call_args[0][0]
-        assert "set attMime to MIME type of att" in script
-        assert "set attSize to file size of att" in script
-        assert "on error" in script
-        # name stays an unguarded read (it never raises -10000).
-        assert "set attName to name of att" in script
+    @patch.object(AppleMailConnector, "_get_attachments_applescript")
+    def test_applescript_index_out_of_range_raises(self, mock_meta, connector):
+        from apple_mail_mcp.exceptions import MailAttachmentIndexError
+        mock_meta.return_value = [
+            {"name": "only.txt", "mime_type": "text/plain",
+             "size": 3, "downloaded": True},
+        ]
+        with pytest.raises(MailAttachmentIndexError):
+            connector.get_attachment_content("12345", 5)

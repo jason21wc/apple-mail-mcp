@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "apple-mail-mcp"
-version = "0.8.2"
+name = "apple-mail-fast-mcp"
+version = "0.10.2"
 description = "MCP server for Apple Mail integration"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,42 +26,44 @@ classifiers = [
 ]
 
 dependencies = [
-    "fastmcp>=3.2.4",
-    "imapclient>=3.0.0",
+    "fastmcp>=3.3.1",
+    "imapclient>=3.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
-    "pytest-asyncio>=0.24.0",
+    "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "radon>=6.0.0",
+    "hypothesis>=6.100.0",
+    "radon>=6.0.1",
     "pip-audit>=2.7.0",
-    "ruff>=0.15.12",
+    "ruff>=0.15.15",
     "mypy>=1.20.2",
 ]
 research = [
-    "imapclient>=3.0.0",
+    "imapclient>=3.1.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
-    "pytest-asyncio>=0.24.0",
+    "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "radon>=6.0.0",
+    "hypothesis>=6.100.0",
+    "radon>=6.0.1",
     "pip-audit>=2.7.0",
-    "ruff>=0.15.12",
+    "ruff>=0.15.15",
     "mypy>=1.20.2",
 ]
 
 [project.scripts]
-apple-mail-mcp = "apple_mail_mcp.server:main"
+apple-mail-fast-mcp = "apple_mail_mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/morgancoopercom/apple-mail-mcp"
-Repository = "https://github.com/morgancoopercom/apple-mail-mcp"
-Issues = "https://github.com/morgancoopercom/apple-mail-mcp/issues"
+Homepage = "https://github.com/s-morgan-jeffries/apple-mail-fast-mcp"
+Repository = "https://github.com/s-morgan-jeffries/apple-mail-fast-mcp"
+Issues = "https://github.com/s-morgan-jeffries/apple-mail-fast-mcp/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apple_mail_mcp"]
@@ -80,6 +82,7 @@ markers = [
     "e2e: mark test as end-to-end test (full MCP stack)",
     "benchmark: mark test as performance benchmark",
     "slow: mark test as slow-running",
+    "real_account_fallback: opt out of the conftest stub of _alternative_account_identifier (for tests that exercise the real name<->UUID Keychain fallback)",
 ]
 
 [tool.coverage.run]

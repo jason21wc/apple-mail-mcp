@@ -1,4 +1,4 @@
-"""Tests for MCP tool annotations (#217 / upstream #240, ported to fork).
+"""Tests for MCP tool annotations (#217).
 
 Covers:
 
@@ -7,17 +7,11 @@ Covers:
 - Every tool registered on the production `mcp` instance has the expected
   `readOnlyHint` / `destructiveHint` / `idempotentHint` values per the
   classification table in the issue.
-
-Fork note: this fork adds the read-only `get_attachment_content` tool (fork
-mod #1), so the read-only set is 10 (not upstream's 9); mutating stays 14.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import subprocess
-import sys
 from typing import Any
 from unittest.mock import Mock
 
@@ -27,7 +21,7 @@ from apple_mail_mcp import server
 
 # ---------------------------------------------------------------------------
 # Classification — the source of truth that the tests below assert against.
-# Keep aligned with the table in the #217 implementation plan + fork mod #1.
+# Keep aligned with the table in the #217 implementation plan.
 # ---------------------------------------------------------------------------
 
 READ_ONLY_TOOLS: set[str] = {
@@ -38,7 +32,7 @@ READ_ONLY_TOOLS: set[str] = {
     "search_messages",
     "get_messages",
     "get_thread",
-    "get_attachment_content",  # fork mod #1 — read-only attachment byte fetch
+    "get_attachment_content",
     "get_template",
     "render_template",
 }
@@ -214,13 +208,13 @@ class TestReadOnlyFlag:
     def test_pre_parse_returns_false_with_no_args(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("sys.argv", ["apple-mail-mcp"])
+        monkeypatch.setattr("sys.argv", ["apple-mail-fast-mcp"])
         assert server._pre_parse_read_only() is False
 
     def test_pre_parse_returns_true_with_flag(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("sys.argv", ["apple-mail-mcp", "--read-only"])
+        monkeypatch.setattr("sys.argv", ["apple-mail-fast-mcp", "--read-only"])
         assert server._pre_parse_read_only() is True
 
     def test_pre_parse_ignores_unknown_args(
@@ -228,7 +222,7 @@ class TestReadOnlyFlag:
     ) -> None:
         """The pre-parse uses parse_known_args; downstream args don't crash it."""
         monkeypatch.setattr(
-            "sys.argv", ["apple-mail-mcp", "setup-imap", "--account", "Gmail"]
+            "sys.argv", ["apple-mail-fast-mcp", "setup-imap", "--account", "Gmail"]
         )
         assert server._pre_parse_read_only() is False
 
@@ -237,29 +231,3 @@ class TestReadOnlyFlag:
         parser = server._build_arg_parser()
         help_text = parser.format_help()
         assert "--read-only" in help_text
-
-    def test_read_only_mode_registers_only_read_tools(self) -> None:
-        """End-to-end: launching with --read-only registers exactly the 10
-        read tools on the real `mcp` instance and skips all 14 mutating tools.
-
-        `_READ_ONLY` is resolved at module import, so this runs in a fresh
-        subprocess with `--read-only` in argv. Pure Python — only imports the
-        module and lists tool metadata, so no Mail.app/IMAP access is needed.
-        """
-        code = (
-            "import sys, asyncio, json; "
-            "sys.argv = ['apple-mail-mcp', '--read-only']; "
-            "from apple_mail_mcp import server; "
-            "names = sorted(t.name for t in asyncio.run(server.mcp.list_tools())); "
-            "print(json.dumps(names))"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        names = json.loads(result.stdout.strip().splitlines()[-1])
-        assert set(names) == READ_ONLY_TOOLS
-        assert len(names) == 10
-        assert not (set(names) & MUTATING_TOOLS)

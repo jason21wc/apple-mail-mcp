@@ -67,8 +67,7 @@ class TestMoveMessages:
 
         assert result == 1
         call_args = mock_run.call_args[0][0]
-        # Nested mailbox path is expanded to chained AppleScript references
-        assert 'mailbox "Client Work" of mailbox "Projects"' in call_args
+        assert "Projects/Client Work" in call_args
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_move_with_gmail_handling(

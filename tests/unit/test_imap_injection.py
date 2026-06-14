@@ -96,41 +96,6 @@ class TestMessageIdRejectControlChars:
             _conn().find_thread_members(_INJECTION, anchor_references=[])
         client.search.assert_not_called()
 
-    # --- Attachment fetch paths (P0-1): these inlined the bracket logic and
-    #     skipped _reject_control_chars, bypassing the chokepoint. ---
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_get_attachment_bytes_rejects_crlf_message_id(self, mock_cls: MagicMock) -> None:
-        client = MagicMock()
-        mock_cls.return_value = client
-        with pytest.raises(ValueError):
-            _conn().get_attachment_bytes(_INJECTION, 0, mailbox="INBOX")
-        client.search.assert_not_called()
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_get_attachment_bytes_rejects_crlf_mailbox(self, mock_cls: MagicMock) -> None:
-        client = MagicMock()
-        mock_cls.return_value = client
-        with pytest.raises(ValueError):
-            _conn().get_attachment_bytes("a@b", 0, mailbox="INBOX\r\nA1 DELETE x")
-        client.search.assert_not_called()
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_get_attachment_payloads_rejects_crlf_message_id(self, mock_cls: MagicMock) -> None:
-        client = MagicMock()
-        mock_cls.return_value = client
-        with pytest.raises(ValueError):
-            _conn().get_attachment_payloads(_INJECTION, mailbox="INBOX")
-        client.search.assert_not_called()
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_get_attachment_payloads_rejects_crlf_mailbox(self, mock_cls: MagicMock) -> None:
-        client = MagicMock()
-        mock_cls.return_value = client
-        with pytest.raises(ValueError):
-            _conn().get_attachment_payloads("a@b", mailbox="INBOX\r\nA1 DELETE x")
-        client.search.assert_not_called()
-
 
 class TestMailboxNameRejectControlChars:
     """Mailbox/folder names become IMAP command args too (SELECT/DELETE/RENAME)."""

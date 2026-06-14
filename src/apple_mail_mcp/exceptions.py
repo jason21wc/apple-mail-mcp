@@ -50,6 +50,21 @@ class MailImapRequiredError(MailError):
     pass
 
 
+class MailAttachmentIndexError(MailError):
+    """The requested attachment index doesn't exist on the message
+    (out of range, or the message has no attachments). (#250)"""
+
+    pass
+
+
+class MailAttachmentTooLargeError(MailError):
+    """The attachment exceeds the inline-content size cap for
+    ``get_attachment_content``; the caller should use ``save_attachments``
+    for large files. (#250)"""
+
+    pass
+
+
 class MailImapMoveUnsupportedError(MailError):
     """The IMAP server advertises neither MOVE (RFC 6851) nor UIDPLUS
     (RFC 4315). No safe scoped move is possible; the orchestrator must
@@ -152,7 +167,8 @@ class MailDraftError(MailError):
 
 class MailDraftInvalidIdError(MailDraftError):
     """Draft id failed validation (path traversal, invalid chars, too long,
-    or empty). Ids must match ^[a-zA-Z0-9_-]{1,128}$."""
+    or empty). Ids must match ^[A-Za-z0-9._@+=-]{1,255}$ — a Mail.app
+    numeric id or a bare RFC 5322 Message-ID, with no path separators."""
 
     pass
 
@@ -160,6 +176,17 @@ class MailDraftInvalidIdError(MailDraftError):
 class MailDraftNotFoundError(MailDraftError):
     """No draft exists with the requested id (lookup across Drafts mailboxes
     of every account returned nothing)."""
+
+    pass
+
+
+class MailDraftHtmlUnavailableError(MailDraftError):
+    """An HTML draft (``body_html``) was requested but the clean IMAP-APPEND
+    path could not run (no Keychain opt-in / IMAP credentials, breaker open,
+    or APPEND failed). HTML drafts are built as RFC822 multipart/alternative
+    over IMAP — Mail.app's AppleScript ``content`` setter is plain-text only —
+    so we fail loud rather than silently downgrade to a plain-text draft.
+    (#251)"""
 
     pass
 

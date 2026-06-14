@@ -1,4 +1,4 @@
-.PHONY: help install dev test test-unit test-integration test-e2e test-verbose lint format typecheck complexity audit check-all coverage clean smoke install-hooks test-hooks
+.PHONY: help install dev test test-unit test-integration test-e2e test-verbose lint format typecheck complexity audit check-all coverage clean eval-descriptions eval-tools
 
 help:
 	@echo "Available targets:"
@@ -36,23 +36,6 @@ test-integration:
 test-e2e:
 	MAIL_TEST_MODE=true uv run pytest tests/e2e/ -v
 
-# Real-execution smoke suite: runs osascript against the local Mail.app (and
-# IMAP against the real account) to catch the AppleScript-runtime bug class
-# that mocked unit tests structurally cannot. Self-skips if Mail.app/account
-# aren't available, so it's safe to run anywhere. Wired into the pre-push hook.
-smoke:
-	uv run pytest tests/integration/test_smoke.py --run-integration -q
-
-# Install repo-tracked git hooks into .git/hooks (symlinks, stay in sync).
-# Single installer — scripts/git-hooks/ is the one home for git hooks;
-# scripts/hooks/ holds Claude-harness hooks, which are NOT git hooks.
-install-hooks:
-	@./scripts/install-git-hooks.sh
-
-# Pin the pre-push gate's decision matrix (vacuous-pass guard etc.).
-test-hooks:
-	@./scripts/test_pre_push_hook.sh
-
 benchmark:
 	MAIL_TEST_MODE=true uv run pytest tests/benchmarks/ --run-benchmark -v -s
 
@@ -86,10 +69,32 @@ coverage:
 check-all: lint typecheck test complexity
 	@./scripts/check_version_sync.sh
 	@./scripts/check_client_server_parity.sh
-	@./scripts/test_pre_push_hook.sh
+	@./scripts/check_docs.sh
 	@echo ""
 	@echo "All checks passed."
 
 clean:
 	rm -rf __pycache__ .pytest_cache .coverage htmlcov/ .mypy_cache .ruff_cache
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# Regenerate the blind-eval tool descriptions from the live FastMCP server
+# (keeps evals/agent_tool_usability/tool_descriptions.md in sync — #219).
+eval-descriptions:
+	uv run python evals/agent_tool_usability/generate_descriptions.py
+
+# Run the blind agent tool-usability eval against the open-weight OpenRouter
+# models (needs an OPENROUTER_API_KEY env var or the apple-mail-fast-mcp-evals /
+# openrouter Keychain entry; costs money). The Claude column is produced
+# separately via a Claude Code subagent. See evals/agent_tool_usability/. (#219)
+#
+# Models use each family's latest non-dated slug where one exists
+# (mistralai/mistral-large, deepseek/deepseek-chat), so the eval tracks the
+# current model instead of pinning a dated id that later 404s (#358). The exact
+# version served is recorded per-result as `resolved_model`, and run_eval
+# pre-checks availability (fails loud before spending credits). qwen-2.5-72b /
+# llama-3.3-70b have no non-dated alias, so their line slug is used as-is.
+eval-tools:
+	uv run --with openai python evals/agent_tool_usability/run_eval.py \
+		--model mistralai/mistral-large qwen/qwen-2.5-72b-instruct \
+		meta-llama/llama-3.3-70b-instruct deepseek/deepseek-chat \
+		--runs 5

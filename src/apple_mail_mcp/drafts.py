@@ -31,10 +31,19 @@ from typing import Literal
 
 from .exceptions import MailDraftInvalidIdError
 
-# Mail.app internal message ids are numeric strings in practice
-# (e.g. "160991"). Allow alphanumerics + - _ for safety. The 128
-# char cap is generous for any conceivable id format.
-_DRAFT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+# A draft_id is EITHER a Mail.app internal numeric id (e.g. "160991")
+# OR a bare RFC 5322 Message-ID (e.g. "abc.123@host", returned by the
+# IMAP-APPEND draft path, #245). The charset therefore allows the
+# Message-ID atext characters that occur in practice (. @ + = _ -) but
+# deliberately EXCLUDES path separators ("/", "\") and angle brackets so
+# the value remains safe to use as a seed-store filename — without a
+# separator no input can escape the drafts directory. Bracketed
+# Message-IDs are normalized to bare form at the boundary before reaching
+# here. The 255-char cap is generous for any real Message-ID.
+# `.` is allowed (RFC Message-IDs use it) but a `..` run is a path-traversal
+# sequence (draft_id becomes a filename stem) — the negative lookahead forbids
+# it so the regex stays the single source of truth for what's accepted. (#325)
+_DRAFT_ID_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._@+=-]{1,255}$")
 _EXT = ".json"
 
 SeedKind = Literal["reply", "forward"]
@@ -50,7 +59,7 @@ class SeedRecord:
 
 
 def _validate_draft_id(draft_id: str) -> None:
-    if not isinstance(draft_id, str) or not _DRAFT_ID_RE.match(draft_id):
+    if not isinstance(draft_id, str) or not _DRAFT_ID_RE.fullmatch(draft_id):
         raise MailDraftInvalidIdError(
             f"draft_id {draft_id!r} must match {_DRAFT_ID_RE.pattern}"
         )

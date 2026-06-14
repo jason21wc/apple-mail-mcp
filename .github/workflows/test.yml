@@ -23,21 +23,26 @@ jobs:
 
       - name: Type check
         run: uv run mypy src/
-        continue-on-error: true
 
       - name: Unit tests
         run: uv run pytest tests/ -m "not integration and not e2e and not benchmark" -v --cov=apple_mail_mcp --cov-report=term-missing --cov-fail-under=90
+        # The unit suite runs in seconds. A tight cap catches any future
+        # leak of a real osascript/socket call (which stalls ~30s in CI) —
+        # the #298 keychain-fallback leak that once made this ~5min is fixed
+        # in tests/unit/conftest.py.
         timeout-minutes: 5
 
       - name: Complexity check
         run: ./scripts/check_complexity.sh
-        continue-on-error: true
 
       - name: Version sync check
         run: ./scripts/check_version_sync.sh
 
       - name: Client-server parity check
         run: ./scripts/check_client_server_parity.sh
+
+      - name: Docs drift check
+        run: ./scripts/check_docs.sh
 
   test-summary:
     runs-on: ubuntu-latest

@@ -5,22 +5,35 @@ AppleScript-based connector for Apple Mail.
 import logging
 import re
 import subprocess
+import tempfile
 import time
 import warnings
 from collections.abc import Callable
 from datetime import date as _date
+from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from pathlib import Path
 from typing import Any, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
+from .draft_builder import (
+    build_draft_mime,
+    build_forward_body,
+    build_reply_body,
+    derive_reply_recipients,
+    forward_subject,
+    parse_original_message,
+    reply_subject,
+)
 from .drafts import _validate_draft_id
 from .exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
+    MailAttachmentIndexError,
+    MailAttachmentTooLargeError,
+    MailDraftHtmlUnavailableError,
     MailDraftNotFoundError,
-    MailError,
     MailImapMoveUnsupportedError,
     MailImapRequiredError,
     MailImapTrashNotFoundError,
@@ -34,11 +47,14 @@ from .exceptions import (
     MailUnsupportedRuleActionError,
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
+from .imap_overrides import get_login_override
 from .keychain import get_imap_password
 from .utils import (
     applescript_account_clause,
     escape_applescript_string,
     get_flag_index,
+    is_apple_hosted_address,
+    is_icloud_imap_host,
     parse_applescript_json,
     sanitize_filename,
     sanitize_input,
@@ -66,260 +82,249 @@ logger = logging.getLogger(__name__)
 # reject anything else to prevent AppleScript injection via the date clause.
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-# Threshold (seconds) above which the AppleScript search path emits an
-# INFO-level recommendation to enable IMAP delegation. Calibrated against
-# the post-#32 baseline: a 50-message search on a 200+ msg mailbox runs
-# in well under a second; sustained >5s suggests the user is hitting the
-# AppleScript fallback against a mailbox where IMAP would help.
-_SLOW_SEARCH_THRESHOLD_SEC = 5.0
+
+def _now() -> _datetime:
+    """Indirection for monkeypatching in tests (#230). Returns tz-aware
+    local time so comparison with IMAP envelope dates (also tz-aware) is
+    well-defined."""
+    return _datetime.now().astimezone()
 
 
-# MCP-tool field name → Mail.app AppleScript `rule type` enum identifier.
-# Verified against Mail.app's running rules: 'from header', 'subject header',
-# 'message content' all confirmed live. Other values follow the same naming
-# convention per Mail.app's AppleScript dictionary; verified via integration
-# test on live rule creation.
-_RULE_FIELD_MAP = {
-    "from": "from header",
-    "to": "to header",
-    "subject": "subject header",
-    "body": "message content",
-    "any_recipient": "any recipient",
-    "header_name": "header key",
-}
+def _bare_message_id(message_id: str) -> str:
+    """Strip surrounding angle brackets from an RFC 5322 Message-ID.
 
-# MCP-tool operator name → Mail.app AppleScript `qualifier` enum identifier.
-# 'does contain value', 'equal to value', 'begins with value' verified live
-# against the user's existing rules. Others follow Mail.app's documented
-# naming.
-_RULE_OPERATOR_MAP = {
-    "contains": "does contain value",
-    "does_not_contain": "does not contain value",
-    "begins_with": "begins with value",
-    "ends_with": "ends with value",
-    "equals": "equal to value",
-}
+    ``make_msgid()`` (and raw ``Message-ID`` headers) produce the
+    bracketed form ``<id@host>``, but Mail.app and the read tools store
+    and emit the bare ``id@host``. The IMAP-APPEND draft path returns the
+    bare form as ``draft_id`` so it round-trips through draft-id
+    validation and the ``delete_draft`` / ``update_draft`` lookups (#245)."""
+    mid = message_id.strip()
+    if mid.startswith("<") and mid.endswith(">"):
+        return mid[1:-1]
+    return mid
 
 
-def _is_rfc_message_id(message_id: str) -> bool:
-    """True when *message_id* looks like an RFC 5322 Message-ID rather than
-    Mail.app's internal numeric id.
+def _construct_as_date_var(var: str, year: int, month: int, day: int) -> str:
+    """Emit AppleScript that constructs an AS date object at midnight (local
+    time) on the given (year, month, day).
 
-    Mail.app numeric ids are stringified long integers (no ``@``).  RFC 5322
-    Message-IDs always contain ``@`` per section 3.6.4.  Matches the
-    discriminator in ``_maybe_resolve_rfc_seed_id`` (issue #205).
+    Why this exists: AppleScript's `date "YYYY-MM-DD"` literal does NOT
+    parse ISO dates — `date "2026-05-28"` evaluates to year-12196, silently
+    breaking any filter that depends on it. The property-setter pattern
+    below is locale-independent and gives exactly midnight on the target
+    date.
+
+    The leading `set day of var to 1` is a defense against current-date
+    quirks: if `current date` is e.g. 2026-01-31 and we immediately
+    `set month of var to 2`, AppleScript would try to roll into Feb 31 and
+    misbehave. Resetting day to 1 first, then year/month/day in that
+    order, avoids all such edge cases. (#242)
     """
-    return bool(message_id) and "@" in message_id
+    indent = "\n            "
+    return indent.join([
+        f"set {var} to current date",
+        f"set day of {var} to 1",
+        f"set year of {var} to {year}",
+        f"set month of {var} to {month}",
+        f"set day of {var} to {day}",
+        f"set time of {var} to 0",
+    ])
 
 
-def _any_rfc_message_id(message_ids: list[str]) -> bool:
-    """True if at least one id is an RFC 5322 Message-ID.
+def _build_date_filter_clauses(
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[str, list[str]]:
+    """Build `(preamble, in_loop_clauses)` for the `date_from`/`date_to`
+    AppleScript filters.
 
-    The IMAP write paths resolve ids via ``SEARCH HEADER "Message-ID"``, which
-    can only match RFC ids — a numeric Mail.app id resolves to nothing and the
-    helper returns 0, which the orchestrator (``imap_count is not None``) then
-    mistakes for "0 applicable" and returns as success, never falling through
-    to the AppleScript pass where the numeric id WOULD match (P0-3, silent
-    no-op). When no id is RFC-resolvable, skip IMAP entirely.
+    The preamble constructs AS date objects via property setters and
+    assigns them to `dateFromVar` / `dateToExclVar`. The loop clauses
+    reference those variables (cheap comparison per message, no per-iter
+    re-parsing of an ISO string).
+
+    Both filters compose by intersection (any matching clause skips the
+    message). Returns `("", [])` when neither bound is set.
+
+    Note: the `received_within_hours` filter is NOT handled here — it's a
+    short-circuit that lives outside the per-message filter block. See
+    `_build_received_within_hours_short_circuit`.
     """
-    return any(_is_rfc_message_id(m) for m in message_ids)
+    preamble_parts: list[str] = []
+    clauses: list[str] = []
 
-
-def _whose_message_clause(message_id: str) -> str:
-    """Build the AppleScript ``whose`` clause to locate one message by id,
-    handling BOTH id namespaces.
-
-    Mail.app's numeric ids match ``whose id is`` only; RFC 5322 Message-IDs
-    (returned by the IMAP path) match ``whose message id is`` only. A single
-    discriminator (:func:`_is_rfc_message_id`) picks the right form, and for
-    RFC ids both bare and angle-bracketed forms are tried (Mail.app stores the
-    bracketed form, but search results vary). The id is sanitized + escaped
-    here so every call site is injection-safe by construction.
-
-    This is the one resolver; before it was extracted, only get_message
-    discriminated namespaces and five other AppleScript lookup sites used
-    numeric-only ``whose id is``, silently failing on RFC ids (P0-3).
-    """
-    if _is_rfc_message_id(message_id):
-        bare = message_id.strip()
-        if bare.startswith("<") and bare.endswith(">"):
-            bare = bare[1:-1]
-        safe_bare = escape_applescript_string(sanitize_input(bare))
-        safe_bracketed = escape_applescript_string(sanitize_input(f"<{bare}>"))
-        return (
-            f'whose (message id is "{safe_bare}" '
-            f'or message id is "{safe_bracketed}")'
+    if date_from is not None:
+        if not _ISO_DATE_RE.match(date_from):
+            raise ValueError(
+                f"date_from must be ISO 8601 YYYY-MM-DD, got: {date_from!r}"
+            )
+        d = _date.fromisoformat(date_from)
+        preamble_parts.append(
+            _construct_as_date_var("dateFromVar", d.year, d.month, d.day)
         )
-    message_id_safe = escape_applescript_string(sanitize_input(message_id))
-    return f'whose id is "{message_id_safe}"'
+        clauses.append(
+            "if (date received of msg) < dateFromVar then set includeThis to false"
+        )
+
+    if date_to is not None:
+        if not _ISO_DATE_RE.match(date_to):
+            raise ValueError(
+                f"date_to must be ISO 8601 YYYY-MM-DD, got: {date_to!r}"
+            )
+        # Upper bound is exclusive of the day AFTER date_to, so the full
+        # day of date_to is included.
+        excl = _date.fromisoformat(date_to) + _timedelta(days=1)
+        preamble_parts.append(
+            _construct_as_date_var(
+                "dateToExclVar", excl.year, excl.month, excl.day
+            )
+        )
+        clauses.append(
+            "if (date received of msg) >= dateToExclVar then set includeThis to false"
+        )
+
+    preamble = "\n            ".join(preamble_parts) if preamble_parts else ""
+    return preamble, clauses
 
 
-def _applescript_mailbox_ref(mailbox_path: str, account_clause: str) -> str:
-    """Build an AppleScript nested mailbox reference from a slash-separated path.
+def _build_received_within_hours_short_circuit(
+    received_within_hours: int | None,
+) -> tuple[str, str]:
+    """Build the AS preamble + exit-clause for `received_within_hours`.
 
-    Example: "Investments Current/Hotel DENBT" with account clause becomes
-    'mailbox "Hotel DENBT" of mailbox "Investments Current" of account "iCloud"'
+    Returns ``(preamble, exit_clause)``:
+
+    - ``preamble`` is spliced ABOVE the search loop. It hoists the cutoff
+      out of the per-iteration cost: ``set cutoffDate to (current date) -
+      (N * hours)`` (computed once, not per message).
+    - ``exit_clause`` is spliced INTO the loop body, before the per-message
+      filter block. It uses ``exit repeat`` rather than the standard
+      ``set includeThis to false`` skip. That short-circuit is **only sound
+      under newest-first iteration** (#242): once a message has
+      `date received < cutoff`, every subsequent message in the loop is
+      also older than the cutoff, so we can bail out of the entire scan.
+      With the previous oldest-first iteration this `exit repeat` would
+      have terminated immediately on the first (oldest) message and
+      returned nothing.
+
+    Both strings are empty when ``received_within_hours`` is None — splicing
+    them in is a no-op at script generation.
     """
-    parts = mailbox_path.split("/")
-    ref = account_clause
-    for part in parts:
-        part_safe = escape_applescript_string(sanitize_input(part))
-        ref = f'mailbox "{part_safe}" of {ref}'
-    return ref
-
-
-def _wrap_as_json_script(body: str, *, timeout: int) -> str:
-    """Wrap a tell-block body with ASObjC imports and an NSJSONSerialization return.
-
-    The `body` must:
-      - Contain a `tell application "Mail" ... end tell` block.
-      - Assign the final result to an AppleScript variable named `resultData`
-        inside that tell block.
-      - Handle failures EITHER by letting AppleScript errors propagate via
-        stderr (preserves _run_applescript's typed exception mapping, e.g.,
-        MailAccountNotFoundError) OR by catching them in a try block and
-        returning "ERROR: <message>" (surfaces as MailAppleScriptError on
-        the Python side). Use the stderr path when the caller relies on
-        typed exceptions; use the "ERROR:" path otherwise.
-
-    The wrapper:
-      - Prepends `use framework "Foundation"` and `use scripting additions`.
-      - Wraps the body in `with timeout of {timeout} seconds ... end timeout`
-        so Mail's default 60 s AppleEvent timeout does not fire before the
-        connector's subprocess timeout — see issue #227. Without this,
-        per-message property fetches on Exchange/EWS mailboxes (server-
-        bound, not local) trip `AppleEvent timed out (-1712)` and leave the
-        scripting bridge in `Connection is invalid (-609)` for ~30 s.
-      - After the tell block, serializes `resultData` via NSJSONSerialization
-        and returns the resulting NSString as text. The serializer runs in
-        the ASObjC bridge (no AppleEvent) so it is intentionally OUTSIDE the
-        timeout block — but `resultData` is still visible because AppleScript
-        `with timeout` is a control construct, not a scope.
-
-    Args:
-        body: AppleScript tell-block source setting `resultData`.
-        timeout: AppleEvent timeout in seconds for the wrapped tell block.
-            Callers should pass ``self.timeout`` so the in-script timeout
-            matches the subprocess-level kill timer.
-
-    Returns:
-        Full AppleScript source ready for osascript.
-    """
-    return (
-        'use framework "Foundation"\n'
-        "use scripting additions\n"
-        "\n"
-        f"with timeout of {timeout} seconds\n"
-        f"{body}\n"
-        "end timeout\n"
-        "\n"
-        "set jsonData to (current application's NSJSONSerialization's "
-        "dataWithJSONObject:resultData options:0 |error|:(missing value))\n"
-        "return (current application's NSString's alloc()'s "
-        "initWithData:jsonData encoding:4) as text\n"
-    )
-
-
-def _bulk_msg_lookup(container: str, indent: str) -> str:
-    """Emit the AppleScript that binds ``msg`` from the loop variable ``msgId``,
-    handling BOTH id namespaces (P0-3).
-
-    Mirrors :func:`_whose_message_clause` for the bulk loop, where the id is a
-    runtime variable rather than a literal: branch on ``"@"`` (the same RFC-vs-
-    numeric discriminator as :func:`_is_rfc_message_id`) so each comparison is
-    type-matched — ``message id`` (string) vs an RFC string, or ``id`` vs a
-    numeric id — instead of comparing an integer ``id`` to a string in one
-    ``or`` (an unspecified coercion). The RFC branch tries bare and bracketed
-    forms, like the literal helper.
-    """
-    return (
-        f'{indent}if (msgId as text) contains "@" then\n'
-        f"{indent}    set bareId to (msgId as text)\n"
-        f'{indent}    if bareId starts with "<" and bareId ends with ">" then\n'
-        f"{indent}        set bareId to text 2 thru -2 of bareId\n"
-        f"{indent}    end if\n"
-        f"{indent}    set msg to first message of {container} whose "
-        f'(message id is bareId or message id is ("<" & bareId & ">"))\n'
-        f"{indent}else\n"
-        f"{indent}    set msg to first message of {container} whose id is msgId\n"
-        f"{indent}end if"
-    )
-
-
-def _bulk_repeat_block(
-    *,
-    account: str | None,
-    source_mailbox: str | None,
-    actions: list[str],
-    counter_var: str,
-) -> str:
-    """Emit the AppleScript repeat block for a bulk-mutation operation.
-
-    When `account` and `source_mailbox` are both provided, emits a narrow
-    O(N) loop scoped to a single mailbox. When both are None, falls back
-    to the legacy O(N × accounts × mailboxes) cross-scan for backwards
-    compatibility. Any partial-pair raises ValueError — a mailbox name
-    without an account is ambiguous (the same name can exist across
-    multiple accounts).
-
-    Args:
-        account: Account name or UUID, or None.
-        source_mailbox: Source mailbox name, or None.
-        actions: One or more AppleScript statements to run inside the
-            loop AFTER `set msg to first message ... whose id is msgId`.
-            The counter increment is appended automatically.
-        counter_var: Name of the AppleScript counter variable (e.g.
-            "updateCount", "moveCount") that gets incremented per success.
-
-    Returns:
-        AppleScript fragment ready to interpolate into a `tell application
-        "Mail"` block.
-
-    Raises:
-        ValueError: If exactly one of `account`/`source_mailbox` is given.
-    """
-    if (account is None) != (source_mailbox is None):
-        missing = "source_mailbox" if account is not None else "account"
+    if received_within_hours is None:
+        return "", ""
+    if not isinstance(received_within_hours, int) or received_within_hours <= 0:
         raise ValueError(
-            f"account and source_mailbox must be provided together; "
-            f"missing {missing}"
+            f"received_within_hours must be > 0, got: {received_within_hours!r}"
         )
-
-    if account is not None and source_mailbox is not None:
-        # Narrow path: single mailbox, single loop. O(N).
-        action_indent = " " * 20
-        action_lines = "\n".join(action_indent + a for a in actions)
-        account_clause = applescript_account_clause(account)
-        mb_ref = _applescript_mailbox_ref(source_mailbox, account_clause)
-        lookup = _bulk_msg_lookup("sourceMb", " " * 20)
-        return (
-            f"            set sourceMb to {mb_ref}\n"
-            f"            repeat with msgId in idList\n"
-            f"                try\n"
-            f"{lookup}\n"
-            f"{action_lines}\n"
-            f"                    set {counter_var} to {counter_var} + 1\n"
-            f"                end try\n"
-            f"            end repeat"
-        )
-
-    # Cross-scan path (legacy / backwards compat). O(N × M × K).
-    action_indent = " " * 28
-    action_lines = "\n".join(action_indent + a for a in actions)
-    lookup = _bulk_msg_lookup("mb", " " * 28)
-    return (
-        f"            repeat with msgId in idList\n"
-        f"                repeat with acc in accounts\n"
-        f"                    repeat with mb in mailboxes of acc\n"
-        f"                        try\n"
-        f"{lookup}\n"
-        f"{action_lines}\n"
-        f"                            set {counter_var} to {counter_var} + 1\n"
-        f"                        end try\n"
-        f"                    end repeat\n"
-        f"                end repeat\n"
-        f"            end repeat"
+    preamble = (
+        f"set cutoffDate to (current date) - ({received_within_hours} * hours)"
     )
+    exit_clause = (
+        "if (date received of msg) < cutoffDate then exit repeat"
+    )
+    return preamble, exit_clause
+
+
+# Byte caps for save_attachments — disk-fill DoS protection (#236). A hostile
+# email can carry a multi-GB attachment; without a cap, "save the attachment"
+# writes it in full. Defaults are overridable per-connector (constructor) and,
+# at the server layer, via env vars.
+DEFAULT_MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024        # 100 MB per attachment
+DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES = 500 * 1024 * 1024  # 500 MB per call
+
+# Tighter cap for get_attachment_content (#250): the bytes are returned inline
+# in the MCP response (base64 inflates ~33%), so a much smaller ceiling than
+# the disk-save caps. Over-cap callers are pointed at save_attachments.
+DEFAULT_MAX_INLINE_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB per attachment
+
+
+def _select_attachments_within_caps(
+    attachments: list[dict[str, Any]],
+    attachment_indices: list[int] | None,
+    *,
+    per_cap: int,
+    total_cap: int,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Pre-check pass for save_attachments byte caps (#236).
+
+    Walks the selected attachments (in selection order, mirroring
+    ``_compute_attachment_save_targets``) and splits them into allowed
+    (0-based) indices and rejected records. An attachment is rejected when its
+    reported size exceeds ``per_cap`` (reason ``per_attachment_cap``) or would
+    push the running total over ``total_cap`` (``aggregate_cap``). A reported
+    size of 0/unknown is treated as under-cap and allowed (fail-open) — the
+    post-write net (:func:`_prune_oversized_written`) catches an attachment
+    Mail under-reported here.
+    """
+    if attachment_indices is not None:
+        selected = [
+            (i, attachments[i])
+            for i in attachment_indices
+            if 0 <= i < len(attachments)
+        ]
+    else:
+        selected = list(enumerate(attachments))
+
+    allowed: list[int] = []
+    rejected: list[dict[str, Any]] = []
+    total = 0
+    for i, att in selected:
+        size = int(att.get("size") or 0)
+        name = str(att.get("name") or "")
+        if size > per_cap:
+            rejected.append(
+                {"name": name, "size": size, "reason": "per_attachment_cap"}
+            )
+            continue
+        if total + size > total_cap:
+            rejected.append(
+                {"name": name, "size": size, "reason": "aggregate_cap"}
+            )
+            continue
+        total += size
+        allowed.append(i)
+    return allowed, rejected
+
+
+def _prune_oversized_written(
+    targets: list[tuple[int, Path]],
+    *,
+    per_cap: int,
+    total_cap: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    """Post-write safety net for save_attachments byte caps (#236).
+
+    After the AppleScript save, stat each written file and delete (and report)
+    any that exceed ``per_cap`` on disk or push the actual running total over
+    ``total_cap`` — covering the case where Mail under-reported size before the
+    write. Only acts on paths that exist, so it is inert under mocked
+    AppleScript (no real files). Returns ``(removed_count, rejected_records)``.
+    """
+    removed = 0
+    rejected: list[dict[str, Any]] = []
+    running = 0
+    for _as_idx, path in targets:
+        if not path.is_file():
+            continue
+        actual = path.stat().st_size
+        if actual > per_cap:
+            path.unlink(missing_ok=True)
+            removed += 1
+            rejected.append(
+                {"name": path.name, "size": actual,
+                 "reason": "per_attachment_cap_postwrite"}
+            )
+            continue
+        if running + actual > total_cap:
+            path.unlink(missing_ok=True)
+            removed += 1
+            rejected.append(
+                {"name": path.name, "size": actual,
+                 "reason": "aggregate_cap_postwrite"}
+            )
+            continue
+        running += actual
+    return removed, rejected
 
 
 def _compute_attachment_save_targets(
@@ -392,37 +397,380 @@ def _compute_draft_extract_targets(
     return targets
 
 
-def _attachment_record_as(list_var: str) -> str:
-    """AppleScript that appends a defensively-built attachment record to
-    `list_var` for the current loop variable `att`. Each property is read in
-    its own try with a safe default: Mail.app raises -10000 on some attachment
-    properties (e.g. MIME type of certain PDFs), and one throw must not abort
-    the enclosing enumeration (that returned [] / 'not found' and silently
-    broke save_attachments and get_message's include_attachments — see #17).
-    Record keys stay |quoted| (NSJSONSerialization drops bare keys)."""
+def _filter_imap_results_to_cutoff(
+    messages: list[dict[str, Any]], cutoff_dt: _datetime
+) -> list[dict[str, Any]]:
+    """Trim IMAP search results to messages received at-or-after `cutoff_dt`.
+
+    The IMAP path's day-granular SINCE under-filters when the caller wants
+    hour precision (e.g., received_within_hours=6 just before midnight
+    includes everything since midnight on the previous day). This pass
+    enforces hour precision in Python using the ISO 8601 ``date_received``
+    that the IMAP connector emits.
+
+    Messages whose ``date_received`` is missing or unparseable are kept
+    defensively — better to over-return than to silently drop rows. The
+    AS path doesn't need this helper because its embedded
+    ``(current date) - (N * hours)`` clause is already hour-precise.
+    """
+    if cutoff_dt.tzinfo is None:
+        cutoff_dt = cutoff_dt.astimezone()
+    kept: list[dict[str, Any]] = []
+    for m in messages:
+        raw = m.get("date_received")
+        if not raw:
+            kept.append(m)
+            continue
+        try:
+            parsed = _datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            kept.append(m)
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        if parsed >= cutoff_dt:
+            kept.append(m)
+    return kept
+
+# Threshold (seconds) above which the AppleScript search path emits an
+# INFO-level recommendation to enable IMAP delegation. Calibrated against
+# the post-#32 baseline: a 50-message search on a 200+ msg mailbox runs
+# in well under a second; sustained >5s suggests the user is hitting the
+# AppleScript fallback against a mailbox where IMAP would help.
+_SLOW_SEARCH_THRESHOLD_SEC = 5.0
+
+
+# MCP-tool field name → Mail.app AppleScript `rule type` enum identifier.
+# Verified against Mail.app's running rules: 'from header', 'subject header',
+# 'message content' all confirmed live. Other values follow the same naming
+# convention per Mail.app's AppleScript dictionary; verified via integration
+# test on live rule creation.
+_RULE_FIELD_MAP = {
+    "from": "from header",
+    "to": "to header",
+    "subject": "subject header",
+    "body": "message content",
+    "any_recipient": "any recipient",
+    "header_name": "header key",
+}
+
+# MCP-tool operator name → Mail.app AppleScript `qualifier` enum identifier.
+# 'does contain value', 'equal to value', 'begins with value' verified live
+# against the user's existing rules. Others follow Mail.app's documented
+# naming.
+_RULE_OPERATOR_MAP = {
+    "contains": "does contain value",
+    "does_not_contain": "does not contain value",
+    "begins_with": "begins with value",
+    "ends_with": "ends with value",
+    "equals": "equal to value",
+}
+
+
+# Shared AppleScript handlers for mailbox lookup (#247).
+#
+# Mail.app's `mailboxes of account` returns a FLAT list of every mailbox
+# belonging to the account — each one has a leaf `name` (no slash separators)
+# and a `container` reference (a mailbox, a container class, or
+# `missing value` at the top). Direct reference (`mailbox "X" of acctRef`)
+# only resolves canonical mailboxes like INBOX and Mail.app system names;
+# Gmail custom labels, nested folders, and most user-created hierarchies
+# return error -1728. The reliable resolution pattern is:
+#
+#   1. Iterate `mailboxes of acctRef` once.
+#   2. For each candidate, build its full slash-separated path via the
+#      container chain (`buildMailboxPath`).
+#   3. Match either by leaf `name` (single-component input) or by computed
+#      full path (slash-bearing input).
+#
+# The class check on `container` accepts both `mailbox` and `container`
+# (Gmail's [Gmail] folder is `container` class, not `mailbox`) and stops
+# at the account boundary so paths don't include the account name.
+#
+# Empirically verified against a real Gmail account: this handler resolves
+# Gmail's `Important` label (30k messages, previously unreachable via
+# direct reference) and the full path `[Gmail]/Important` to the same
+# mailbox.
+_MAILBOX_RESOLVER_HANDLERS = '''using terms from application "Mail"
+    on buildMailboxPath(mb)
+        set parts to {name of mb}
+        set current to mb
+        repeat
+            try
+                set parentRef to container of current
+                if parentRef is missing value then exit repeat
+                set parentClass to class of parentRef
+                if parentClass is not mailbox and parentClass is not container then exit repeat
+                set parts to {(name of parentRef)} & parts
+                set current to parentRef
+            on error
+                exit repeat
+            end try
+        end repeat
+        set tid to AppleScript's text item delimiters
+        set AppleScript's text item delimiters to "/"
+        set fullPath to parts as text
+        set AppleScript's text item delimiters to tid
+        return fullPath
+    end buildMailboxPath
+
+    on resolveMailbox(acctRef, targetPath)
+        if targetPath is "" then error "mailbox path is empty"
+        set hasSlash to (targetPath contains "/")
+        repeat with mb in (mailboxes of acctRef)
+            if hasSlash then
+                if my buildMailboxPath(mb) is targetPath then return mb
+            else
+                if (name of mb) is targetPath then return mb
+            end if
+        end repeat
+        error "mailbox not found: " & targetPath
+    end resolveMailbox
+
+    on collectMailboxesWithPaths(acctRef)
+        set results to {}
+        repeat with mb in (mailboxes of acctRef)
+            set mbName to name of mb
+            set mbPath to my buildMailboxPath(mb)
+            set mbUnread to unread count of mb
+            if mbUnread is missing value then set mbUnread to 0
+            set rec to {|name|:mbName, |path|:mbPath, |unread_count|:mbUnread}
+            set end of results to rec
+        end repeat
+        return results
+    end collectMailboxesWithPaths
+end using terms from
+'''
+
+
+def _wrap_with_timeout(body: str, *, timeout: int) -> str:
+    """Wrap an AppleScript tell-block in `with timeout … end timeout`.
+
+    Threads the connector's configured timeout into the script so Mail's
+    default 60s AppleEvent timeout does not fire before the subprocess-level
+    kill timer — see issues #227 (JSON paths) and #233 (the non-JSON mutation
+    paths). Without this, server-bound operations on slow accounts (Exchange/
+    EWS) can trip `AppleEvent timed out (-1712)` and the user's
+    ``AppleMailConnector(timeout=N)`` knob silently doesn't apply.
+
+    The `body` must NOT contain top-level `use` statements or handler
+    definitions — AppleScript forbids both inside a `with timeout` block.
+    Keep handlers (e.g. ``_MAILBOX_RESOLVER_HANDLERS``) OUTSIDE this wrapper,
+    prepended to the wrapped result by the caller.
+
+    Args:
+        body: AppleScript source (typically a `tell application "Mail"` block).
+        timeout: AppleEvent timeout in seconds. Callers pass ``self.timeout``.
+
+    Returns:
+        The body wrapped in a `with timeout` block.
+    """
+    return f"with timeout of {timeout} seconds\n{body}\nend timeout\n"
+
+
+def _wrap_as_json_script(
+    body: str, *, timeout: int, handlers: str = ""
+) -> str:
+    """Wrap a tell-block body with ASObjC imports and an NSJSONSerialization return.
+
+    The `body` must:
+      - Contain a `tell application "Mail" ... end tell` block.
+      - Assign the final result to an AppleScript variable named `resultData`
+        inside that tell block.
+      - Handle failures EITHER by letting AppleScript errors propagate via
+        stderr (preserves _run_applescript's typed exception mapping, e.g.,
+        MailAccountNotFoundError) OR by catching them in a try block and
+        returning "ERROR: <message>" (surfaces as MailAppleScriptError on
+        the Python side). Use the stderr path when the caller relies on
+        typed exceptions; use the "ERROR:" path otherwise.
+
+    The wrapper:
+      - Prepends `use framework "Foundation"` and `use scripting additions`.
+      - Optionally inserts top-level `handlers` (e.g. ``_MAILBOX_RESOLVER_HANDLERS``)
+        between the `use` statements and the `with timeout` block. Handlers
+        must be defined at script top level (outside any `tell` block) so
+        the body inside the tell can call them with ``my handlerName(...)``.
+      - Wraps the body in `with timeout of {timeout} seconds ... end timeout`
+        so Mail's default 60 s AppleEvent timeout does not fire before the
+        connector's subprocess timeout — see issue #227. Without this,
+        per-message property fetches on Exchange/EWS mailboxes (server-
+        bound, not local) trip `AppleEvent timed out (-1712)` and leave the
+        scripting bridge in `Connection is invalid (-609)` for ~30 s.
+      - After the tell block, serializes `resultData` via NSJSONSerialization
+        and returns the resulting NSString as text. The serializer runs in
+        the ASObjC bridge (no AppleEvent) so it is intentionally OUTSIDE the
+        timeout block — but `resultData` is still visible because AppleScript
+        `with timeout` is a control construct, not a scope.
+
+    Args:
+        body: AppleScript tell-block source setting `resultData`.
+        timeout: AppleEvent timeout in seconds for the wrapped tell block.
+            Callers should pass ``self.timeout`` so the in-script timeout
+            matches the subprocess-level kill timer.
+        handlers: Optional AppleScript handler block to inject at script
+            top level (before `with timeout`). Empty string = no handlers.
+
+    Returns:
+        Full AppleScript source ready for osascript.
+    """
+    handlers_block = f"{handlers}\n" if handlers else ""
     return (
-        "\n                        try\n"
-        "                            set attName to name of att\n"
-        "                        on error\n"
-        "                            set attName to \"\"\n"
-        "                        end try\n"
-        "                        try\n"
-        "                            set attMime to (MIME type of att)\n"
-        "                        on error\n"
-        "                            set attMime to \"\"\n"
-        "                        end try\n"
-        "                        try\n"
-        "                            set attSize to (file size of att)\n"
-        "                        on error\n"
-        "                            set attSize to 0\n"
-        "                        end try\n"
-        "                        try\n"
-        "                            set attDownloaded to (downloaded of att)\n"
-        "                        on error\n"
-        "                            set attDownloaded to false\n"
-        "                        end try\n"
-        f"                        set end of {list_var} to "
-        "{|name|:attName, |mime_type|:attMime, |size|:attSize, |downloaded|:attDownloaded}\n"
+        'use framework "Foundation"\n'
+        "use scripting additions\n"
+        "\n"
+        f"{handlers_block}"
+        f"{_wrap_with_timeout(body, timeout=timeout)}"
+        "\n"
+        "set jsonData to (current application's NSJSONSerialization's "
+        "dataWithJSONObject:resultData options:0 |error|:(missing value))\n"
+        "return (current application's NSString's alloc()'s "
+        "initWithData:jsonData encoding:4) as text\n"
+    )
+
+
+def _bulk_repeat_block(
+    *,
+    account: str | None,
+    source_mailbox: str | None,
+    actions: list[str],
+    counter_var: str,
+    verify_dest_var: str | None = None,
+) -> str:
+    """Emit the AppleScript repeat block for a bulk-mutation operation.
+
+    When `account` and `source_mailbox` are both provided, emits a narrow
+    O(N) loop scoped to a single mailbox. When both are None, falls back
+    to the legacy O(N × accounts × mailboxes) cross-scan for backwards
+    compatibility. Any partial-pair raises ValueError — a mailbox name
+    without an account is ambiguous (the same name can exist across
+    multiple accounts).
+
+    Args:
+        account: Account name or UUID, or None.
+        source_mailbox: Source mailbox name, or None.
+        actions: One or more AppleScript statements to run inside the
+            loop once a message is matched (under `if matched then`).
+            Each id is matched in TWO sequential attempts — first by
+            Mail's internal numeric `id`, then (if that misses) by the
+            RFC 5322 `message id`. This lets callers pass either form:
+            read tools hand back the RFC Message-ID on the IMAP path,
+            which a numeric `id` never equals (the cause of silent
+            `updated:0` patches; #205-family). The two predicates are
+            kept in SEPARATE `whose` clauses on purpose — combining them
+            as `whose (id is X or message id is X)` makes Mail's query
+            compiler fail the whole filter when X is a non-numeric RFC
+            id (the `id is X` integer comparison poisons the `or`),
+            matching nothing. The `message id` arm itself queries BOTH
+            the bare and `<bracketed>` forms (`message id is A or message
+            id is B` — safe, both are string comparisons), mirroring
+            `find_message_by_message_id`: IMAP-backed accounts store the
+            id bare, but other paths may store it bracketed per RFC 5322
+            (#232). The counter increment is appended automatically.
+
+            Performance: on the cross-scan path (no `source_mailbox`) the
+            `message id` fallback is NOT indexed (~20s/mailbox on a real
+            account; see APPLESCRIPT_GOTCHAS.md) and fires once per mailbox
+            for any RFC id, since the numeric `id` arm always misses for
+            those. Callers holding an RFC id should pass `account` +
+            `source_mailbox` to take the narrow single-mailbox path.
+        counter_var: Name of the AppleScript counter variable (e.g.
+            "updateCount", "moveCount") that gets incremented per success.
+
+    Returns:
+        AppleScript fragment ready to interpolate into a `tell application
+        "Mail"` block.
+
+    Raises:
+        ValueError: If exactly one of `account`/`source_mailbox` is given.
+    """
+    if (account is None) != (source_mailbox is None):
+        missing = "source_mailbox" if account is not None else "account"
+        raise ValueError(
+            f"account and source_mailbox must be provided together; "
+            f"missing {missing}"
+        )
+
+    def _success_tail(indent: str) -> str:
+        """The per-match tail. Normally a bare counter bump; in verify mode
+        (move ops, #364) it confirms the message actually left the source by
+        checking its current mailbox against the destination — counting
+        silent no-ops into ``failCount`` instead of reporting false success.
+        Reading ``mailbox of msg`` after a successful move can error (the
+        source-scoped reference no longer resolves); that's treated as
+        landed, since the message did leave the source."""
+        if verify_dest_var is None:
+            return f"{indent}set {counter_var} to {counter_var} + 1"
+        return (
+            f"{indent}set landed to true\n"
+            f"{indent}try\n"
+            f"{indent}    if (name of mailbox of msg) is not "
+            f"(name of {verify_dest_var}) then set landed to false\n"
+            f"{indent}end try\n"
+            f"{indent}if landed then\n"
+            f"{indent}    set {counter_var} to {counter_var} + 1\n"
+            f"{indent}else\n"
+            f"{indent}    set failCount to failCount + 1\n"
+            f"{indent}end if"
+        )
+
+    if account is not None and source_mailbox is not None:
+        # Narrow path: single mailbox, single loop. O(N).
+        action_indent = " " * 20
+        action_lines = "\n".join(action_indent + a for a in actions)
+        account_clause = applescript_account_clause(account)
+        mb_safe = escape_applescript_string(sanitize_input(source_mailbox))
+        return (
+            f'            set sourceMb to my resolveMailbox({account_clause}, "{mb_safe}")\n'
+            f"            repeat with msgId in idList\n"
+            f"                set mid to (contents of msgId)\n"
+            f"                set matched to false\n"
+            f"                try\n"
+            f"                    set msg to first message of sourceMb whose id is mid\n"
+            f"                    set matched to true\n"
+            f"                end try\n"
+            f"                if not matched then\n"
+            f"                    try\n"
+            f"                        set midBare to mid\n"
+            f'                        if midBare starts with "<" and midBare ends with ">" then set midBare to text 2 thru -2 of midBare\n'
+            f'                        set msg to first message of sourceMb whose (message id is midBare or message id is ("<" & midBare & ">"))\n'
+            f"                        set matched to true\n"
+            f"                    end try\n"
+            f"                end if\n"
+            f"                if matched then\n"
+            f"{action_lines}\n"
+            f"{_success_tail(' ' * 20)}\n"
+            f"                end if\n"
+            f"            end repeat"
+        )
+
+    # Cross-scan path (legacy / backwards compat). O(N × M × K).
+    action_indent = " " * 28
+    action_lines = "\n".join(action_indent + a for a in actions)
+    return (
+        f"            repeat with msgId in idList\n"
+        f"                set mid to (contents of msgId)\n"
+        f"                repeat with acc in accounts\n"
+        f"                    repeat with mb in mailboxes of acc\n"
+        f"                        set matched to false\n"
+        f"                        try\n"
+        f"                            set msg to first message of mb whose id is mid\n"
+        f"                            set matched to true\n"
+        f"                        end try\n"
+        f"                        if not matched then\n"
+        f"                            try\n"
+        f"                                set midBare to mid\n"
+        f'                                if midBare starts with "<" and midBare ends with ">" then set midBare to text 2 thru -2 of midBare\n'
+        f'                                set msg to first message of mb whose (message id is midBare or message id is ("<" & midBare & ">"))\n'
+        f"                                set matched to true\n"
+        f"                            end try\n"
+        f"                        end if\n"
+        f"                        if matched then\n"
+        f"{action_lines}\n"
+        f"{_success_tail(' ' * 28)}\n"
+        f"                        end if\n"
+        f"                    end repeat\n"
+        f"                end repeat\n"
+        f"            end repeat"
     )
 
 
@@ -437,21 +785,14 @@ class AppleMailConnector:
     minute. Class constant — no public knob; tune by subclassing if
     really needed. See issue #118."""
 
-    _IMAP_CONFIG_TTL_S: float = 300.0
-    """How long a resolved (host, port, email) account config stays cached.
-    Resolving spawns an osascript subprocess, which serializes behind any
-    in-flight Mail.app AppleScript — without this cache, every "pure IMAP"
-    call stalls when Mail.app is busy (observed: ~60s IMAP-path hangs
-    behind an orphaned cross-mailbox get_thread scan). 5 min bounds how
-    long an edit to account settings in Mail.app goes unseen; a stale
-    entry that no longer connects fails into the existing AppleScript
-    fallback (_IMAP_FALLBACK_EXCS) rather than erroring."""
-
     def __init__(
         self,
         timeout: int = 60,
         *,
         imap_pool: ImapConnectionPool | None = None,
+        max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+        max_total_attachment_bytes: int = DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES,
+        max_inline_attachment_bytes: int = DEFAULT_MAX_INLINE_ATTACHMENT_BYTES,
     ) -> None:
         """
         Initialize the Mail connector.
@@ -464,9 +805,19 @@ class AppleMailConnector:
                 across calls, amortizing the ~400 ms TCP+TLS+LOGIN
                 overhead per call. Default None (per-call lifecycle —
                 the v0.5.0 behavior). See issue #75.
+            max_attachment_bytes: Per-attachment byte cap for
+                ``save_attachments`` (disk-fill DoS protection, #236).
+            max_total_attachment_bytes: Aggregate byte cap per
+                ``save_attachments`` call.
+            max_inline_attachment_bytes: Per-attachment byte cap for
+                ``get_attachment_content`` — tighter than the disk-save
+                caps because the bytes are returned inline (#250).
         """
         self.timeout = timeout
         self._imap_pool = imap_pool
+        self.max_attachment_bytes = max_attachment_bytes
+        self.max_total_attachment_bytes = max_total_attachment_bytes
+        self.max_inline_attachment_bytes = max_inline_attachment_bytes
         # Accounts for which we've already logged a WARNING about IMAP failure.
         # Subsequent failures for the same account are demoted to DEBUG per
         # invariant 5 in docs/research/imap-auth-options-decision.md.
@@ -476,9 +827,6 @@ class AppleMailConnector:
         # (the orchestrator goes straight to the AppleScript path without
         # paying the connect/login round trip).
         self._imap_failure_until: dict[str, float] = {}
-        # Per-account (resolved_at_monotonic, (host, port, email)) entries
-        # for _resolve_imap_config. See _IMAP_CONFIG_TTL_S.
-        self._imap_config_cache: dict[str, tuple[float, tuple[str, int, str]]] = {}
 
     def _imap_breaker_open(self, account: str) -> bool:
         """True if a recent IMAP failure on this account is still cooling
@@ -537,14 +885,23 @@ class AppleMailConnector:
             )
             return
 
-        # Non-benign failure: open the breaker, and evict any cached
-        # account config so the retry after breaker expiry re-resolves
-        # from Mail.app instead of reusing a possibly-stale host/login
-        # for the rest of the config TTL.
+        if isinstance(exc, MailMessageNotFoundError):
+            # A reply/forward seed not in the guessed seed_mailbox is a
+            # benign folder-guess miss — AppleScript resolves the seed across
+            # all folders. Opening the breaker would poison every IMAP read
+            # for the account for 30s after a normal reply-to-filed-mail.
+            # (#350)
+            logger.debug(
+                "Seed message not in the guessed mailbox for %s; using "
+                "AppleScript (which resolves across all folders)",
+                account,
+            )
+            return
+
+        # Non-benign failure: open the breaker.
         self._imap_failure_until[account] = (
             time.monotonic() + self._IMAP_BREAKER_TTL_S
         )
-        self._imap_config_cache.pop(account, None)
 
         if account not in self._imap_failures:
             self._imap_failures.add(account)
@@ -552,7 +909,7 @@ class AppleMailConnector:
                 logger.warning(
                     "IMAP login rejected for %r — likely an expired or "
                     "revoked app password. To refresh: "
-                    "`apple-mail-mcp setup-imap --account %s`. The "
+                    "`apple-mail-fast-mcp setup-imap --account %s`. The "
                     "AppleScript fallback is being used in the meantime; "
                     "results will be correct but slower.",
                     account, account,
@@ -627,12 +984,8 @@ class AppleMailConnector:
         except subprocess.TimeoutExpired as e:
             raise MailAppleScriptError(f"Script execution timeout after {self.timeout}s") from e
         except Exception as e:
-            # Re-raise on the common MailError base rather than an enumerated
-            # allowlist. The previous tuple listed four sibling types and
-            # silently omitted MailRuleNotFoundError (and any future MailError),
-            # re-wrapping it as MailAppleScriptError and defeating the
-            # server-layer error_type routing. One base check cannot drift.
-            if isinstance(e, MailError):
+            if isinstance(e, (MailAccountNotFoundError, MailMailboxNotFoundError,
+                            MailMessageNotFoundError, MailAppleScriptError)):
                 raise
             raise MailAppleScriptError(f"Unexpected error: {str(e)}") from e
 
@@ -759,9 +1112,10 @@ class AppleMailConnector:
                 f"rule_index must be 1-based and positive, got {rule_index}"
             )
         enabled_str = "true" if enabled else "false"
-        script = (
+        script = _wrap_with_timeout(
             f'tell application "Mail" to '
-            f"set enabled of rule {rule_index} to {enabled_str}"
+            f"set enabled of rule {rule_index} to {enabled_str}",
+            timeout=self.timeout,
         )
         self._run_applescript(script)
 
@@ -851,8 +1205,8 @@ class AppleMailConnector:
             )
             lines.append("set should move message of newRule to true")
             lines.append(
-                f'set move message of newRule to mailbox "{mb_safe}" '
-                f"of {acct_clause}"
+                f"set move message of newRule to "
+                f'(my resolveMailbox({acct_clause}, "{mb_safe}"))'
             )
         if actions.get("copy_to"):
             mb_safe = escape_applescript_string(
@@ -863,8 +1217,8 @@ class AppleMailConnector:
             )
             lines.append("set should copy message of newRule to true")
             lines.append(
-                f'set copy message of newRule to mailbox "{mb_safe}" '
-                f"of {acct_clause}"
+                f"set copy message of newRule to "
+                f'(my resolveMailbox({acct_clause}, "{mb_safe}"))'
             )
         if actions.get("mark_read"):
             lines.append("set mark read of newRule to true")
@@ -962,7 +1316,10 @@ class AppleMailConnector:
             f"set enabled of newRule to {enabled_str}\n"
             f"return (count of rules) as text"
         )
-        script = f'tell application "Mail"\n{body}\nend tell'
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}" + _wrap_with_timeout(
+            f'tell application "Mail"\n{body}\nend tell',
+            timeout=self.timeout,
+        )
         return int(self._run_applescript(script))
 
     def update_rule(
@@ -1075,10 +1432,11 @@ class AppleMailConnector:
         if len(body_parts) == 1:
             # Only the rule lookup, no actual updates — caller passed nothing.
             return
-        script = (
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}" + _wrap_with_timeout(
             'tell application "Mail"\n'
             + "\n".join(body_parts)
-            + "\nend tell"
+            + "\nend tell",
+            timeout=self.timeout,
         )
         self._run_applescript(script)
 
@@ -1156,90 +1514,100 @@ class AppleMailConnector:
             raise MailRuleNotFoundError(
                 f"rule_index must be 1-based and positive, got {rule_index}"
             )
-        script = (
+        script = _wrap_with_timeout(
             f'tell application "Mail"\n'
             f"    set deletedName to name of rule {rule_index}\n"
             f"    delete rule {rule_index}\n"
             f"    return deletedName\n"
-            f"end tell"
+            f"end tell",
+            timeout=self.timeout,
         )
         return self._run_applescript(script)
 
     def list_mailboxes(self, account: str) -> list[dict[str, Any]]:
         """List all mailboxes for an account.
 
-        Returns full slash-separated paths for nested mailboxes (e.g.,
-        "Investments Current/Hotel DENBT Platte River Property"). These
-        paths can be passed directly to search_messages' mailbox parameter.
-
-        Uses the IMAP path when available (returns accurate hierarchy);
-        falls back to AppleScript with container-walking for full paths.
-
         Args:
-            account: Account name.
+            account: Account name (or UUID).
 
         Returns:
-            List of dicts with keys: name, unread_count.
+            List of dicts with keys ``name`` (leaf), ``path`` (full
+            slash-separated path from account root — usable directly in
+            ``search_messages.mailbox`` / ``move_messages.destination_mailbox``
+            for nested addressing), and ``unread_count``.
+
+            Mail.app exposes mailboxes as a flat list with leaf names; the
+            ``path`` field is computed by walking each mailbox's container
+            chain (see ``_MAILBOX_RESOLVER_HANDLERS``). For top-level
+            mailboxes, ``name == path``. For nested mailboxes (Gmail labels
+            under ``[Gmail]``, user-created folder hierarchies, etc.) the
+            two differ — ``path`` is what ``resolveMailbox`` matches against
+            for unambiguous addressing.
 
         Raises:
             MailAccountNotFoundError: If account doesn't exist.
         """
-        if not self._imap_breaker_open(account):
-            try:
-                return self._list_mailboxes_imap(account)
-            except Exception:
-                pass
-
-        return self._list_mailboxes_applescript(account)
-
-    def _list_mailboxes_imap(self, account: str) -> list[dict[str, Any]]:
-        """IMAP path for list_mailboxes — returns full folder paths."""
-        host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
-        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
-
-        with imap._session() as client:
-            folders = client.list_folders()
-            result: list[dict[str, Any]] = []
-            for _flags, _delimiter, folder_name in folders:
-                if isinstance(folder_name, bytes):
-                    folder_name = folder_name.decode("utf-8", errors="replace")
-                try:
-                    status = client.folder_status(folder_name, ["UNSEEN"])
-                    unread = status.get(b"UNSEEN", 0)
-                except Exception:
-                    unread = 0
-                result.append({"name": folder_name, "unread_count": unread})
-            return result
-
-    def _list_mailboxes_applescript(self, account: str) -> list[dict[str, Any]]:
-        """AppleScript path for list_mailboxes with full path resolution."""
         account_clause = applescript_account_clause(account)
 
         tell_body = f'''
         tell application "Mail"
             set accountRef to {account_clause}
-            set resultData to {{}}
-
-            repeat with mb in mailboxes of accountRef
-                set mbUnread to unread count of mb
-                if mbUnread is missing value then set mbUnread to 0
-                -- Build full path by walking container chain
-                set fullPath to name of mb
-                set currentContainer to container of mb
-                repeat while class of currentContainer is mailbox
-                    set fullPath to (name of currentContainer) & "/" & fullPath
-                    set currentContainer to container of currentContainer
-                end repeat
-                set mbRecord to {{|name|:fullPath, |unread_count|:mbUnread}}
-                set end of resultData to mbRecord
-            end repeat
+            set resultData to my collectMailboxesWithPaths(accountRef)
         end tell
         '''
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = _wrap_as_json_script(
+            tell_body,
+            timeout=self.timeout,
+            handlers=_MAILBOX_RESOLVER_HANDLERS,
+        )
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
+
+    def _get_imap_password_with_fallback(
+        self, account: str, email: str
+    ) -> str:
+        """Look up the IMAP Keychain password, retrying with the alternative
+        account-identifier form (name ↔ UUID) on a NotFound miss. (#243)
+
+        Keychain entries are written by ``setup-imap`` keyed on whatever
+        string the user typed — typically the Mail.app account NAME.
+        Callers (including the MCP layer) may legitimately pass either the
+        name or the UUID per the documented stability story on
+        ``search_messages.account``. This wrapper bridges the gap: try the
+        caller-supplied form first; on NotFound, resolve UUID↔name via
+        ``list_accounts()`` and retry. Other Keychain errors (AccessDenied,
+        generic Keychain errors) are NOT retried — they're explicit signals
+        from macOS and falling back would mask them.
+        """
+        try:
+            return get_imap_password(account, email)
+        except MailKeychainEntryNotFoundError:
+            alt = self._alternative_account_identifier(account)
+            if alt is None:
+                raise
+            return get_imap_password(alt, email)
+
+    def _alternative_account_identifier(self, account: str) -> str | None:
+        """Given a Mail.app account name OR UUID, return the other form.
+
+        Returns ``None`` if the input doesn't match any account or if the
+        account list can't be retrieved. Used by
+        ``_get_imap_password_with_fallback`` to bridge the
+        name-vs-UUID Keychain key mismatch.
+        """
+        try:
+            accounts = self.list_accounts()
+        except Exception:
+            return None
+        for acc in accounts:
+            name = acc.get("name")
+            uid = acc.get("id")
+            if name == account and uid:
+                return cast(str, uid)
+            if uid == account and name:
+                return cast(str, name)
+        return None
 
     def _resolve_imap_config(self, account: str) -> tuple[str, int, str]:
         """Query Mail.app for the IMAP connection details of an account.
@@ -1264,15 +1632,24 @@ class AppleMailConnector:
             matches Mail.app's own behavior in every configuration we've
             seen. (#201)
 
+            Inverse case (#299): an iCloud account whose Apple ID is a
+            *third-party* email (e.g. a gmail-based Apple ID). There
+            `user name` is the gmail address, which iCloud's IMAP server
+            (*.mail.me.com) rejects — it wants the account's own
+            @icloud.com/@me.com address. So for iCloud IMAP hosts, when
+            `user name` is not itself Apple-hosted, we prefer an
+            Apple-hosted entry from `email addresses` (falling back to
+            `user name` when none exists, which keeps the #201 custom-domain
+            case correct).
+
+            An explicit per-account login override (``setup-imap --email``,
+            persisted via ``imap_overrides``) takes precedence over all of the
+            above — the escape hatch for accounts whose correct LOGIN can't be
+            derived from Mail.app's properties (#341).
+
         Raises:
             MailAccountNotFoundError: If the account doesn't exist.
         """
-        cached = self._imap_config_cache.get(account)
-        if cached is not None:
-            resolved_at, config = cached
-            if time.monotonic() - resolved_at < self._IMAP_CONFIG_TTL_S:
-                return config
-
         account_clause = applescript_account_clause(account)
         tell_body = f'''
         tell application "Mail"
@@ -1292,18 +1669,40 @@ class AppleMailConnector:
         email_addresses = cast(list[str], parsed.get("email_addresses") or [])
         user_name = cast(str, parsed.get("user_name") or "")
         email = user_name or (email_addresses[0] if email_addresses else "")
-        # Use .get with safe defaults: accounts without an IMAP server
+        # Read host/port with safe defaults: accounts without an IMAP server
         # (POP / "On My Mac" / mid-configuration) report `server name`/`port`
-        # as `missing value`. An empty host makes the later connect fail with
-        # OSError, which IS in _IMAP_FALLBACK_EXCS → graceful AppleScript
-        # fallback, rather than a KeyError that would escape the net.
-        config = (
-            cast(str, parsed.get("host") or ""),
+        # as `missing value`, which drops those keys from the serialized
+        # record. An empty host then fails the later connect with OSError
+        # (the graceful-fallback path) rather than KeyError-ing here.
+        host = cast(str, parsed.get("host") or "")
+        # (#299) iCloud IMAP (*.mail.me.com) authenticates the account's own
+        # Apple-hosted address, not a third-party Apple ID. When `user name`
+        # is a non-Apple email (e.g. a gmail-based Apple ID), prefer an
+        # @icloud.com/@me.com/@mac.com entry from `email addresses`. Falls
+        # back to `user name` when none exists — preserving the #201
+        # custom-domain case (no Apple-hosted alias present → the Apple ID
+        # itself is the login).
+        if is_icloud_imap_host(host) and not is_apple_hosted_address(email):
+            apple_alias = next(
+                (a for a in email_addresses if is_apple_hosted_address(a)),
+                None,
+            )
+            if apple_alias:
+                email = apple_alias
+        # (#341) An explicit per-account login override (set via
+        # `setup-imap --email`) wins over everything Mail.app reports. It's
+        # the escape hatch for accounts whose correct IMAP LOGIN can't be
+        # derived from the account properties — e.g. an iCloud account with a
+        # third-party Apple ID and an empty `email addresses` list, where the
+        # #299 apple-alias rule has nothing to choose from.
+        override = get_login_override(account)
+        if override:
+            email = override
+        return (
+            host,
             cast(int, parsed.get("port") or 0),
             email,
         )
-        self._imap_config_cache[account] = (time.monotonic(), config)
-        return config
 
     def _imap_search(
         self,
@@ -1337,7 +1736,7 @@ class AppleMailConnector:
             MailAccountNotFoundError: Mail.app doesn't know this account.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.search_messages(
             mailbox=mailbox,
@@ -1364,6 +1763,7 @@ class AppleMailConnector:
         is_flagged: bool | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        received_within_hours: int | None = None,
         has_attachment: bool | None = None,
         limit: int | None = None,
         include_attachments: bool = False,
@@ -1397,6 +1797,24 @@ class AppleMailConnector:
         """
         body_search = bool(body_contains or text_contains)
 
+        # #230: received_within_hours is a hour-granular relative cutoff that
+        # composes with date_from. Validate up front (so both IMAP and AS
+        # paths see a consistent error), then desugar to date_from for the
+        # IMAP path's day-granular SINCE pre-filter and post-filter results
+        # to enforce hour precision. The AS path receives the raw param and
+        # embeds an (current date) - (N * hours) clause that Mail.app
+        # evaluates server-side — no post-filter needed there.
+        cutoff_dt: _datetime | None = None
+        if received_within_hours is not None:
+            if not isinstance(received_within_hours, int) or received_within_hours <= 0:
+                raise ValueError(
+                    f"received_within_hours must be > 0, got: {received_within_hours!r}"
+                )
+            cutoff_dt = _now() - _timedelta(hours=received_within_hours)
+            cutoff_date_iso = cutoff_dt.date().isoformat()
+            if date_from is None or cutoff_date_iso > date_from:
+                date_from = cutoff_date_iso
+
         if not self._imap_breaker_open(account):
             try:
                 result = self._imap_search(
@@ -1414,6 +1832,8 @@ class AppleMailConnector:
                     body_contains,
                     text_contains,
                 )
+                if cutoff_dt is not None:
+                    result = _filter_imap_results_to_cutoff(result, cutoff_dt)
                 self._imap_clear_breaker(account)
                 return result
             except _IMAP_FALLBACK_EXCS as exc:
@@ -1428,7 +1848,7 @@ class AppleMailConnector:
                 f"AppleScript body search can take minutes on large "
                 f"mailboxes (measured 148s for 100 cold-cache messages on "
                 f"a 47k-message Gmail INBOX). Run "
-                f"`apple-mail-mcp setup-imap --account {account!r}` for "
+                f"`apple-mail-fast-mcp setup-imap --account {account!r}` for "
                 f"sub-second IMAP body search."
             )
 
@@ -1448,6 +1868,7 @@ class AppleMailConnector:
                 include_attachments,
                 body_contains,
                 text_contains,
+                received_within_hours=received_within_hours,
             )
         finally:
             elapsed = time.perf_counter() - start
@@ -1475,6 +1896,7 @@ class AppleMailConnector:
         include_attachments: bool = False,
         body_contains: str | None = None,
         text_contains: str | None = None,
+        received_within_hours: int | None = None,
     ) -> list[dict[str, Any]]:
         """AppleScript path for search_messages (the universal baseline).
 
@@ -1505,7 +1927,7 @@ class AppleMailConnector:
             MailMailboxNotFoundError: If mailbox doesn't exist.
         """
         account_clause = applescript_account_clause(account)
-        mailbox_ref = _applescript_mailbox_ref(mailbox, account_clause)
+        mailbox_safe = escape_applescript_string(sanitize_input(mailbox))
 
         # Build per-message AppleScript IF filters instead of a `whose` clause.
         #
@@ -1553,30 +1975,23 @@ class AppleMailConnector:
                 f'then set includeThis to false'
             )
 
-        if date_from is not None:
-            if not _ISO_DATE_RE.match(date_from):
-                raise ValueError(
-                    f"date_from must be ISO 8601 YYYY-MM-DD, got: {date_from!r}"
-                )
-            filter_checks.append(
-                f'if (date received of msg) < (date "{date_from}") '
-                f'then set includeThis to false'
-            )
+        date_preamble, date_filter_clauses = _build_date_filter_clauses(
+            date_from, date_to
+        )
+        filter_checks.extend(date_filter_clauses)
 
-        if date_to is not None:
-            if not _ISO_DATE_RE.match(date_to):
-                raise ValueError(
-                    f"date_to must be ISO 8601 YYYY-MM-DD, got: {date_to!r}"
-                )
-            # Upper bound is exclusive of the day AFTER date_to, so the full
-            # day of date_to is included.
-            next_day = (
-                _date.fromisoformat(date_to) + _timedelta(days=1)
-            ).isoformat()
-            filter_checks.append(
-                f'if (date received of msg) >= (date "{next_day}") '
-                f'then set includeThis to false'
-            )
+        # `received_within_hours` is handled OUTSIDE the per-message filter
+        # block (#242): a `set cutoffDate to ...` preamble is hoisted above
+        # the loop (computed once, not per message), and an `if ... then
+        # exit repeat` short-circuit is spliced into the loop body before
+        # the filter block. This is sound only because the loop iterates
+        # newest-first (see the `repeat with i from 1 to total` comment
+        # below) — once a message has date < cutoff, every subsequent
+        # iteration's message is also < cutoff, so we can bail out of the
+        # entire scan.
+        cutoff_preamble, cutoff_exit_clause = (
+            _build_received_within_hours_short_circuit(received_within_hours)
+        )
 
         if has_attachment is True:
             filter_checks.append(
@@ -1618,15 +2033,21 @@ class AppleMailConnector:
         # Render filter checks each on their own line, indented for the loop.
         filter_block = "\n                ".join(filter_checks) if filter_checks else ""
 
-        # Per-match limit short-circuits the loop. With no limit, we collect
-        # everything (newest-first) — same observable behavior as before
-        # except for ordering (was oldest-first).
+        # Per-match limit short-circuits the loop once enough hits accrue.
+        # Iteration is newest-first (#242): Mail.app exposes `item 1 of
+        # msgs` as the newest message and `item total of msgs` as the
+        # oldest, so the `repeat with i from 1 to total` form below visits
+        # newest first and naturally bounds the scan to ~limit iterations
+        # for limit-bounded queries.
         effective_limit = str(limit) if limit else "999999999"
 
         if include_attachments:
-            attachments_clause = f'''
-                    set attList to {{}}
-                    repeat with att in mail attachments of msg{_attachment_record_as("attList")}                    end repeat'''
+            attachments_clause = '''
+                    set attList to {}
+                    repeat with att in mail attachments of msg
+                        set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
+                        set end of attList to attRecord
+                    end repeat'''
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
@@ -1634,15 +2055,19 @@ class AppleMailConnector:
 
         tell_body = f'''
         tell application "Mail"
-            set mailboxRef to {mailbox_ref}
+            set accountRef to {account_clause}
+            set mailboxRef to my resolveMailbox(accountRef, "{mailbox_safe}")
             set msgs to messages of mailboxRef
             set total to count of msgs
+            {date_preamble}
+            {cutoff_preamble}
 
             set resultData to {{}}
             set matchCount to 0
-            repeat with i from total to 1 by -1
+            repeat with i from 1 to total
                 if matchCount >= {effective_limit} then exit repeat
                 set msg to item i of msgs
+                {cutoff_exit_clause}
                 set includeThis to true
                 {filter_block}
                 if includeThis then{attachments_clause}
@@ -1654,7 +2079,11 @@ class AppleMailConnector:
         end tell
         '''
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = _wrap_as_json_script(
+            tell_body,
+            timeout=self.timeout,
+            handlers=_MAILBOX_RESOLVER_HANDLERS,
+        )
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
@@ -1725,8 +2154,7 @@ class AppleMailConnector:
                 # fall through to AppleScript
 
         return self._get_message_applescript(
-            message_id, include_content, include_attachments,
-            account=account, mailbox=mailbox,
+            message_id, include_content, include_attachments
         )
 
     def _imap_get_message(
@@ -1745,7 +2173,7 @@ class AppleMailConnector:
         caller (get_message) catches and falls back.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.get_message(
             message_id,
@@ -1760,21 +2188,14 @@ class AppleMailConnector:
         message_id: str,
         include_content: bool,
         include_attachments: bool = False,
-        *,
-        account: str | None = None,
-        mailbox: str | None = None,
     ) -> dict[str, Any]:
-        """AppleScript fallback for get_message.
+        """AppleScript fallback for get_message — iterates account × mailbox.
 
-        When *account* and *mailbox* are both provided the scan narrows
-        to a single mailbox (fast). Otherwise falls back to a cross-scan
-        over all accounts × mailboxes (slow, see issue #72).
-
-        Handles both Mail.app numeric ids (``whose id is``) and RFC 5322
-        Message-IDs (``whose message id is``), so callers coming from the
-        IMAP path — which returns RFC ids — degrade gracefully.
+        Slow on accounts with many mailboxes (see issue #72). Callers
+        with a known account+mailbox should provide them to take the
+        IMAP path instead.
         """
-        whose_clause = _whose_message_clause(message_id)
+        message_id_safe = escape_applescript_string(sanitize_input(message_id))
 
         content_clause = (
             'set msgContent to content of msg'
@@ -1783,60 +2204,28 @@ class AppleMailConnector:
         )
 
         if include_attachments:
-            attachments_clause = f'''
-                        set attList to {{}}
-                        repeat with att in mail attachments of msg{_attachment_record_as("attList")}                        end repeat
+            attachments_clause = '''
+                        set attList to {}
+                        repeat with att in mail attachments of msg
+                            set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
+                            set end of attList to attRecord
+                        end repeat
 '''
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
             attachments_field = ""
 
-        # Single-brace record. `set resultData to {result_record}` already
-        # interpolates this value verbatim, so result_record must itself be a
-        # RECORD `{|id|:...}` — not `{{...}}`, which is an AppleScript
-        # list-of-one-record and serializes to a JSON array. That array was
-        # the real cause of the original "get_message returned a list" failure
-        # (masked first as a `.get` crash, then by the degenerate-result
-        # guard) — it only surfaces when the AppleScript path actually runs.
-        result_record = (
-            '{|id|:(id of msg as text), |rfc_message_id|:(message id of msg),'
-            ' |subject|:(subject of msg), |sender|:(sender of msg),'
-            ' |date_received|:(date received of msg as text),'
-            ' |read_status|:(read status of msg),'
-            ' |flagged|:(flagged status of msg),'
-            f' |content|:msgContent{attachments_field}}}'
-        )
-
-        if account is not None and mailbox is not None:
-            acct_clause = applescript_account_clause(account)
-            mb_ref = _applescript_mailbox_ref(mailbox, acct_clause)
-            tell_body = f'''
-        tell application "Mail"
-            set resultData to missing value
-            try
-                set msg to first message of {mb_ref} {whose_clause}
-                {content_clause}
-{attachments_clause}
-                set resultData to {result_record}
-            end try
-
-            if resultData is missing value then
-                error "Can't get message: not found"
-            end if
-        end tell
-        '''
-        else:
-            tell_body = f'''
+        tell_body = f'''
         tell application "Mail"
             set resultData to missing value
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb {whose_clause}
+                        set msg to first message of mb whose id is "{message_id_safe}"
                         {content_clause}
 {attachments_clause}
-                        set resultData to {result_record}
+                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent{attachments_field}}}
                         exit repeat
                     end try
                 end repeat
@@ -1851,18 +2240,7 @@ class AppleMailConnector:
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        parsed = parse_applescript_json(result)
-        if not isinstance(parsed, dict):
-            # Defensive: a degenerate/empty AppleScript record serializes to
-            # an empty JSON array, because AppleScript `{}` is ambiguous and
-            # ASObjC bridges an empty record to NSArray (not NSDictionary).
-            # Returning that list would break every dict-expecting caller
-            # (e.g. `.get(...)` → AttributeError). Treat it as not-found.
-            raise MailMessageNotFoundError(
-                f"Message {message_id!r} not found "
-                f"(degenerate AppleScript result)."
-            )
-        return parsed
+        return cast(dict[str, Any], parse_applescript_json(result))
 
     def auto_template_vars(self, message_id: str | None) -> dict[str, str]:
         """Build the auto-fill variable dict for render_template.
@@ -1929,16 +2307,17 @@ class AppleMailConnector:
             for mid in message_ids
         )
 
-        script = f"""
-        tell application "Mail"
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+            f"""tell application "Mail"
             set idList to {{{id_list}}}
             set updateCount to 0
 
 {repeat_block}
 
             return updateCount
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
@@ -2025,90 +2404,41 @@ class AppleMailConnector:
         caller (get_attachments) catches and falls back.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.get_attachments(message_id, mailbox=mailbox)
-
-    def _get_attachments_applescript(
-        self, message_id: str
-    ) -> list[dict[str, Any]]:
-        """AppleScript fallback for get_attachments — iterates account ×
-        mailbox to locate the message, then enumerates attachments via
-        Mail.app's model layer. Slow on accounts with many mailboxes;
-        also subject to known silent-failure cases (see issue #73).
-        Callers with a known account+mailbox should provide them to take
-        the IMAP path instead.
-        """
-        whose_clause = _whose_message_clause(message_id)
-
-        tell_body = f'''
-        tell application "Mail"
-            set resultData to missing value
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set msg to first message of mb {whose_clause}
-                        set attList to mail attachments of msg
-
-                        set resultData to {{}}
-                        repeat with att in attList{_attachment_record_as("resultData")}                        end repeat
-                        exit repeat
-                    end try
-                end repeat
-                if resultData is not missing value then exit repeat
-            end repeat
-
-            if resultData is missing value then
-                error "Can't get message: not found"
-            end if
-        end tell
-        '''
-
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
-        result = self._run_applescript(script)
-        return cast(list[dict[str, Any]], parse_applescript_json(result))
-
-    _MAX_ATTACHMENT_READ_BYTES = 25 * 1024 * 1024  # 25 MB
 
     def get_attachment_content(
         self,
         message_id: str,
-        attachment_index: int = 0,
+        attachment_index: int,
         *,
         account: str | None = None,
         mailbox: str | None = None,
     ) -> dict[str, Any]:
-        """Read attachment content from a message without saving to disk.
+        """Return a single attachment's bytes inline (no caller-facing disk).
 
-        Tries the IMAP path first when both ``account`` and ``mailbox`` are
-        supplied and the account's circuit breaker is closed. IMAP fetches
-        the attachment bytes straight from the server, so it works even when
-        Mail.app has not downloaded the attachment locally — the AppleScript
-        ``save`` raises ``-10000`` on an undownloaded placeholder. Falls back
-        to AppleScript on any IMAP connection/auth failure, and whenever no
-        account/mailbox hint is given.
+        Dispatch mirrors :meth:`get_attachments`: the IMAP path is used when
+        both ``account`` and ``mailbox`` are supplied and the breaker is
+        closed (it fetches the raw message and decodes the part — never
+        touches disk), falling back to AppleScript on any IMAP failure. The
+        AppleScript path can't read attachment bytes directly, so it saves
+        the selected attachment to a private temp dir, reads it, and deletes
+        it (the temp file is internal — no caller-managed file). (#250)
 
-        Identifier semantics mirror :meth:`get_message`: the IMAP path
-        matches the RFC 5322 Message-ID, the AppleScript path matches
-        Mail.app's numeric id. Forward the same ``account`` + ``mailbox``
-        you got from ``search_messages`` to stay on the fast,
-        download-independent IMAP path.
+        ``attachment_index`` is 0-based and follows the message's MIME
+        attachment order — the same order ``get_attachments`` /
+        ``get_messages(include_attachments=True)`` report. Pass the same
+        ``account`` / ``mailbox`` you read the message with so the path (and
+        thus ordering) stays consistent.
 
-        Args:
-            message_id: Message ID. RFC 5322 form for the IMAP path,
-                Mail.app numeric id for the AppleScript path.
-            attachment_index: Zero-based index of the attachment to read.
-            account: Mail.app account name. With ``mailbox``, enables IMAP.
-            mailbox: Folder to look in for the IMAP path.
-
-        Returns:
-            Dict with keys: name, mime_type, size, content (text or
-            base64), is_binary.
+        Returns ``{"name", "mime_type", "size", "payload": bytes}``; the
+        server layer encodes ``payload`` as text or base64.
 
         Raises:
-            MailMessageNotFoundError: If the message doesn't exist.
-            ValueError: If attachment_index is out of range or negative,
-                or the attachment exceeds the size limit.
+            MailMessageNotFoundError: message not found via either path.
+            MailAttachmentIndexError: ``attachment_index`` out of range.
+            MailAttachmentTooLargeError: attachment exceeds the inline cap.
         """
         if (
             account is not None
@@ -2140,163 +2470,150 @@ class AppleMailConnector:
         message_id: str,
         attachment_index: int,
     ) -> dict[str, Any]:
-        """Run get_attachment_content through the IMAP path. Mirrors
-        :meth:`_imap_get_message` — propagates fallback-triggering
-        exceptions unchanged so the caller can degrade to AppleScript.
+        """IMAP path for get_attachment_content: fetch the raw message and
+        decode the selected attachment part. Reuses ``fetch_raw_message`` +
+        ``parse_original_message`` (the same machinery the clean
+        reply/forward draft path uses), so no new IMAP byte-fetch code.
+
+        Propagates ``_IMAP_FALLBACK_EXCS`` unchanged for the caller's
+        fallback.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
-        return imap.get_attachment_content(
-            message_id,
-            attachment_index=attachment_index,
-            mailbox=mailbox,
-            max_bytes=self._MAX_ATTACHMENT_READ_BYTES,
-        )
+        raw = imap.fetch_raw_message(message_id, mailbox)
+        atts = parse_original_message(raw).attachments
+        if not 0 <= attachment_index < len(atts):
+            raise MailAttachmentIndexError(
+                f"attachment_index {attachment_index} out of range: message "
+                f"has {len(atts)} attachment(s)."
+            )
+        filename, maintype, subtype, payload = atts[attachment_index]
+        self._enforce_inline_cap(len(payload), filename)
+        return {
+            "name": filename,
+            "mime_type": f"{maintype}/{subtype}",
+            "size": len(payload),
+            "payload": payload,
+        }
 
     def _get_attachment_content_applescript(
-        self,
-        message_id: str,
-        attachment_index: int = 0,
+        self, message_id: str, attachment_index: int
     ) -> dict[str, Any]:
+        """AppleScript path: enumerate metadata, validate index + size, then
+        save the one attachment to a temp dir and read it back."""
+        attachments = self._get_attachments_applescript(message_id)
+        if not 0 <= attachment_index < len(attachments):
+            raise MailAttachmentIndexError(
+                f"attachment_index {attachment_index} out of range: message "
+                f"has {len(attachments)} attachment(s)."
+            )
+        meta = attachments[attachment_index]
+        name = str(meta.get("name") or "")
+        mime_type = str(meta.get("mime_type") or "application/octet-stream")
+        # Pre-check the reported size so an oversize attachment is rejected
+        # before we spend an AppleScript save. (A post-read recheck below
+        # catches a Mail-under-reported size.)
+        self._enforce_inline_cap(int(meta.get("size") or 0), name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / (sanitize_filename(name) or "attachment")
+            self._save_one_attachment_applescript(
+                message_id, attachment_index + 1, dest
+            )
+            if not dest.is_file():
+                raise MailMessageNotFoundError(
+                    f"Could not read attachment {attachment_index} of "
+                    f"message {message_id!r}."
+                )
+            payload = dest.read_bytes()
+        self._enforce_inline_cap(len(payload), name)
+        return {
+            "name": name,
+            "mime_type": mime_type,
+            "size": len(payload),
+            "payload": payload,
+        }
+
+    def _save_one_attachment_applescript(
+        self, message_id: str, one_based_index: int, dest_path: Path
+    ) -> None:
+        """Save a single attachment (1-based AppleScript index) to
+        ``dest_path`` via Mail.app's ``save`` command. Factored out so the
+        byte-read path is unit-testable without a real Mail.app save.
         """
-        Read attachment content from a message without saving to disk.
-
-        Uses a temporary directory with a safe filename to save the
-        attachment via AppleScript, reads the content into memory, then
-        cleans up. This avoids needing a permanent disk write for content
-        inspection workflows.
-
-        Args:
-            message_id: Message ID (Mail.app internal id)
-            attachment_index: Zero-based index of attachment to read
-
-        Returns:
-            Dict with keys: name (str), mime_type (str), size (int),
-            content (str — decoded text or base64 for binary),
-            is_binary (bool).
-
-        Raises:
-            MailMessageNotFoundError: If message doesn't exist
-            ValueError: If attachment_index is out of range or negative,
-                or if the attachment exceeds the size limit.
-        """
-        import base64
-        import tempfile
-
-        if attachment_index < 0:
-            raise ValueError("attachment_index must be non-negative")
-
-        whose_clause = _whose_message_clause(message_id)
-        as_index = attachment_index + 1  # AppleScript is 1-based
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            dir_safe = escape_applescript_string(tmp_dir)
-            # Use a fixed safe filename to prevent path traversal via
-            # attacker-controlled attachment names from email.
-            safe_save_name = f"_att_{as_index}"
-
-            script = f"""
-            tell application "Mail"
-                set foundMsg to missing value
-                repeat with acc in accounts
-                    repeat with mb in mailboxes of acc
-                        try
-                            set foundMsg to first message of mb {whose_clause}
-                            exit repeat
-                        end try
-                    end repeat
-                    if foundMsg is not missing value then exit repeat
+        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        dest_safe = escape_applescript_string(str(dest_path))
+        script = _wrap_with_timeout(
+            f"""tell application "Mail"
+            repeat with acc in accounts
+                repeat with mb in mailboxes of acc
+                    try
+                        set msg to first message of mb whose id is "{message_id_safe}"
+                        set theAtts to mail attachments of msg
+                        save (item {one_based_index} of theAtts) in (POSIX file "{dest_safe}")
+                        return "OK"
+                    end try
                 end repeat
+            end repeat
+            error "Message not found"
+        end tell""",
+            timeout=self.timeout,
+        )
+        self._run_applescript(script)
 
-                if foundMsg is missing value then
-                    error "Can't get message: not found"
-                end if
-
-                set attList to mail attachments of foundMsg
-                if (count of attList) < {as_index} then
-                    error "Attachment index out of range"
-                end if
-
-                set att to item {as_index} of attList
-                set attName to name of att
-                try
-                    set attMime to MIME type of att
-                on error
-                    set attMime to ""
-                end try
-                try
-                    set attSize to file size of att
-                on error
-                    set attSize to 0
-                end try
-                save att in POSIX file "{dir_safe}/{safe_save_name}"
-
-                return attName & "|||" & attMime & "|||" & (attSize as text)
-            end tell
-            """
-
-            try:
-                result = self._run_applescript(script)
-            except MailAppleScriptError as e:
-                if "Attachment index out of range" in str(e):
-                    raise ValueError("Attachment index out of range") from e
-                raise
-
-            parts = result.rsplit("|||", maxsplit=2)
-            if len(parts) != 3:
-                raise MailAppleScriptError(
-                    f"Unexpected AppleScript output: {result}"
-                )
-
-            att_name, mime_type, size_str = parts
-            saved_path = Path(tmp_dir) / safe_save_name
-
-            # Check size before reading into memory
-            try:
-                att_size = int(size_str.strip())
-            except (ValueError, AttributeError):
-                att_size = 0
-            if att_size > self._MAX_ATTACHMENT_READ_BYTES:
-                raise ValueError(
-                    f"Attachment too large ({att_size // (1024*1024)} MB); "
-                    f"use save_attachments to download to disk instead"
-                )
-
-            if not saved_path.exists():
-                raise MailAppleScriptError(
-                    "AppleScript save completed but file not found at "
-                    f"expected path: {saved_path}"
-                )
-
-            content_bytes = saved_path.read_bytes()
-            if len(content_bytes) > self._MAX_ATTACHMENT_READ_BYTES:
-                raise ValueError(
-                    f"Attachment content exceeds size limit "
-                    f"({len(content_bytes) // (1024*1024)} MB); "
-                    f"use save_attachments to download to disk instead"
-                )
-
-            is_text = mime_type.startswith("text/") or att_name.endswith(
-                (".txt", ".csv", ".md", ".json", ".xml", ".html", ".log")
+    def _enforce_inline_cap(self, size: int, name: str) -> None:
+        """Raise MailAttachmentTooLargeError when ``size`` exceeds the inline
+        cap, pointing the caller at save_attachments for large files."""
+        if size > self.max_inline_attachment_bytes:
+            raise MailAttachmentTooLargeError(
+                f"Attachment {name!r} is {size} bytes, over the "
+                f"{self.max_inline_attachment_bytes}-byte inline limit for "
+                f"get_attachment_content. Use save_attachments for large "
+                f"files."
             )
 
-            if is_text:
-                try:
-                    content = content_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    content = base64.b64encode(content_bytes).decode("ascii")
-                    is_text = False
-            else:
-                content = base64.b64encode(content_bytes).decode("ascii")
+    def _get_attachments_applescript(
+        self, message_id: str
+    ) -> list[dict[str, Any]]:
+        """AppleScript fallback for get_attachments — iterates account ×
+        mailbox to locate the message, then enumerates attachments via
+        Mail.app's model layer. Slow on accounts with many mailboxes;
+        also subject to known silent-failure cases (see issue #73).
+        Callers with a known account+mailbox should provide them to take
+        the IMAP path instead.
+        """
+        message_id_safe = escape_applescript_string(sanitize_input(message_id))
 
-            return {
-                "name": att_name,
-                "mime_type": mime_type,
-                "size": int(size_str) if size_str.isdigit() else len(content_bytes),
-                "content": content,
-                "is_binary": not is_text,
-            }
+        tell_body = f'''
+        tell application "Mail"
+            set resultData to missing value
+            repeat with acc in accounts
+                repeat with mb in mailboxes of acc
+                    try
+                        set msg to first message of mb whose id is "{message_id_safe}"
+                        set attList to mail attachments of msg
+
+                        set resultData to {{}}
+                        repeat with att in attList
+                            set attRecord to {{|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}}
+                            set end of resultData to attRecord
+                        end repeat
+                        exit repeat
+                    end try
+                end repeat
+                if resultData is not missing value then exit repeat
+            end repeat
+
+            if resultData is missing value then
+                error "Can't get message: not found"
+            end if
+        end tell
+        '''
+
+        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        result = self._run_applescript(script)
+        return cast(list[dict[str, Any]], parse_applescript_json(result))
 
     def get_thread(self, message_id: str) -> list[dict[str, Any]]:
         """Return all messages in the thread containing ``message_id``.
@@ -2354,7 +2671,7 @@ class AppleMailConnector:
         """
         account = cast(str, anchor["account"])
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.find_thread_members(
             anchor_rfc_message_id=cast(str, anchor["rfc_message_id"]),
@@ -2377,7 +2694,7 @@ class AppleMailConnector:
         and falls back via _IMAP_FALLBACK_EXCS.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.move_messages(
             message_ids=message_ids,
@@ -2433,7 +2750,7 @@ class AppleMailConnector:
         (_try_imap_delete) catches and falls back via _IMAP_FALLBACK_EXCS.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.delete_messages(
             message_ids=message_ids,
@@ -2485,7 +2802,7 @@ class AppleMailConnector:
         unchanged.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.set_read_status(
             message_ids=message_ids,
@@ -2609,7 +2926,7 @@ class AppleMailConnector:
         exceptions unchanged.
         """
         host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
+        password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.set_flagged_status(
             message_ids=message_ids,
@@ -2742,11 +3059,6 @@ class AppleMailConnector:
         Net effect of this helper: 1 call + 1 if-check at the call
         site instead of 3 of each.
         """
-        # All-numeric ids can't be resolved by the IMAP HEADER Message-ID
-        # search; trying IMAP would return 0 and mask the AppleScript fallback
-        # where numeric ids DO match (P0-3). Fall through immediately.
-        if not _any_rfc_message_id(message_ids):
-            return None
         for fast_path in (
             self._maybe_imap_move_only,
             self._maybe_imap_read_only,
@@ -2803,14 +3115,14 @@ class AppleMailConnector:
         """
         from .utils import parse_rfc822_ids
 
-        whose_clause = _whose_message_clause(message_id)
+        message_id_safe = escape_applescript_string(sanitize_input(message_id))
         anchor_body = f'''
         tell application "Mail"
             set anchorResult to missing value
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb {whose_clause}
+                        set msg to first message of mb whose id is "{message_id_safe}"
                         set anchorInReplyTo to ""
                         set anchorRefs to ""
                         try
@@ -2820,11 +3132,7 @@ class AppleMailConnector:
                                 if hname is "references" then set anchorRefs to (content of h)
                             end repeat
                         end try
-                        set anchorSubject to subject of msg
-                        if anchorSubject is missing value then set anchorSubject to ""
-                        set anchorMsgId to message id of msg
-                        if anchorMsgId is missing value then set anchorMsgId to ""
-                        set resultData to {{|account|:(name of acc), |rfc_message_id|:anchorMsgId, |subject|:anchorSubject, |in_reply_to|:anchorInReplyTo, |references_raw|:anchorRefs}}
+                        set resultData to {{|account|:(name of acc), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |in_reply_to|:anchorInReplyTo, |references_raw|:anchorRefs}}
                         set anchorResult to resultData
                         exit repeat
                     end try
@@ -2840,16 +3148,7 @@ class AppleMailConnector:
 
         anchor_script = _wrap_as_json_script(anchor_body, timeout=self.timeout)
         anchor_raw = self._run_applescript(anchor_script)
-        parsed = parse_applescript_json(anchor_raw)
-        if not isinstance(parsed, dict):
-            # Degenerate/empty AppleScript record serializes to `[]`; treat
-            # as not-found rather than KeyError-ing on bracket access below
-            # (same guard as _get_message_applescript).
-            raise MailMessageNotFoundError(
-                f"Thread anchor {message_id!r} not found "
-                f"(degenerate AppleScript result)."
-            )
-        raw = parsed
+        raw = cast(dict[str, Any], parse_applescript_json(anchor_raw))
 
         in_reply_to_raw = raw.get("in_reply_to") or ""
         references_raw = raw.get("references_raw") or ""
@@ -2990,34 +3289,35 @@ class AppleMailConnector:
         *,
         account: str | None = None,
         mailbox: str | None = None,
-    ) -> int:
+    ) -> dict[str, Any]:
         """
         Save attachments from a message to a directory.
 
-        Tries the IMAP path first when both ``account`` and ``mailbox`` are
-        supplied and the account's circuit breaker is closed. IMAP fetches
-        the attachment bytes straight from the server, so it works even when
-        Mail.app has not downloaded the attachment locally (the AppleScript
-        ``save`` raises ``-10000`` on an undownloaded placeholder). Falls
-        back to AppleScript on any IMAP connection/auth failure, and whenever
-        no account/mailbox hint is given.
+        Per-attachment and aggregate byte caps (``max_attachment_bytes`` /
+        ``max_total_attachment_bytes``) guard against disk-fill DoS from a
+        hostile oversized attachment (#236): oversized attachments are
+        pre-checked out before saving, and a post-write net deletes any file
+        that still lands over the cap (covering sizes Mail under-reports for
+        not-yet-downloaded attachments).
 
-        Identifier semantics mirror :meth:`get_attachment_content`: the IMAP
-        path matches the RFC 5322 Message-ID (what ``search_messages``
-        returns), the AppleScript path matches Mail.app's numeric id. Forward
-        the same ``account`` + ``mailbox`` you got from ``search_messages``
-        to stay on the fast, download-independent IMAP path.
+        IMAP fast path (#371): when ``account`` + ``mailbox`` are supplied,
+        the message is fetched once over IMAP and its attachment bytes are
+        written straight to disk — avoiding the O(accounts × mailboxes)
+        AppleScript cross-scan (whose unindexed ``message id`` lookup is
+        ~20s/mailbox and times out on Gmail's many labels). Falls back to
+        AppleScript transparently when IMAP isn't configured. Attachment
+        ordering matches ``get_attachment_content`` (same fetch+parse path).
 
         Args:
-            message_id: Message ID. RFC 5322 form for the IMAP path,
-                Mail.app numeric id for the AppleScript path.
+            message_id: Message ID
             save_directory: Directory to save attachments to
             attachment_indices: Indices of attachments to save (None = all)
-            account: Mail.app account name. With ``mailbox``, enables IMAP.
-            mailbox: Folder to look in for the IMAP path.
 
         Returns:
-            Number of attachments saved
+            ``{"saved": int, "rejected": list[dict]}`` — count actually
+            written, and per-rejection records ``{name, size, reason}`` where
+            reason is ``per_attachment_cap`` / ``aggregate_cap`` (pre-check) or
+            ``*_postwrite`` (post-write net).
 
         Raises:
             FileNotFoundError: If save directory doesn't exist
@@ -3040,88 +3340,6 @@ class AppleMailConnector:
         except (RuntimeError, OSError) as e:
             raise ValueError(f"Invalid save directory: {e}") from e
 
-        if (
-            account is not None
-            and mailbox is not None
-            and not self._imap_breaker_open(account)
-        ):
-            try:
-                result = self._imap_save_attachments(
-                    account=account,
-                    mailbox=mailbox,
-                    message_id=message_id,
-                    save_directory=save_directory,
-                    attachment_indices=attachment_indices,
-                )
-                self._imap_clear_breaker(account)
-                return result
-            except _IMAP_FALLBACK_EXCS as exc:
-                self._log_imap_fallback(account, exc)
-                # fall through to AppleScript
-
-        return self._save_attachments_applescript(
-            message_id, save_directory, attachment_indices
-        )
-
-    def _imap_save_attachments(
-        self,
-        *,
-        account: str,
-        mailbox: str,
-        message_id: str,
-        save_directory: Path,
-        attachment_indices: list[int] | None,
-    ) -> int:
-        """Save attachments through the IMAP path.
-
-        Enumerates attachment names via ``get_attachments``, computes
-        sanitized, contained target paths with
-        :func:`_compute_attachment_save_targets` (the same CWE-22 guard the
-        AppleScript path uses), then fetches each selected attachment's raw
-        bytes via IMAP and writes them to disk. Propagates
-        fallback-triggering exceptions unchanged so the caller can degrade to
-        AppleScript. ``save_directory`` must already be resolved.
-        """
-        host, port, email = self._resolve_imap_config(account)
-        password = get_imap_password(account, email)
-        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
-
-        # Names AND bytes come from one enumeration/fetch so a name can never
-        # be paired with another part's bytes (a BODYSTRUCTURE enumeration +
-        # per-index byte fetches could misalign — the two walkers' attachment
-        # definitions can differ). _compute_attachment_save_targets applies the
-        # CWE-22 containment + sanitized basenames; its 1-based indices map
-        # straight back into the same payloads list.
-        payloads = imap.get_attachment_payloads(
-            message_id,
-            mailbox=mailbox,
-            max_bytes=self._MAX_ATTACHMENT_READ_BYTES,
-        )
-        targets = _compute_attachment_save_targets(
-            [name for name, _ in payloads],
-            save_directory,
-            attachment_indices,
-        )
-        if not targets:
-            return 0
-
-        saved = 0
-        for one_based_idx, target in targets:
-            _name, raw = payloads[one_based_idx - 1]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(raw)
-            saved += 1
-        return saved
-
-    def _save_attachments_applescript(
-        self,
-        message_id: str,
-        save_directory: Path,
-        attachment_indices: list[int] | None = None,
-    ) -> int:
-        """Save attachments via AppleScript. ``save_directory`` must already
-        be validated and resolved by the caller (:meth:`save_attachments`).
-        """
         # Enumerate attachment names first so the (attacker-controlled)
         # filename never reaches a filesystem path unsanitized. The leaf
         # names are reduced to safe basenames and joined under the resolved
@@ -3129,34 +3347,60 @@ class AppleMailConnector:
         # selected attachment by index to a precomputed, contained POSIX
         # path. (Concatenating `name of att` into the path inside AppleScript
         # was a path-traversal → arbitrary-file-write vector.)
+        # IMAP fast path (#371): one fetch instead of the AppleScript
+        # cross-scan. Mirrors get_attachment_content's dispatch.
+        if (
+            account is not None
+            and mailbox is not None
+            and not self._imap_breaker_open(account)
+        ):
+            try:
+                imap_result = self._imap_save_attachments(
+                    account=account,
+                    mailbox=mailbox,
+                    message_id=message_id,
+                    save_directory=save_directory,
+                    attachment_indices=attachment_indices,
+                )
+                self._imap_clear_breaker(account)
+                return imap_result
+            except _IMAP_FALLBACK_EXCS as exc:
+                self._log_imap_fallback(account, exc)
+                # fall through to AppleScript
+
         attachments = self._get_attachments_applescript(message_id)
+
+        # Pre-check byte caps (#236): drop oversized attachments before saving.
+        allowed, rejected = _select_attachments_within_caps(
+            attachments,
+            attachment_indices,
+            per_cap=self.max_attachment_bytes,
+            total_cap=self.max_total_attachment_bytes,
+        )
+        if not allowed:
+            return {"saved": 0, "rejected": rejected}
+
         targets = _compute_attachment_save_targets(
             [str(a.get("name", "")) for a in attachments],
             save_directory,
-            attachment_indices,
+            allowed,
         )
         if not targets:
-            return 0
+            return {"saved": 0, "rejected": rejected}
 
-        whose_clause = _whose_message_clause(message_id)
+        message_id_safe = escape_applescript_string(sanitize_input(message_id))
         idx_list = ", ".join(str(idx) for idx, _ in targets)
         path_list = ", ".join(
             f'"{escape_applescript_string(str(path))}"' for _, path in targets
         )
 
-        script = f"""
-        tell application "Mail"
+        script = _wrap_with_timeout(
+            f"""tell application "Mail"
             -- Search all accounts for message
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb {whose_clause}
-                        -- Re-fetches the attachment list; relies on Mail.app
-                        -- returning it in the same order as the earlier
-                        -- enumeration used to compute idx/path. A reorder
-                        -- between the two osascript calls would only mislabel
-                        -- (bytes of A under A's sanitized name vs B's) — both
-                        -- still contained in save_directory, no traversal.
+                        set msg to first message of mb whose id is "{message_id_safe}"
                         set theAtts to mail attachments of msg
                         set idxList to {{{idx_list}}}
                         set pathList to {{{path_list}}}
@@ -3177,11 +3421,88 @@ class AppleMailConnector:
             end repeat
 
             error "Message not found"
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script)
-        return int(result) if result.isdigit() else 0
+        saved = int(result) if result.isdigit() else 0
+
+        # Post-write net (#236): delete any file that landed over the cap
+        # (e.g. Mail under-reported size pre-download) and report it.
+        removed, post_rejected = _prune_oversized_written(
+            targets,
+            per_cap=self.max_attachment_bytes,
+            total_cap=self.max_total_attachment_bytes,
+        )
+        rejected.extend(post_rejected)
+        return {"saved": max(0, saved - removed), "rejected": rejected}
+
+    def _imap_save_attachments(
+        self,
+        *,
+        account: str,
+        mailbox: str,
+        message_id: str,
+        save_directory: Path,
+        attachment_indices: list[int] | None,
+    ) -> dict[str, Any]:
+        """IMAP path for save_attachments (#371): fetch the raw message once
+        and write the selected attachment bytes to disk. Reuses
+        ``fetch_raw_message`` + ``parse_original_message`` (same machinery as
+        ``_imap_get_attachment_content``) and the same #236 byte-cap /
+        path-safety helpers as the AppleScript path — the only new step is
+        the direct ``write_bytes``.
+
+        Propagates ``_IMAP_FALLBACK_EXCS`` unchanged for the caller's
+        fallback.
+        """
+        host, port, email = self._resolve_imap_config(account)
+        password = self._get_imap_password_with_fallback(account, email)
+        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+        raw = imap.fetch_raw_message(message_id, mailbox)
+        parsed = parse_original_message(raw).attachments
+
+        # Shape the parsed parts like _get_attachments_applescript output so
+        # the shared cap/target helpers apply unchanged. Exact byte sizes
+        # here (not Mail's pre-download estimate) make the pre-check precise.
+        attachments: list[dict[str, Any]] = [
+            {
+                "name": filename,
+                "mime_type": f"{maintype}/{subtype}",
+                "size": len(payload),
+                "downloaded": True,
+            }
+            for (filename, maintype, subtype, payload) in parsed
+        ]
+
+        allowed, rejected = _select_attachments_within_caps(
+            attachments,
+            attachment_indices,
+            per_cap=self.max_attachment_bytes,
+            total_cap=self.max_total_attachment_bytes,
+        )
+        if not allowed:
+            return {"saved": 0, "rejected": rejected}
+
+        targets = _compute_attachment_save_targets(
+            [a["name"] for a in attachments], save_directory, allowed
+        )
+        saved = 0
+        for as_idx, path in targets:
+            # _compute_attachment_save_targets returns 1-based indices.
+            path.write_bytes(parsed[as_idx - 1][3])
+            saved += 1
+
+        # Post-write net for symmetry with the AppleScript path (inert here —
+        # IMAP sizes are exact, so nothing should exceed the pre-check).
+        removed, post_rejected = _prune_oversized_written(
+            targets,
+            per_cap=self.max_attachment_bytes,
+            total_cap=self.max_total_attachment_bytes,
+        )
+        rejected.extend(post_rejected)
+        return {"saved": max(0, saved - removed), "rejected": rejected}
 
     def move_messages(
         self,
@@ -3199,7 +3520,8 @@ class AppleMailConnector:
             message_ids: List of message IDs to move
             destination_mailbox: Name of destination mailbox
             account: Account name (or UUID) hosting the destination mailbox
-            gmail_mode: Use Gmail-specific handling (copy + delete)
+            gmail_mode: Deprecated and ignored (#364) — moves are always a
+                verified `set mailbox`, never copy+delete.
             source_mailbox: Optional source mailbox name to narrow the
                 AppleScript scan to one mailbox (O(N) instead of O(N × M × K)).
                 When provided, source is assumed to be in the same `account`
@@ -3217,46 +3539,85 @@ class AppleMailConnector:
         if not message_ids:
             return 0
 
+        # gmail_mode is deprecated and ignored (#364): the old copy+delete
+        # path routed Gmail moves through Trash and lost the message. Every
+        # AppleScript move now uses `set mailbox` and verifies the message
+        # actually left the source, failing loud (MailImapRequiredError) on
+        # the Gmail silent-no-op instead of reporting false success.
+        return self._run_verified_move(
+            message_ids,
+            account=account,
+            source_mailbox=source_mailbox,
+            destination_mailbox=destination_mailbox,
+        )
+
+    @staticmethod
+    def _parse_move_counts(result: str) -> tuple[int, int]:
+        """Parse the ``"<moved>,<failed>"`` payload from a verified-move
+        script into ``(moved, failed)``. Tolerates a bare ``"<moved>"`` (no
+        comma) for callers/tests that don't exercise verification."""
+        parts = result.strip().split(",")
+        moved = int(parts[0]) if parts[0].strip().isdigit() else 0
+        failed = (
+            int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 0
+        )
+        return moved, failed
+
+    def _run_verified_move(
+        self,
+        message_ids: list[str],
+        *,
+        account: str,
+        source_mailbox: str | None,
+        destination_mailbox: str,
+    ) -> int:
+        """Move messages via AppleScript ``set mailbox`` and verify each one
+        left the source (#364). Raises MailImapRequiredError if any message
+        silently stayed put (the Gmail no-op) — the move can only be done
+        reliably over IMAP. Returns the count that verifiably moved."""
         from .utils import sanitize_input
 
         account_clause = applescript_account_clause(account)
-        dest_mb_ref = _applescript_mailbox_ref(destination_mailbox, account_clause)
+        mailbox_safe = escape_applescript_string(
+            sanitize_input(destination_mailbox)
+        )
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
             for mid in message_ids
         )
-
-        if gmail_mode:
-            actions = ["duplicate msg to destMailbox", "delete msg"]
-        else:
-            actions = ["set mailbox of msg to destMailbox"]
-
-        # `account` is required by this method (it's where the destination
-        # lives), so source_mailbox is the only "optional" half here. Pass
-        # account through only when the caller explicitly wants the narrow
-        # source-scan path.
         repeat_block = _bulk_repeat_block(
             account=account if source_mailbox is not None else None,
             source_mailbox=source_mailbox,
-            actions=actions,
+            actions=["set mailbox of msg to destMailbox"],
             counter_var="moveCount",
+            verify_dest_var="destMailbox",
         )
-
-        script = f"""
-        tell application "Mail"
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+            f"""tell application "Mail"
             set accountRef to {account_clause}
-            set destMailbox to {dest_mb_ref}
+            set destMailbox to my resolveMailbox(accountRef, "{mailbox_safe}")
             set idList to {{{id_list}}}
             set moveCount to 0
+            set failCount to 0
 
 {repeat_block}
 
-            return moveCount
-        end tell
-        """
+            return (moveCount as text) & "," & (failCount as text)
+        end tell""",
+            timeout=self.timeout,
+        )
 
-        result = self._run_applescript(script)
-        return int(result) if result.isdigit() else 0
+        moved, failed = self._parse_move_counts(self._run_applescript(script))
+        if failed > 0:
+            src = source_mailbox or "the source mailbox"
+            raise MailImapRequiredError(
+                f"Move to {destination_mailbox!r} could not be confirmed for "
+                f"{failed} message(s) — they never left {src!r}. On Gmail, "
+                f"label moves only apply reliably over IMAP: run "
+                f"`apple-mail-fast-mcp setup-imap --account <name>` for this "
+                f"account and retry. (#364)"
+            )
+        return moved
 
     def flag_message(
         self,
@@ -3310,16 +3671,17 @@ class AppleMailConnector:
             counter_var="flagCount",
         )
 
-        script = f"""
-        tell application "Mail"
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+            f"""tell application "Mail"
             set idList to {{{id_list}}}
             set flagCount to 0
 
 {repeat_block}
 
             return flagCount
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
@@ -3367,7 +3729,9 @@ class AppleMailConnector:
                 unlock the IMAP fast path on move-only patches (#149) —
                 without it, the move runs via AppleScript even when
                 IMAP is configured.
-            gmail_mode: Use Gmail-specific copy+delete for the move.
+            gmail_mode: Deprecated and ignored (#364). Moves are always a
+                verified ``set mailbox`` (IMAP relabel when available);
+                copy+delete is gone because it trashed Gmail messages.
 
         IMAP fast path (#149): when the patch is move-only
         (``destination_mailbox`` is the only field set) and
@@ -3419,6 +3783,23 @@ class AppleMailConnector:
         if imap_count is not None:
             return imap_count
 
+        # Pure move (no read/flag) on the AppleScript fallback: route through
+        # the verified mover so a Gmail silent-no-op fails loud instead of
+        # quietly losing the message (#364). gmail_mode is deprecated/ignored.
+        pure_move = (
+            destination_mailbox is not None
+            and read_status is None
+            and flagged is None
+            and flag_color is None
+        )
+        if pure_move:
+            return self._run_verified_move(
+                message_ids,
+                account=cast(str, account),
+                source_mailbox=source_mailbox,
+                destination_mailbox=cast(str, destination_mailbox),
+            )
+
         actions: list[str] = []
 
         if read_status is not None:
@@ -3427,13 +3808,13 @@ class AppleMailConnector:
 
         actions.extend(self._build_flag_actions(flagged, flag_color))
 
-        # Move (always last — IMAP STORE requires source folder).
+        # Move (always last — IMAP STORE requires source folder). gmail_mode
+        # is deprecated/ignored (#364): never copy+delete (it trashes on
+        # Gmail). Combined move+read/flag patches stay on this unverified
+        # path; the move itself is a plain relabel that never routes through
+        # Trash.
         if destination_mailbox is not None:
-            if gmail_mode:
-                actions.append("duplicate msg to destMailbox")
-                actions.append("delete msg")
-            else:
-                actions.append("set mailbox of msg to destMailbox")
+            actions.append("set mailbox of msg to destMailbox")
 
         repeat_block = _bulk_repeat_block(
             account=account if source_mailbox is not None else None,
@@ -3455,11 +3836,11 @@ class AppleMailConnector:
             mb_safe = escape_applescript_string(sanitize_input(destination_mailbox))
             dest_setup = (
                 f'set accountRef to {account_clause}\n'
-                f'            set destMailbox to mailbox "{mb_safe}" of accountRef'
+                f'            set destMailbox to my resolveMailbox(accountRef, "{mb_safe}")'
             )
 
-        script = f"""
-        tell application "Mail"
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+            f"""tell application "Mail"
             {dest_setup}
             set idList to {{{id_list}}}
             set updateCount to 0
@@ -3467,8 +3848,9 @@ class AppleMailConnector:
 {repeat_block}
 
             return updateCount
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
@@ -3551,18 +3933,19 @@ class AppleMailConnector:
             name_safe = escape_applescript_string(sanitize_input(name))
             new_name_safe = escape_applescript_string(sanitized_new_name)
 
-            script = f"""
-            tell application "Mail"
+            script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+                f"""tell application "Mail"
                 set accountRef to {account_clause}
                 try
-                    set mb to mailbox "{name_safe}" of accountRef
+                    set mb to my resolveMailbox(accountRef, "{name_safe}")
                 on error
                     error "MAILBOX_NOT_FOUND"
                 end try
                 set name of mb to "{new_name_safe}"
                 return "success"
-            end tell
-            """
+            end tell""",
+                timeout=self.timeout,
+            )
 
             try:
                 result = self._run_applescript(script)
@@ -3593,7 +3976,7 @@ class AppleMailConnector:
 
         try:
             host, port, email = self._resolve_imap_config(account)
-            password = get_imap_password(account, email)
+            password = self._get_imap_password_with_fallback(account, email)
         except (
             MailKeychainEntryNotFoundError, MailKeychainAccessDeniedError
         ) as e:
@@ -3663,7 +4046,7 @@ class AppleMailConnector:
 
         try:
             host, port, email = self._resolve_imap_config(account)
-            password = get_imap_password(account, email)
+            password = self._get_imap_password_with_fallback(account, email)
         except (
             MailKeychainEntryNotFoundError, MailKeychainAccessDeniedError
         ) as e:
@@ -3720,22 +4103,24 @@ class AppleMailConnector:
 
         if parent_mailbox:
             parent_safe = escape_applescript_string(sanitize_input(parent_mailbox))
-            script = f"""
-            tell application "Mail"
+            script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+                f"""tell application "Mail"
                 set accountRef to {account_clause}
-                set parentMailbox to mailbox "{parent_safe}" of accountRef
+                set parentMailbox to my resolveMailbox(accountRef, "{parent_safe}")
                 make new mailbox at parentMailbox with properties {{name:"{name_safe}"}}
                 return "success"
-            end tell
-            """
+            end tell""",
+                timeout=self.timeout,
+            )
         else:
-            script = f"""
-            tell application "Mail"
+            script = _wrap_with_timeout(
+                f"""tell application "Mail"
                 set accountRef to {account_clause}
                 make new mailbox at accountRef with properties {{name:"{name_safe}"}}
                 return "success"
-            end tell
-            """
+            end tell""",
+                timeout=self.timeout,
+            )
 
         result = self._run_applescript(script)
         return result == "success"
@@ -3807,14 +4192,7 @@ class AppleMailConnector:
         # mailbox per Message-ID, defeating the speed win. Falls
         # through to the AppleScript pass on any _IMAP_FALLBACK_EXCS
         # exception (incl. capability gaps and trash-not-found).
-        # All-numeric ids can't be resolved via IMAP HEADER Message-ID search
-        # (they're Mail.app ids, not RFC ids); skip IMAP so the AppleScript
-        # pass — where numeric ids match — runs instead of a silent 0 (P0-3).
-        if (
-            account is not None
-            and source_mailbox is not None
-            and _any_rfc_message_id(message_ids)
-        ):
+        if account is not None and source_mailbox is not None:
             imap_count = self._try_imap_delete(
                 message_ids,
                 account=account,
@@ -3835,16 +4213,17 @@ class AppleMailConnector:
             counter_var="deleteCount",
         )
 
-        script = f"""
-        tell application "Mail"
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+            f"""tell application "Mail"
             set idList to {{{id_list}}}
             set deleteCount to 0
 
 {repeat_block}
 
             return deleteCount
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
@@ -3881,9 +4260,12 @@ class AppleMailConnector:
         )
 
         if include_attachments:
-            attachments_clause = f'''
-                set attList to {{}}
-                repeat with att in mail attachments of msg{_attachment_record_as("attList")}                end repeat'''
+            attachments_clause = '''
+                set attList to {}
+                repeat with att in mail attachments of msg
+                    set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
+                    set end of attList to attRecord
+                end repeat'''
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
@@ -3905,6 +4287,26 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
+    def _resolve_draft_lookup_id(self, draft_id: str) -> str:
+        """Map a ``draft_id`` to Mail.app's internal numeric id for the
+        AppleScript ``whose id is`` lookups used by ``delete_draft`` /
+        ``get_draft_state``.
+
+        IMAP-APPEND drafts (#245) are keyed by a bare RFC 5322 Message-ID
+        (contains ``@``); Mail.app's ``id`` property is its own internal id,
+        not the Message-ID, so resolve the Message-ID to that internal id
+        first. Numeric ids pass through unchanged.
+
+        Raises:
+            MailDraftNotFoundError: a Message-ID that matches no message.
+        """
+        if "@" not in draft_id:
+            return draft_id
+        internal = self.find_message_by_message_id(draft_id)
+        if internal is None:
+            raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
+        return internal
+
     def delete_draft(self, draft_id: str) -> bool:
         """Move a draft to Trash (lifecycle endpoint for cancellation).
 
@@ -3924,16 +4326,22 @@ class AppleMailConnector:
             MailDraftNotFoundError: no draft with that id exists.
         """
         _validate_draft_id(draft_id)
+        lookup_id = self._resolve_draft_lookup_id(draft_id)
+        # Defense-in-depth: _validate_draft_id's charset already excludes
+        # AppleScript-breaking chars, but apply the SECURITY_CHECKLIST
+        # two-step at the interpolation site so safety doesn't hinge on the
+        # regex staying narrow. (#294)
+        lookup_id_safe = escape_applescript_string(sanitize_input(lookup_id))
 
-        script = f"""
-        tell application "Mail"
+        script = _wrap_with_timeout(
+            f"""tell application "Mail"
             set didDelete to false
             repeat with acc in accounts
                 try
                     repeat with mb in mailboxes of acc
                         if name of mb contains "Drafts" then
                             try
-                                set m to first message of mb whose id is "{draft_id}"
+                                set m to first message of mb whose id is "{lookup_id_safe}"
                                 delete m
                                 set didDelete to true
                                 exit repeat
@@ -3948,8 +4356,9 @@ class AppleMailConnector:
             else
                 return "NOT_FOUND"
             end if
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script).strip()
         if result == "OK":
@@ -3985,15 +4394,13 @@ class AppleMailConnector:
         """
         if not rfc5322_message_id:
             return None
-        bare = rfc5322_message_id
-        if bare.startswith("<") and bare.endswith(">"):
-            bare = bare[1:-1]
+        bare = _bare_message_id(rfc5322_message_id)
         bracketed = f"<{bare}>"
         safe_bare = escape_applescript_string(sanitize_input(bare))
         safe_bracketed = escape_applescript_string(sanitize_input(bracketed))
 
-        script = f"""
-        tell application "Mail"
+        script = _wrap_with_timeout(
+            f"""tell application "Mail"
             set foundId to ""
             repeat with acc in accounts
                 try
@@ -4012,8 +4419,9 @@ class AppleMailConnector:
             else
                 return foundId
             end if
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script).strip()
         if result == "NOT_FOUND" or not result:
@@ -4050,10 +4458,12 @@ class AppleMailConnector:
             MailDraftNotFoundError: no draft with that id exists.
         """
         _validate_draft_id(draft_id)
+        lookup_id = self._resolve_draft_lookup_id(draft_id)
+        lookup_id_safe = escape_applescript_string(sanitize_input(lookup_id))
 
         tell_body = f"""
         tell application "Mail"
-            set targetId to "{draft_id}"
+            set targetId to "{lookup_id_safe}"
             set foundDraft to missing value
             repeat with acc in accounts
                 try
@@ -4251,22 +4661,298 @@ class AppleMailConnector:
             set theMessage to {verb} origMsg opening window false
         """
 
+    def _create_draft_via_imap(
+        self,
+        *,
+        from_account: str,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,
+        attachment_paths: list[Path] | None,
+        body_html: str | None = None,
+    ) -> dict[str, str]:
+        """Create a save-as-draft by APPENDing a clean RFC822 message over
+        IMAP (issue #245), instead of Mail.app's AppleScript ``content``
+        setter. Returns the generated RFC Message-ID as ``draft_id``.
+
+        When ``body_html`` is given the message is a multipart/alternative
+        (text/plain + text/html); HTML drafts only exist on this IMAP path
+        (#251).
+
+        Raises the standard ``_IMAP_FALLBACK_EXCS`` (e.g. no Keychain
+        opt-in, network failure) which ``create_draft`` catches to fall
+        back to AppleScript. ``MailAccountNotFoundError`` / ``ValueError``
+        from sender resolution are NOT caught — they are caller/config
+        errors and must surface.
+        """
+        sender = self._resolve_account_to_sender(from_account)
+        host, port, email = self._resolve_imap_config(from_account)
+        password = self._get_imap_password_with_fallback(from_account, email)
+        message_id, raw = build_draft_mime(
+            sender=sender,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            body_html=body_html,
+            attachments=(
+                [Path(p) for p in attachment_paths] if attachment_paths else None
+            ),
+        )
+        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+        imap.append_draft(raw)
+        self._imap_clear_breaker(from_account)
+        return {"draft_id": _bare_message_id(message_id), "sent_message_id": ""}
+
+    def _create_reply_forward_draft_via_imap(
+        self,
+        *,
+        seed: str,
+        seed_id: str,
+        seed_mailbox: str,
+        from_account: str,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        body: str,
+        reply_all: bool,
+        attachment_paths: list[Path] | None,
+    ) -> dict[str, str]:
+        """Create a clean reply/forward save-as-draft via IMAP APPEND
+        (issue #245 follow-up).
+
+        Fetches the original's raw RFC 822 from ``seed_mailbox`` over IMAP,
+        rebuilds a clean text/plain reply/forward (no Mail.app
+        cite-blockquote) with proper ``In-Reply-To`` / ``References``
+        threading, and APPENDs it to Drafts. For forwards, the original's
+        attachments travel with the draft.
+
+        Raises the standard ``_IMAP_FALLBACK_EXCS`` and
+        ``MailMessageNotFoundError`` (when the original isn't in
+        ``seed_mailbox``) which ``create_draft`` catches to fall back to
+        the AppleScript path — AppleScript resolves the message across all
+        folders, so a folder-guess miss degrades gracefully.
+        """
+        sender = self._resolve_account_to_sender(from_account)
+        host, port, email = self._resolve_imap_config(from_account)
+        password = self._get_imap_password_with_fallback(from_account, email)
+        imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+
+        raw = imap.fetch_raw_message(seed_id, seed_mailbox)
+        orig = parse_original_message(raw)
+
+        # Threading: In-Reply-To = the original's Message-ID; References =
+        # the original's References chain plus the original's Message-ID.
+        in_reply_to = orig.message_id or None
+        references = list(orig.references)
+        if orig.message_id and orig.message_id not in references:
+            references.append(orig.message_id)
+
+        final_to: list[str]
+        final_cc: list[str] | None
+        if seed == "reply":
+            derived_to, derived_cc = derive_reply_recipients(
+                from_header=orig.from_header,
+                reply_to_header=orig.reply_to_header,
+                to_header=orig.to_header,
+                cc_header=orig.cc_header,
+                self_addresses=[email],
+                reply_all=reply_all,
+            )
+            final_to = to if to is not None else derived_to
+            final_cc = cc if cc is not None else derived_cc
+            final_subject = (
+                subject if subject is not None else reply_subject(orig.subject)
+            )
+            final_body = build_reply_body(
+                new_body=body,
+                original_from=orig.from_header,
+                original_date=orig.date,
+                original_text=orig.text,
+            )
+            forwarded_attachments = None
+        else:  # forward
+            final_to = to if to is not None else []
+            final_cc = cc
+            final_subject = (
+                subject if subject is not None else forward_subject(orig.subject)
+            )
+            final_body = build_forward_body(
+                new_body=body,
+                original_from=orig.from_header,
+                original_date=orig.date,
+                original_subject=orig.subject,
+                original_to=orig.to_header,
+                original_text=orig.text,
+            )
+            forwarded_attachments = orig.attachments or None
+
+        message_id, draft_raw = build_draft_mime(
+            sender=sender,
+            to=final_to,
+            cc=final_cc,
+            bcc=bcc,
+            subject=final_subject or "",
+            body=final_body,
+            attachments=(
+                [Path(p) for p in attachment_paths] if attachment_paths else None
+            ),
+            in_reply_to=in_reply_to,
+            references=references or None,
+            forwarded_attachments=forwarded_attachments,
+        )
+        imap.append_draft(draft_raw)
+        self._imap_clear_breaker(from_account)
+        return {"draft_id": _bare_message_id(message_id), "sent_message_id": ""}
+
+    def _try_imap_compose_draft(
+        self,
+        *,
+        seed: str,
+        send_now: bool,
+        from_account: str | None,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        body: str,
+        attachment_paths: list[Path] | None,
+        body_html: str | None = None,
+    ) -> dict[str, str] | None:
+        """IMAP-APPEND path for a ``seed="new"`` save-as-draft (issue #245).
+
+        Returns the draft dict when it handles the request, or ``None`` to
+        signal ``create_draft`` to fall through to the AppleScript path.
+        Scoped to ``seed="new"`` save-as-draft with a known account; on the
+        usual IMAP-degradation signals (e.g. no Keychain opt-in) it logs
+        and returns ``None``, preserving prior behavior. ``body_html``
+        builds a multipart/alternative draft (#251).
+        """
+        if not (
+            seed == "new"
+            and not send_now
+            and from_account is not None
+            and not self._imap_breaker_open(from_account)
+        ):
+            return None
+        try:
+            return self._create_draft_via_imap(
+                from_account=from_account,
+                to=to or [],
+                cc=cc,
+                bcc=bcc,
+                subject=subject or "",
+                body=body,
+                body_html=body_html,
+                attachment_paths=attachment_paths,
+            )
+        except _IMAP_FALLBACK_EXCS as exc:
+            self._log_imap_fallback(from_account, exc)
+        return None
+
+    def _try_imap_reply_forward_draft(
+        self,
+        *,
+        seed: str,
+        seed_id: str | None,
+        seed_mailbox: str | None,
+        send_now: bool,
+        from_account: str | None,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        body: str,
+        reply_all: bool,
+        attachment_paths: list[Path] | None,
+    ) -> dict[str, str] | None:
+        """IMAP-APPEND path for a reply/forward save-as-draft (issue #245
+        follow-up).
+
+        Same cite-blockquote avoidance as compose, but rebuilds the quoted
+        original + threading from the original's raw RFC 822 (fetched by
+        Message-ID from ``seed_mailbox``). Requires an RFC Message-ID seed
+        (the form read tools emit) and a known account. Returns ``None`` to
+        fall through to AppleScript on IMAP degradation OR a folder-guess
+        miss (``MailMessageNotFoundError``) — AppleScript resolves the seed
+        across all folders.
+        """
+        if not (
+            seed in ("reply", "forward")
+            and not send_now
+            and seed_id is not None
+            and "@" in seed_id
+            and from_account is not None
+            and not self._imap_breaker_open(from_account)
+        ):
+            return None
+        try:
+            return self._create_reply_forward_draft_via_imap(
+                seed=seed,
+                seed_id=seed_id,
+                seed_mailbox=seed_mailbox or "INBOX",
+                from_account=from_account,
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                reply_all=reply_all,
+                attachment_paths=attachment_paths,
+            )
+        except _IMAP_FALLBACK_EXCS as exc:
+            self._log_imap_fallback(from_account, exc)
+        except MailMessageNotFoundError as exc:
+            # Original not in seed_mailbox (or wrong folder hint) — the
+            # AppleScript path resolves the seed across all folders.
+            self._log_imap_fallback(from_account, exc)
+        return None
+
     def create_draft(
         self,
         *,
         seed: str = "new",
         seed_id: str | None = None,
+        seed_mailbox: str | None = None,
         to: list[str] | None = None,
         cc: list[str] | None = None,
         bcc: list[str] | None = None,
         subject: str | None = None,
         body: str = "",
+        body_html: str | None = None,
         attachment_paths: list[Path] | None = None,
         reply_all: bool = False,
         from_account: str | None = None,
         send_now: bool = False,
+        on_warning: Callable[[str], None] | None = None,
     ) -> dict[str, str]:
         """Create a draft (fresh, reply, or forward). Optionally send.
+
+        For ``seed="new"`` save-as-draft (``send_now=False``) with a known
+        ``from_account``, the draft is created via IMAP APPEND of a clean
+        RFC 822 message rather than Mail.app's AppleScript ``content``
+        setter, which wraps the body in a cite-blockquote that renders as
+        a quote on iOS (Mail.app bug FB11734014, #245). Falls back to the
+        AppleScript path when IMAP isn't configured.
+
+        ``seed="reply"`` / ``seed="forward"`` save-as-draft also use the
+        clean IMAP path when ``seed_id`` is an RFC Message-ID and
+        ``from_account`` is known: the original is fetched from
+        ``seed_mailbox`` (default INBOX), and the quoted body + ``Re:``/
+        ``Fwd:`` subject + ``In-Reply-To``/``References`` threading are
+        rebuilt in plain text (forwards carry the original's attachments).
+        Falls back to AppleScript when IMAP isn't configured or the
+        original isn't in ``seed_mailbox``. ``send_now=True`` still uses
+        AppleScript.
+
+        After an IMAP-path APPEND the account is synchronized so the draft
+        appears in Mail.app's local Drafts pane promptly rather than after
+        Mail's background poll (#269); a brief lag can still remain since
+        Mail controls the final UI refresh.
 
         Args:
             seed: ``"new"``, ``"reply"``, or ``"forward"``.
@@ -4276,6 +4962,11 @@ class AppleMailConnector:
                 is what read tools (``search_messages`` / ``get_messages``)
                 emit as ``id`` on the IMAP path (#148), so callers can
                 forward those ids verbatim. Required when ``seed != "new"``.
+            seed_mailbox: Folder the seed message lives in, used by the
+                clean reply/forward IMAP path to fetch the original
+                (default INBOX). Supply it for replies to filed mail; a
+                miss falls back to AppleScript (which resolves across all
+                folders). Ignored for ``seed="new"``.
             to/cc/bcc: Recipient lists. For reply/forward, ``None`` keeps
                 Mail's auto-derived recipients; an empty list explicitly
                 clears that group; a populated list replaces.
@@ -4287,7 +4978,15 @@ class AppleMailConnector:
             attachment_paths: List of file paths. Each must exist.
             reply_all: For ``seed="reply"`` only — use ``reply to all``.
             from_account: Mail.app account name or UUID; ``None`` uses
-                Mail's default sender for the seed message.
+                Mail's default sender for the seed message. When ``None``
+                on a save-as-draft and exactly one enabled account exists,
+                that account is adopted so the clean IMAP path can engage
+                (it is Mail's default sender anyway, so the From is
+                unchanged). (#321)
+            on_warning: Optional callback invoked with a human-readable
+                string when a save-as-draft falls back to the AppleScript
+                path (whose body carries Mail.app's cite-blockquote wrapper,
+                FB11734014) instead of the clean IMAP path. (#270)
             send_now: ``False`` saves as draft and returns
                 ``{"draft_id": ...}``. ``True`` sends and returns
                 ``{"draft_id": "", "sent_message_id": ""}`` (sent_message_id
@@ -4304,6 +5003,56 @@ class AppleMailConnector:
             MailAppleScriptError: AppleScript failure.
         """
         self._validate_create_draft_args(seed, seed_id, to, subject)
+
+        # #321: with no explicit account the clean IMAP draft path can't
+        # engage (it must name the account for creds + From); adopt the
+        # sole enabled account when there is one (it's Mail's default
+        # sender anyway, so the From is unchanged).
+        effective_account = self._effective_from_account(from_account, send_now)
+
+        # Clean IMAP-APPEND paths (issue #245) avoid Mail.app's
+        # cite-blockquote wrapper (bug FB11734014); they return a draft
+        # dict, or None to fall through to AppleScript.
+        imap_result = self._try_imap_draft_paths(
+            seed=seed,
+            seed_id=seed_id,
+            seed_mailbox=seed_mailbox,
+            send_now=send_now,
+            effective_account=effective_account,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            body_html=body_html,
+            reply_all=reply_all,
+            attachment_paths=attachment_paths,
+        )
+        if imap_result is not None:
+            imap_result.setdefault("from_account", effective_account or "")
+            # The draft is now on the server, but Mail.app doesn't poll
+            # Drafts on its own — nudge it to sync so the draft surfaces in
+            # the local UI promptly. (#269)
+            self._sync_account_drafts(effective_account)
+            return imap_result
+
+        # HTML drafts exist only on the clean IMAP path (Mail.app's
+        # AppleScript `content` setter is plain-text only). If the IMAP path
+        # couldn't engage, fail loud rather than silently dropping the HTML
+        # into a plain-text AppleScript draft. (#251)
+        if body_html is not None:
+            raise MailDraftHtmlUnavailableError(
+                "HTML drafts require IMAP credentials"
+                + (f" for account {effective_account!r}" if effective_account else "")
+                + ". Opt in to Keychain IMAP access (see docs) or omit "
+                "body_html to create a plain-text draft."
+            )
+
+        # Committed to the AppleScript path, which carries Mail.app's
+        # cite-blockquote wrapper (FB11734014). Warn save-as-draft callers
+        # so a silently-wrapped draft is visible and actionable. (#270)
+        if not send_now and on_warning is not None:
+            on_warning(self._draft_fallback_warning(effective_account))
 
         # If the caller handed us an RFC 5322 Message-ID (the form read
         # tools emit on the IMAP path per #148), resolve to Mail's
@@ -4330,8 +5079,8 @@ class AppleMailConnector:
         # and the Display-Name <email> form from #158 broadened what
         # characters can appear here. (#173)
         sender_clause = ""
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
+        if effective_account is not None:
+            sender_email = self._resolve_account_to_sender(effective_account)
             sender_safe = escape_applescript_string(sanitize_input(sender_email))
             sender_clause = f'set sender of theMessage to "{sender_safe}"'
 
@@ -4341,7 +5090,8 @@ class AppleMailConnector:
             if addrs is None:
                 return ""  # keep auto-derived
             list_str = ", ".join(
-                f'"{escape_applescript_string(a)}"' for a in addrs
+                f'"{escape_applescript_string(sanitize_input(a))}"'
+                for a in addrs
             )
             return f"""
                 delete (every {kind} recipient of theMessage)
@@ -4433,8 +5183,8 @@ class AppleMailConnector:
                 end repeat
             """
 
-        script = f"""
-        tell application "Mail"
+        script = _wrap_with_timeout(
+            f"""tell application "Mail"
             {snapshot_block}
 
             {creation_block}
@@ -4448,8 +5198,9 @@ class AppleMailConnector:
             {attachment_block}
 
             {terminal_block}
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         try:
             result = self._run_applescript(script).strip()
@@ -4461,8 +5212,145 @@ class AppleMailConnector:
             raise
 
         if send_now:
-            return {"draft_id": "", "sent_message_id": ""}
-        return {"draft_id": result, "sent_message_id": ""}
+            return {"draft_id": "", "sent_message_id": "", "from_account": ""}
+        return {
+            "draft_id": result,
+            "sent_message_id": "",
+            "from_account": effective_account or "",
+        }
+
+    def _sync_account_drafts(self, account: str | None) -> None:
+        """Best-effort: poke Mail.app to synchronize ``account`` so a
+        just-APPENDed draft surfaces in the local Drafts pane without
+        waiting for Mail's background poll (#269).
+
+        Never raises: the draft already exists on the server, so a sync
+        failure is a UI-latency nuisance, not a draft failure. Mail still
+        controls the final UI refresh, so a brief lag can remain.
+        """
+        if not account:
+            return
+        script = _wrap_with_timeout(
+            f'tell application "Mail" to synchronize with '
+            f"{applescript_account_clause(account)}",
+            timeout=self.timeout,
+        )
+        try:
+            self._run_applescript(script)
+        except Exception as exc:  # noqa: BLE001 — UI nicety, never fail draft
+            logger.debug("post-APPEND Drafts sync failed for %r: %s", account, exc)
+
+    @staticmethod
+    def _draft_fallback_warning(effective_account: str | None) -> str:
+        """Build the #270 warning shown when a save-as-draft lands on the
+        AppleScript path (and thus the cite-blockquote wrapper, FB11734014)
+        instead of the clean IMAP path."""
+        tail = (
+            "Body may render as a blockquote on iOS Mail (Mail.app bug "
+            "FB11734014)."
+        )
+        if effective_account is None:
+            return (
+                "Draft created via AppleScript: no from_account was given "
+                "and there isn't exactly one enabled account, so the clean "
+                f"IMAP draft path couldn't be auto-selected. {tail} Pass "
+                "from_account, or set up IMAP with `apple-mail-fast-mcp "
+                "setup-imap`."
+            )
+        return (
+            "Draft created via AppleScript fallback: the IMAP draft path is "
+            f"unavailable for {effective_account!r} (IMAP not configured, "
+            f"unreachable, or a non-RFC reply seed). {tail} Configure or "
+            "repair IMAP for the account with `apple-mail-fast-mcp setup-imap`."
+        )
+
+    def _effective_from_account(
+        self, from_account: str | None, send_now: bool
+    ) -> str | None:
+        """Resolve the account create_draft should act under (#321).
+
+        Honors an explicit ``from_account``; otherwise, for a save-as-draft,
+        adopts the sole enabled account so the clean IMAP path can engage.
+        ``send_now`` stays on the AppleScript send path, so it isn't
+        auto-resolved.
+        """
+        if from_account is not None or send_now:
+            return from_account
+        return self._resolve_implicit_account()
+
+    def _try_imap_draft_paths(
+        self,
+        *,
+        seed: str,
+        seed_id: str | None,
+        seed_mailbox: str | None,
+        send_now: bool,
+        effective_account: str | None,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        body: str,
+        reply_all: bool,
+        attachment_paths: list[Path] | None,
+        body_html: str | None = None,
+    ) -> dict[str, str] | None:
+        """Try the clean IMAP-APPEND draft paths (compose, then
+        reply/forward), returning a draft dict or ``None`` to fall through
+        to AppleScript. (#245)
+
+        ``body_html`` is honored only on the compose (``seed="new"``) path;
+        reply/forward HTML is out of scope for #251.
+        """
+        result = self._try_imap_compose_draft(
+            seed=seed,
+            send_now=send_now,
+            from_account=effective_account,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            body_html=body_html,
+            attachment_paths=attachment_paths,
+        )
+        if result is not None:
+            return result
+        return self._try_imap_reply_forward_draft(
+            seed=seed,
+            seed_id=seed_id,
+            seed_mailbox=seed_mailbox,
+            send_now=send_now,
+            from_account=effective_account,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            reply_all=reply_all,
+            attachment_paths=attachment_paths,
+        )
+
+    def _resolve_implicit_account(self) -> str | None:
+        """Return the sole enabled Mail account's name, or ``None`` (#321).
+
+        ``create_draft`` uses this when no ``from_account`` is supplied: the
+        clean IMAP-APPEND draft path needs to name the account (for creds
+        and the From header), so it can't engage on an anonymous call. With
+        exactly one enabled account, Mail's default sender already *is* that
+        account, so adopting it is behavior-preserving for the From header.
+        With zero or several enabled accounts we return ``None`` and the
+        caller keeps Mail's default (AppleScript) behavior.
+        """
+        try:
+            accounts = self.list_accounts()
+        except Exception:
+            return None
+        enabled = [a for a in accounts if a.get("enabled")]
+        if len(enabled) != 1:
+            return None
+        name = enabled[0].get("name")
+        return cast(str, name) if name else None
 
     def extract_draft_attachments(
         self,
@@ -4501,6 +5389,12 @@ class AppleMailConnector:
             FileNotFoundError: ``dest_dir`` does not exist.
         """
         _validate_draft_id(draft_id)
+        # Resolve RFC Message-ID draft ids (IMAP-APPEND drafts, #245) to
+        # Mail's internal numeric id, matching delete_draft/get_draft_state.
+        # Without this, update_draft loses attachments on IMAP-created drafts
+        # (their `id` is numeric, never equal to the RFC-id targetId). (#294)
+        lookup_id = self._resolve_draft_lookup_id(draft_id)
+        lookup_id_safe = escape_applescript_string(sanitize_input(lookup_id))
         dest_dir = Path(dest_dir)
         if not dest_dir.is_dir():
             raise FileNotFoundError(f"dest_dir does not exist: {dest_dir}")
@@ -4520,9 +5414,9 @@ class AppleMailConnector:
             f'"{escape_applescript_string(str(p))}"' for p in target_paths
         )
 
-        script = f"""
-        tell application "Mail"
-            set targetId to "{draft_id}"
+        script = _wrap_with_timeout(
+            f"""tell application "Mail"
+            set targetId to "{lookup_id_safe}"
             set foundDraft to missing value
             repeat with acc in accounts
                 try
@@ -4556,8 +5450,9 @@ class AppleMailConnector:
                 end try
             end repeat
             return saved as text
-        end tell
-        """
+        end tell""",
+            timeout=self.timeout,
+        )
 
         result = self._run_applescript(script).strip()
         if result == "ERR_NOT_FOUND":

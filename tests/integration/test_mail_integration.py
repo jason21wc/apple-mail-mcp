@@ -17,7 +17,13 @@ from pathlib import Path
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
-from apple_mail_mcp.mail_connector import AppleMailConnector
+from apple_mail_mcp.mail_connector import (
+    _MAILBOX_RESOLVER_HANDLERS,
+    AppleMailConnector,
+    _wrap_as_json_script,
+    _wrap_with_timeout,
+)
+from apple_mail_mcp.utils import parse_applescript_json
 
 # Skip all integration tests by default
 # Run with: pytest --run-integration
@@ -255,6 +261,40 @@ class TestMailIntegration:
         assert isinstance(result["flagged"], bool)
         assert isinstance(result["content"], str)
 
+    def test_get_messages_body_is_bounded_and_serializable(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#365: a real full-body fetch through the server tool must always
+        return a JSON-serializable, size-bounded response. The original bug
+        crashed the whole stdio server on bodies that this asserts are safe.
+
+        Goes through the server-layer ``get_messages`` (not the bare
+        connector) because the scrub/bound chokepoint lives there.
+        """
+        import json as _json
+
+        from apple_mail_mcp.server import get_messages
+        from apple_mail_mcp.utils import DEFAULT_MAX_BODY_BYTES
+
+        matches = connector.search_messages(
+            account=test_account, mailbox="INBOX", limit=3
+        )
+        if not matches:
+            pytest.skip("test inbox has no messages")
+
+        ids = [m["id"] for m in matches]
+        result = get_messages(ids, account=test_account, mailbox="INBOX")
+
+        assert result["success"] is True
+        # The exact operation that crashed the server pre-fix.
+        _json.dumps(result).encode("utf-8")
+        for msg in result["messages"]:
+            body = msg.get("content", "")
+            assert isinstance(body, str)
+            assert len(body.encode("utf-8")) <= DEFAULT_MAX_BODY_BYTES
+            if msg.get("content_truncated"):
+                assert msg["content_original_bytes"] > DEFAULT_MAX_BODY_BYTES
+
     def test_get_message_via_imap(
         self, connector: AppleMailConnector, test_account: str
     ) -> None:
@@ -283,7 +323,7 @@ class TestMailIntegration:
         ):
             pytest.skip(
                 f"No Keychain entry for {test_account!r} — IMAP path "
-                f"can't be exercised. Run `apple-mail-mcp setup-imap` first."
+                f"can't be exercised. Run `apple-mail-fast-mcp setup-imap` first."
             )
 
         matches = connector.search_messages(
@@ -379,6 +419,46 @@ class TestMailIntegration:
         new_files = written - before
         assert all(p.is_relative_to(tmp_path.resolve()) for p in new_files)
 
+    def test_get_attachment_content_round_trip(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#250: get_attachment_content returns a real attachment's bytes
+        inline (no caller-facing disk). Scans a few INBOX messages for one
+        with an attachment; fetches index 0 and checks the payload size
+        matches the metadata and the content encodes coherently.
+        """
+        import base64 as _b64
+
+        matches = connector.search_messages(
+            account=test_account, mailbox="INBOX", limit=10
+        )
+        target = next(
+            (
+                (m["id"], connector.get_attachments(m["id"]))
+                for m in matches
+                if connector.get_attachments(m["id"])
+            ),
+            None,
+        )
+        if target is None:
+            pytest.skip("no INBOX message with attachments")
+        message_id, meta = target
+
+        result = connector.get_attachment_content(message_id, 0)
+        assert set(result.keys()) >= {"name", "mime_type", "size", "payload"}
+        assert isinstance(result["payload"], bytes)
+        assert result["size"] == len(result["payload"])
+        # Server-layer encode must produce a coherent text/base64 blob.
+        from apple_mail_mcp.utils import attachment_content_encoding
+
+        content, encoding = attachment_content_encoding(
+            result["payload"], result["mime_type"]
+        )
+        if encoding == "base64":
+            assert _b64.b64decode(content) == result["payload"]
+        else:
+            assert content.encode("utf-8") == result["payload"]
+
     def test_get_attachments_via_imap(
         self, connector: AppleMailConnector, test_account: str
     ) -> None:
@@ -404,7 +484,7 @@ class TestMailIntegration:
         ):
             pytest.skip(
                 f"No Keychain entry for {test_account!r} — IMAP path "
-                f"can't be exercised. Run `apple-mail-mcp setup-imap` first."
+                f"can't be exercised. Run `apple-mail-fast-mcp setup-imap` first."
             )
 
         matches = connector.search_messages(
@@ -429,123 +509,72 @@ class TestMailIntegration:
             # Documented divergence — IMAP path always reports False.
             assert att["downloaded"] is False
 
-    def test_get_attachment_content_via_imap(
-        self, connector: AppleMailConnector, test_account: str
-    ) -> None:
-        """IMAP byte-fetch reads attachment content straight from the
-        server — works even when Mail.app has NOT downloaded the
-        attachment locally (the AppleScript path raises -10000 on an
-        undownloaded placeholder). This is the fix for the hotel-report
-        PDF extraction path.
-
-        Skips if the account has no IMAP Keychain entry, or if the test
-        inbox has no message carrying an attachment.
-        """
-        from apple_mail_mcp.exceptions import (
-            MailKeychainAccessDeniedError,
-            MailKeychainEntryNotFoundError,
-        )
-        from apple_mail_mcp.keychain import get_imap_password
-
-        try:
-            _, _, email = connector._resolve_imap_config(test_account)
-            get_imap_password(test_account, email)
-        except (
-            MailKeychainEntryNotFoundError,
-            MailKeychainAccessDeniedError,
-        ):
-            pytest.skip(
-                f"No Keychain entry for {test_account!r} — IMAP path "
-                f"can't be exercised. Run `apple-mail-mcp setup-imap` first."
-            )
-
-        matches = connector.search_messages(
-            account=test_account, mailbox="INBOX",
-            has_attachment=True, limit=1,
-        )
-        if not matches:
-            pytest.skip("test inbox has no messages with attachments")
-
-        rfc_id = matches[0].get("rfc_message_id") or matches[0].get("id")
-        assert rfc_id, "search row missing rfc_message_id/id"
-
-        result = connector.get_attachment_content(
-            rfc_id, attachment_index=0,
-            account=test_account, mailbox="INBOX",
-        )
-
-        assert set(result.keys()) >= {
-            "name", "mime_type", "size", "content", "is_binary",
-        }
-        assert isinstance(result["content"], str)
-        assert isinstance(result["is_binary"], bool)
-        # Bytes came from the server regardless of Mail.app download state.
-        assert result["size"] >= 0
-
-    def test_save_attachments_via_imap_writes_bytes_contained(
+    def test_save_attachments_via_imap_fast_path(
         self, connector: AppleMailConnector, test_account: str, tmp_path: Path
     ) -> None:
-        """IMAP save path fetches attachment bytes from the server and writes
-        them to disk — works even when Mail.app has NOT downloaded the
-        attachment (the AppleScript path raises -10000 on an undownloaded
-        placeholder). Asserts the write stayed inside save_directory (CWE-22)
-        and that real bytes landed on disk.
-
-        Skips if the account has no IMAP Keychain entry, or if the test
-        inbox has no message carrying an attachment.
+        """#371: save_attachments(account, mailbox) writes attachment bytes
+        via the IMAP fast path (one fetch, no AppleScript cross-scan).
+        APPENDs a synthetic message with a known attachment, saves it, and
+        verifies the file bytes match exactly. Skips without IMAP.
         """
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        from email.message import EmailMessage
+        from email.utils import format_datetime
+
+        from imapclient import IMAPClient
+
         from apple_mail_mcp.exceptions import (
             MailKeychainAccessDeniedError,
             MailKeychainEntryNotFoundError,
         )
         from apple_mail_mcp.keychain import get_imap_password
 
+        host, port, email = connector._resolve_imap_config(test_account)
         try:
-            _, _, email = connector._resolve_imap_config(test_account)
-            get_imap_password(test_account, email)
-        except (
-            MailKeychainEntryNotFoundError,
-            MailKeychainAccessDeniedError,
-        ):
+            pw = get_imap_password(test_account, email)
+        except (MailKeychainEntryNotFoundError, MailKeychainAccessDeniedError):
             pytest.skip(
-                f"No Keychain entry for {test_account!r} — IMAP path "
-                f"can't be exercised. Run `apple-mail-mcp setup-imap` first."
+                f"No Keychain entry for {test_account!r} — run setup-imap."
             )
 
-        matches = connector.search_messages(
-            account=test_account, mailbox="INBOX",
-            has_attachment=True, limit=1,
-        )
-        if not matches:
-            pytest.skip("test inbox has no messages with attachments")
+        suffix = _uuid.uuid4().hex[:8]
+        box = f"ZZZ-AMM-ATT-{suffix}"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
+        payload = b"%PDF-1.4 fake pdf " + _uuid.uuid4().hex.encode()
 
-        rfc_id = matches[0].get("rfc_message_id") or matches[0].get("id")
-        assert rfc_id, "search row missing rfc_message_id/id"
+        assert connector.create_mailbox(account=test_account, name=box)
+        try:
+            m = EmailMessage()
+            m["From"] = "sender@apple-mail-fast-mcp-test.invalid"
+            m["To"] = "rcpt@apple-mail-fast-mcp-test.invalid"
+            m["Subject"] = "AMM #371 save_attachments fast path"
+            m["Date"] = format_datetime(datetime.now(tz=timezone.utc))
+            m["Message-ID"] = f"<{msg_id_local}>"
+            m.set_content("body")
+            m.add_attachment(
+                payload, maintype="application", subtype="pdf", filename="doc.pdf"
+            )
 
-        # Confirm the message actually enumerates at least one attachment
-        # via the IMAP BODYSTRUCTURE walk before asserting a write happened.
-        atts = connector.get_attachments(
-            rfc_id, account=test_account, mailbox="INBOX",
-        )
-        if not atts:
-            pytest.skip("first attachment message had no IMAP-visible parts")
+            ac = IMAPClient(host, port=port, ssl=True, timeout=30)
+            ac.login(email, pw)
+            try:
+                ac.append(box, m.as_bytes())
+            finally:
+                ac.logout()
 
-        save_dir = (tmp_path / "save").resolve()
-        save_dir.mkdir()
-
-        count = connector.save_attachments(
-            rfc_id, save_dir,
-            attachment_indices=[0],
-            account=test_account, mailbox="INBOX",
-        )
-        assert count == 1
-
-        written = [p for p in save_dir.rglob("*") if p.is_file()]
-        assert len(written) == 1
-        # Containment: the file is strictly inside save_dir, never escaped.
-        assert written[0].resolve().is_relative_to(save_dir)
-        # Real bytes from the server, not an empty placeholder.
-        assert written[0].stat().st_size > 0
+            result = connector.save_attachments(
+                msg_id_local, tmp_path, account=test_account, mailbox=box
+            )
+            assert result["saved"] == 1
+            assert (tmp_path / "doc.pdf").read_bytes() == payload
+        finally:
+            try:
+                connector.delete_mailbox(
+                    account=test_account, name=box, delete_messages=True
+                )
+            except Exception:
+                pass
 
 
 class TestDraftsLifecycleIntegration:
@@ -614,6 +643,187 @@ class TestDraftsLifecycleIntegration:
         finally:
             connector.delete_draft(draft_id)
 
+    def test_imap_append_message_id_round_trips_state_and_delete(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """Issue #245 / PR #293: the IMAP-APPEND draft path returns a bare
+        RFC Message-ID as draft_id (not Mail's internal numeric id).
+        get_draft_state and delete_draft must resolve that Message-ID back
+        to Mail's internal id (via find_message_by_message_id) for their
+        `whose id is` lookups — otherwise a freshly-created draft can be
+        neither read back nor deleted.
+
+        Skips if the test account has no Keychain entry (IMAP path can't be
+        exercised; the AppleScript fallback returns a numeric id which the
+        fresh/reply tests above already cover).
+        """
+        from apple_mail_mcp.exceptions import (
+            MailKeychainAccessDeniedError,
+            MailKeychainEntryNotFoundError,
+        )
+        from apple_mail_mcp.keychain import get_imap_password
+
+        try:
+            _, _, email = connector._resolve_imap_config(test_account)
+            get_imap_password(test_account, email)
+        except (
+            MailKeychainEntryNotFoundError,
+            MailKeychainAccessDeniedError,
+        ):
+            pytest.skip(
+                f"No Keychain entry for {test_account!r} — IMAP-APPEND path "
+                f"can't be exercised. Run `apple-mail-fast-mcp setup-imap` first."
+            )
+
+        result = connector.create_draft(
+            seed="new",
+            from_account=test_account,
+            to=["test1@example.com"],
+            subject="ZZZ-AMM-INTEG-MSGID",
+            body="integration message-id round-trip body",
+        )
+        draft_id = result["draft_id"]
+        # IMAP path returns a BARE Message-ID (has @, no angle brackets).
+        assert "@" in draft_id, (
+            "expected IMAP-APPEND path (bare Message-ID draft_id); got "
+            f"{draft_id!r} — AppleScript fallback likely fired"
+        )
+        assert "<" not in draft_id and ">" not in draft_id
+
+        try:
+            state = connector.get_draft_state(draft_id)
+            assert state["subject"] == "ZZZ-AMM-INTEG-MSGID"
+            assert "integration message-id round-trip body" in state["body"]
+        finally:
+            assert connector.delete_draft(draft_id) is True
+
+    def test_sync_account_drafts_runs_against_real_account(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#269: the post-APPEND `synchronize with account` AppleScript is
+        accepted by the real Mail.app for the test account and does not
+        raise. (Unit tests mock _run_applescript and can't catch an
+        AppleScript syntax/dictionary error — this is the required real
+        coverage for the new script.)
+        """
+        # Best-effort by contract — assert it completes without raising.
+        connector._sync_account_drafts(test_account)
+
+    def test_imap_append_draft_becomes_visible_after_sync(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#269: a draft created via the IMAP path (which now syncs the
+        account afterward) is readable from Mail.app's local state. Timing
+        isn't asserted — Mail controls the final UI refresh — so we poll
+        briefly for the functional outcome.
+        """
+        import time as _time
+
+        from apple_mail_mcp.exceptions import (
+            MailKeychainAccessDeniedError,
+            MailKeychainEntryNotFoundError,
+        )
+        from apple_mail_mcp.keychain import get_imap_password
+
+        try:
+            _, _, email = connector._resolve_imap_config(test_account)
+            get_imap_password(test_account, email)
+        except (
+            MailKeychainEntryNotFoundError,
+            MailKeychainAccessDeniedError,
+        ):
+            pytest.skip(
+                f"No Keychain entry for {test_account!r} — IMAP-APPEND path "
+                f"can't be exercised. Run `apple-mail-fast-mcp setup-imap` first."
+            )
+
+        result = connector.create_draft(
+            seed="new",
+            from_account=test_account,
+            to=["test1@example.com"],
+            subject="ZZZ-AMM-INTEG-SYNC269",
+            body="post-append sync visibility body",
+        )
+        draft_id = result["draft_id"]
+        assert "@" in draft_id, (
+            f"expected IMAP-APPEND path (bare Message-ID); got {draft_id!r}"
+        )
+        try:
+            state = None
+            for _ in range(10):
+                try:
+                    state = connector.get_draft_state(draft_id)
+                    break
+                except Exception:
+                    _time.sleep(3)
+            assert state is not None, "draft never became readable within 30s"
+            assert state["subject"] == "ZZZ-AMM-INTEG-SYNC269"
+        finally:
+            assert connector.delete_draft(draft_id) is True
+
+    def test_create_draft_html_body_round_trips_as_multipart_alternative(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#251: a draft created with body_html is APPENDed as a real
+        multipart/alternative and the HTML survives a round-trip fetch from
+        the Drafts folder over IMAP."""
+        import email as _email
+        from email import policy as _policy
+
+        from apple_mail_mcp.exceptions import (
+            MailKeychainAccessDeniedError,
+            MailKeychainEntryNotFoundError,
+            MailMessageNotFoundError,
+        )
+        from apple_mail_mcp.imap_connector import ImapConnector
+        from apple_mail_mcp.keychain import get_imap_password
+
+        try:
+            host, port, email = connector._resolve_imap_config(test_account)
+            password = get_imap_password(test_account, email)
+        except (
+            MailKeychainEntryNotFoundError,
+            MailKeychainAccessDeniedError,
+        ):
+            pytest.skip(
+                f"No Keychain entry for {test_account!r} — HTML IMAP-APPEND "
+                f"path can't be exercised. Run `apple-mail-fast-mcp setup-imap`."
+            )
+
+        marker = "ZZZ-AMM-INTEG-HTML251"
+        result = connector.create_draft(
+            seed="new",
+            from_account=test_account,
+            to=["test1@example.com"],
+            subject=marker,
+            body="plain fallback",
+            body_html=f"<p>Revenue <b>{marker}</b></p>",
+        )
+        draft_id = result["draft_id"]
+        assert "@" in draft_id, (
+            f"expected IMAP-APPEND path (bare Message-ID); got {draft_id!r}"
+        )
+        try:
+            # Fetch the raw draft back over IMAP from the Drafts folder.
+            imap = ImapConnector(host, port, email, password)
+            raw = None
+            for folder in ImapConnector._CONVENTIONAL_DRAFTS_NAMES:
+                try:
+                    raw = imap.fetch_raw_message(draft_id, folder)
+                    break
+                except MailMessageNotFoundError:
+                    continue
+            assert raw is not None, "HTML draft not found in any Drafts folder"
+            msg = _email.message_from_bytes(raw, policy=_policy.default)
+            assert msg.get_content_type() == "multipart/alternative"
+            html = msg.get_body(preferencelist=("html",))
+            plain = msg.get_body(preferencelist=("plain",))
+            assert html is not None and plain is not None
+            assert f"<b>{marker}</b>" in html.get_content()
+            assert "plain fallback" in plain.get_content()
+        finally:
+            assert connector.delete_draft(draft_id) is True
+
     def test_reply_save_preserves_threading_headers(
         self,
         connector: AppleMailConnector,
@@ -639,6 +849,233 @@ class TestDraftsLifecycleIntegration:
             assert "ZZZ-AMM-INTEG-REPLY-BODY" in state["body"]
         finally:
             connector.delete_draft(draft_id)
+
+    def _append_via_imap(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        mailbox: str,
+        raw: bytes,
+    ) -> None:
+        """APPEND a raw RFC 822 message to ``mailbox`` over IMAP (helper for
+        the #293 reply/forward clean-path tests). Caller creates the
+        mailbox and handles cleanup."""
+        from imapclient import IMAPClient
+
+        from apple_mail_mcp.keychain import get_imap_password
+
+        host, port, email = connector._resolve_imap_config(test_account)
+        pw = get_imap_password(test_account, email)
+        client = IMAPClient(host, port=port, ssl=True, timeout=30)
+        client.login(email, pw)
+        try:
+            client.append(mailbox, raw, flags=[])
+        finally:
+            client.logout()
+
+    def _skip_without_keychain(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        from apple_mail_mcp.exceptions import (
+            MailKeychainAccessDeniedError,
+            MailKeychainEntryNotFoundError,
+        )
+        from apple_mail_mcp.keychain import get_imap_password
+
+        try:
+            _, _, email = connector._resolve_imap_config(test_account)
+            get_imap_password(test_account, email)
+        except (
+            MailKeychainEntryNotFoundError,
+            MailKeychainAccessDeniedError,
+        ):
+            pytest.skip(
+                f"No Keychain entry for {test_account!r} — IMAP path can't "
+                f"be exercised. Run `apple-mail-fast-mcp setup-imap` first."
+            )
+
+    def test_fetch_raw_message_happy_and_folder_miss(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#293: ImapConnector.fetch_raw_message returns a message's raw RFC
+        822 bytes when found in the given folder, and raises
+        MailMessageNotFoundError when the folder doesn't contain it (so the
+        reply/forward orchestrator can fall back to AppleScript). Exercises
+        the real IMAP SEARCH/FETCH boundary the unit tests mock out.
+        """
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        from email.utils import format_datetime
+
+        from apple_mail_mcp.exceptions import MailMessageNotFoundError
+        from apple_mail_mcp.imap_connector import ImapConnector
+        from apple_mail_mcp.keychain import get_imap_password
+
+        self._skip_without_keychain(connector, test_account)
+
+        suffix = _uuid.uuid4().hex[:8]
+        src = f"ZZZ-AMM-FETCHRAW-{suffix}"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
+        host, port, email = connector._resolve_imap_config(test_account)
+        pw = get_imap_password(test_account, email)
+
+        assert connector.create_mailbox(account=test_account, name=src)
+        try:
+            now = format_datetime(datetime.now(tz=timezone.utc))
+            raw = (
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
+                f"Subject: AMM #293 fetch-raw test\r\n"
+                f"Date: {now}\r\n"
+                f"Message-ID: <{msg_id_local}>\r\n"
+                f"\r\n"
+                f"raw fetch body\r\n"
+            ).encode()
+            self._append_via_imap(connector, test_account, src, raw)
+
+            imap = ImapConnector(host, port, email, pw)
+
+            # Happy path: present in src.
+            fetched = imap.fetch_raw_message(msg_id_local, src)
+            assert b"AMM #293 fetch-raw test" in fetched
+            assert msg_id_local.encode() in fetched
+
+            # Folder-miss: the same id is not in INBOX -> raises so the
+            # orchestrator can fall back to AppleScript.
+            with pytest.raises(MailMessageNotFoundError):
+                imap.fetch_raw_message(msg_id_local, "INBOX")
+        finally:
+            try:
+                connector.delete_mailbox(
+                    account=test_account, name=src, delete_messages=True
+                )
+            except Exception:
+                pass
+
+    def test_reply_via_imap_append_is_clean_and_threaded(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#293 / #292: a reply save-as-draft with a seed_mailbox goes
+        through the clean IMAP-APPEND path (no iOS cite-blockquote): it
+        fetches the original over IMAP, rebuilds a text/plain reply with a
+        quoted original + threading headers, and APPENDs to Drafts. The
+        IMAP path returns a bare RFC Message-ID as draft_id (the AppleScript
+        fallback would return a numeric id), so that shape proves the clean
+        path fired. Verifies In-Reply-To, Re: subject, and the quoted body.
+        """
+        import time as _time
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        from email.utils import format_datetime
+
+        self._skip_without_keychain(connector, test_account)
+
+        suffix = _uuid.uuid4().hex[:8]
+        src = f"ZZZ-AMM-REPLYSRC-{suffix}"
+        orig_id = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
+
+        assert connector.create_mailbox(account=test_account, name=src)
+        draft_id = ""
+        try:
+            now = format_datetime(datetime.now(tz=timezone.utc))
+            raw = (
+                f"From: Ada Original <ada@apple-mail-fast-mcp-test.invalid>\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
+                f"Subject: AMM 293 original subject\r\n"
+                f"Date: {now}\r\n"
+                f"Message-ID: <{orig_id}>\r\n"
+                f"\r\n"
+                f"This is the original message body.\r\n"
+            ).encode()
+            self._append_via_imap(connector, test_account, src, raw)
+
+            result = connector.create_draft(
+                seed="reply",
+                seed_id=orig_id,
+                seed_mailbox=src,
+                from_account=test_account,
+                body="ZZZ-AMM-293-REPLY-BODY",
+            )
+            draft_id = result["draft_id"]
+
+            # Clean IMAP-APPEND path returns a BARE RFC Message-ID; the
+            # AppleScript fallback would have returned a numeric id.
+            assert "@" in draft_id and "<" not in draft_id, (
+                f"expected IMAP clean-path draft_id (bare Message-ID); got "
+                f"{draft_id!r} — AppleScript fallback likely fired"
+            )
+
+            # Mail.app may lag picking up the APPENDed draft; poll briefly.
+            state = None
+            for _ in range(10):
+                try:
+                    state = connector.get_draft_state(draft_id)
+                    break
+                except Exception:
+                    _time.sleep(3)
+            assert state is not None, "draft never became readable within 30s"
+
+            assert state["in_reply_to"], "reply must carry In-Reply-To"
+            assert orig_id in state["in_reply_to"], (
+                f"In-Reply-To should reference the original; got "
+                f"{state['in_reply_to']!r}"
+            )
+            assert state["subject"].startswith("Re:"), (
+                f"expected Re: prefix; got {state['subject']!r}"
+            )
+            # Clean reply rebuild: user's new text on top, an attribution
+            # line, then the original carried as a quoted reply (NOT a
+            # cite-blockquote). The literal "> " markers are normalised away
+            # by Mail.app's plain-text `content` read-back; the pure builder
+            # unit tests assert the "> " quoting directly. Here we verify the
+            # round-trip-stable structure.
+            body = state["body"]
+            assert "ZZZ-AMM-293-REPLY-BODY" in body
+            assert "wrote:" in body, "reply should carry an attribution line"
+            assert "This is the original message body." in body, (
+                f"original must be quoted into the reply; body was {body!r}"
+            )
+            assert (
+                body.index("ZZZ-AMM-293-REPLY-BODY")
+                < body.index("This is the original message body.")
+            ), "user's new text should sit above the quoted original"
+        finally:
+            if draft_id:
+                try:
+                    connector.delete_draft(draft_id)
+                except Exception:
+                    pass
+            try:
+                connector.delete_mailbox(
+                    account=test_account, name=src, delete_messages=True
+                )
+            except Exception:
+                pass
+
+    def test_imap_operation_timeout_applied_on_live_socket(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """#249: post-login, the live IMAP socket carries OPERATION_TIMEOUT_S
+        (not the short connect timeout), so a slow server-side SEARCH/FETCH
+        isn't killed mid-operation. Drives the real production `_session`
+        path and inspects the actual socket timeout, then runs a real
+        operation under it.
+        """
+        from apple_mail_mcp.imap_connector import (
+            OPERATION_TIMEOUT_S,
+            ImapConnector,
+        )
+        from apple_mail_mcp.keychain import get_imap_password
+
+        self._skip_without_keychain(connector, test_account)
+
+        host, port, email = connector._resolve_imap_config(test_account)
+        pw = get_imap_password(test_account, email)
+        imap = ImapConnector(host, port, email, pw)
+        with imap._session() as client:
+            assert client.socket().gettimeout() == OPERATION_TIMEOUT_S
+            # A real operation completes under the raised timeout.
+            client.select_folder("INBOX", readonly=True)
 
     def test_attachment_extraction_round_trip(
         self,
@@ -675,6 +1112,70 @@ class TestDraftsLifecycleIntegration:
             assert extracted[0].read_bytes() == b"%PDF-FAKE-INTEG-CONTENT"
         finally:
             connector.delete_draft(draft_id)
+
+    def test_extract_attachments_on_imap_draft_resolves_rfc_id(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        tmp_path: Path,
+    ) -> None:
+        """#294: extract_draft_attachments must resolve an RFC Message-ID
+        draft_id (IMAP-APPEND drafts, #245) to Mail's internal id, like
+        delete_draft/get_draft_state. Pre-fix it interpolated the raw RFC id
+        as targetId, never matched Mail's numeric `id`, and update_draft
+        silently lost attachments on IMAP-created drafts. Skips unless the
+        account has Keychain creds — only then does create_draft take the
+        IMAP-APPEND path and return an RFC-id draft_id (the case under test).
+        """
+        self._skip_without_keychain(connector, test_account)
+
+        original = tmp_path / "src" / "report.pdf"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(b"%PDF-294-INTEG")
+
+        import time as _time
+
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+
+        result = connector.create_draft(
+            seed="new",
+            from_account=test_account,
+            to=["target@example.com"],
+            subject="ZZZ-AMM-294-ATTACH",
+            body="see attached",
+            attachment_paths=[original],
+        )
+        draft_id = result["draft_id"]
+        try:
+            # IMAP-APPEND path returns a bare RFC Message-ID (has @, no <>).
+            assert "@" in draft_id and "<" not in draft_id, (
+                f"expected IMAP-APPEND draft_id; got {draft_id!r}"
+            )
+            # Mail.app's IMAP sync may lag the APPEND; poll until the draft
+            # is resolvable by its Message-ID (also the case under test for
+            # extract — which now resolves the RFC id the same way).
+            state = None
+            for _ in range(10):
+                try:
+                    state = connector.get_draft_state(draft_id)
+                    break
+                except MailDraftNotFoundError:
+                    _time.sleep(3)
+            assert state is not None, "draft never synced into Mail.app in 30s"
+            assert "report.pdf" in state["attachment_names"]
+
+            extract_dir = tmp_path / "extract"
+            extract_dir.mkdir()
+            extracted = connector.extract_draft_attachments(
+                draft_id, state["attachment_names"], extract_dir
+            )
+            assert len(extracted) == 1 and extracted[0].is_file()
+            assert extracted[0].read_bytes() == b"%PDF-294-INTEG"
+        finally:
+            try:
+                connector.delete_draft(draft_id)
+            except Exception:
+                pass
 
     def test_delete_draft_removes_from_drafts_mailbox(
         self,
@@ -768,7 +1269,7 @@ class TestDraftsLifecycleIntegration:
         suffix = _uuid.uuid4().hex[:8]
         src = f"ZZZ-AMM-MV-SRC-{suffix}"
         dst = f"ZZZ-AMM-MV-DST-{suffix}"
-        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-mcp-test.invalid"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
         bracketed = f"<{msg_id_local}>"
 
         host, port, email = connector._resolve_imap_config(test_account)
@@ -782,8 +1283,8 @@ class TestDraftsLifecycleIntegration:
             # gives us a known Message-ID without going through Mail.app.
             now = format_datetime(datetime.now(tz=timezone.utc))
             raw = (
-                f"From: sender@apple-mail-mcp-test.invalid\r\n"
-                f"To: rcpt@apple-mail-mcp-test.invalid\r\n"
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
                 f"Subject: AMM #149 IMAP move test\r\n"
                 f"Date: {now}\r\n"
                 f"Message-ID: {bracketed}\r\n"
@@ -830,6 +1331,102 @@ class TestDraftsLifecycleIntegration:
                 except Exception:
                     pass
 
+    def test_gmail_label_move_lands_in_label_not_trash(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+    ) -> None:
+        """#364 acceptance gate: a Gmail label→label move must land the
+        message in the destination label and NOT in [Gmail]/Trash. The old
+        gmail_mode copy+delete trashed it (and stripped the label); this
+        pins that it never happens again. Verified via direct IMAP because
+        Mail.app's local view lags the server.
+
+        Skips on non-Gmail accounts — the bug and its fix are Gmail-specific.
+        """
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        from email.utils import format_datetime
+
+        from imapclient import IMAPClient
+
+        from apple_mail_mcp.keychain import get_imap_password
+
+        host, port, email = connector._resolve_imap_config(test_account)
+        if "gmail" not in host.lower():
+            pytest.skip(f"not a Gmail account (host={host})")
+        pw = get_imap_password(test_account, email)
+
+        suffix = _uuid.uuid4().hex[:8]
+        src = f"ZZZ-AMM-GM-SRC-{suffix}"
+        dst = f"ZZZ-AMM-GM-DST-{suffix}"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
+        bracketed = f"<{msg_id_local}>"
+
+        assert connector.create_mailbox(account=test_account, name=src)
+        assert connector.create_mailbox(account=test_account, name=dst)
+
+        try:
+            now = format_datetime(datetime.now(tz=timezone.utc))
+            raw = (
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
+                f"Subject: AMM #364 Gmail label move test\r\n"
+                f"Date: {now}\r\n"
+                f"Message-ID: {bracketed}\r\n"
+                f"\r\n"
+                f"body\r\n"
+            ).encode()
+
+            append_client = IMAPClient(host, port=port, ssl=True, timeout=30)
+            append_client.login(email, pw)
+            try:
+                append_client.append(src, raw)
+            finally:
+                append_client.logout()
+
+            moved = connector.update_message(
+                [msg_id_local],
+                destination_mailbox=dst,
+                account=test_account,
+                source_mailbox=src,
+            )
+            assert moved == 1
+
+            verify = IMAPClient(host, port=port, ssl=True, timeout=30)
+            verify.login(email, pw)
+            try:
+                # Discover Trash via SPECIAL-USE, fall back to the Gmail name.
+                trash = None
+                for flags, _delim, name in verify.list_folders():
+                    if b"\\Trash" in flags:
+                        trash = name
+                        break
+                trash = trash or "[Gmail]/Trash"
+
+                verify.select_folder(src, readonly=True)
+                src_uids = verify.search(["HEADER", "Message-ID", bracketed])
+                verify.select_folder(dst, readonly=True)
+                dst_uids = verify.search(["HEADER", "Message-ID", bracketed])
+                verify.select_folder(trash, readonly=True)
+                trash_uids = verify.search(["HEADER", "Message-ID", bracketed])
+            finally:
+                verify.logout()
+
+            assert src_uids == [], f"still in source label: {src_uids}"
+            assert len(dst_uids) == 1, f"not in destination label: {dst_uids}"
+            assert trash_uids == [], (
+                f"#364 regression — message routed through Trash: {trash_uids}"
+            )
+        finally:
+            for name in (src, dst):
+                try:
+                    connector.delete_mailbox(
+                        account=test_account, name=name, delete_messages=True
+                    )
+                except Exception:
+                    pass
+
     def test_delete_messages_via_imap_round_trip(
         self,
         connector: AppleMailConnector,
@@ -851,7 +1448,7 @@ class TestDraftsLifecycleIntegration:
 
         suffix = _uuid.uuid4().hex[:8]
         src = f"ZZZ-AMM-DEL-SRC-{suffix}"
-        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-mcp-test.invalid"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
         bracketed = f"<{msg_id_local}>"
 
         host, port, email = connector._resolve_imap_config(test_account)
@@ -864,8 +1461,8 @@ class TestDraftsLifecycleIntegration:
             # we have a known Message-ID without going through Mail.app.
             now = format_datetime(datetime.now(tz=timezone.utc))
             raw = (
-                f"From: sender@apple-mail-mcp-test.invalid\r\n"
-                f"To: rcpt@apple-mail-mcp-test.invalid\r\n"
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
                 f"Subject: AMM #150 IMAP delete test\r\n"
                 f"Date: {now}\r\n"
                 f"Message-ID: {bracketed}\r\n"
@@ -967,7 +1564,7 @@ class TestDraftsLifecycleIntegration:
 
         suffix = _uuid.uuid4().hex[:8]
         src = f"ZZZ-AMM-READ-SRC-{suffix}"
-        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-mcp-test.invalid"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
         bracketed = f"<{msg_id_local}>"
 
         host, port, email = connector._resolve_imap_config(test_account)
@@ -980,8 +1577,8 @@ class TestDraftsLifecycleIntegration:
             # explicitly without \Seen.
             now = format_datetime(datetime.now(tz=timezone.utc))
             raw = (
-                f"From: sender@apple-mail-mcp-test.invalid\r\n"
-                f"To: rcpt@apple-mail-mcp-test.invalid\r\n"
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
                 f"Subject: AMM #151 IMAP read-status test\r\n"
                 f"Date: {now}\r\n"
                 f"Message-ID: {bracketed}\r\n"
@@ -1068,7 +1665,7 @@ class TestDraftsLifecycleIntegration:
 
         suffix = _uuid.uuid4().hex[:8]
         src = f"ZZZ-AMM-FLAG-SRC-{suffix}"
-        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-mcp-test.invalid"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
         bracketed = f"<{msg_id_local}>"
 
         host, port, email = connector._resolve_imap_config(test_account)
@@ -1079,8 +1676,8 @@ class TestDraftsLifecycleIntegration:
         try:
             now = format_datetime(datetime.now(tz=timezone.utc))
             raw = (
-                f"From: sender@apple-mail-mcp-test.invalid\r\n"
-                f"To: rcpt@apple-mail-mcp-test.invalid\r\n"
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
                 f"Subject: AMM #152 IMAP flag round-trip test\r\n"
                 f"Date: {now}\r\n"
                 f"Message-ID: {bracketed}\r\n"
@@ -1148,6 +1745,77 @@ class TestDraftsLifecycleIntegration:
             except Exception:
                 pass
 
+    def test_flag_two_ids_resolves_via_single_or_search(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+    ) -> None:
+        """#316: two Message-IDs flagged in one update_message call resolve
+        through a single OR-of-HEADER SEARCH. Proves imapclient's nested-OR
+        criteria actually serializes and matches on the live server (the
+        thing unit tests with a mocked client can't verify), and that both
+        ids are found in one round-trip."""
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        from email.utils import format_datetime
+
+        from imapclient import IMAPClient
+
+        from apple_mail_mcp.keychain import get_imap_password
+
+        suffix = _uuid.uuid4().hex[:8]
+        src = f"ZZZ-AMM-OR316-{suffix}"
+        ids_local = [
+            f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid" for _ in range(2)
+        ]
+
+        host, port, email = connector._resolve_imap_config(test_account)
+        pw = get_imap_password(test_account, email)
+
+        assert connector.create_mailbox(account=test_account, name=src)
+        try:
+            now = format_datetime(datetime.now(tz=timezone.utc))
+            append_client = IMAPClient(host, port=port, ssl=True, timeout=30)
+            append_client.login(email, pw)
+            try:
+                for mid in ids_local:
+                    raw = (
+                        f"From: s@apple-mail-fast-mcp-test.invalid\r\n"
+                        f"To: r@apple-mail-fast-mcp-test.invalid\r\n"
+                        f"Subject: AMM #316 OR-search test\r\n"
+                        f"Date: {now}\r\n"
+                        f"Message-ID: <{mid}>\r\n"
+                        f"\r\nbody\r\n"
+                    ).encode()
+                    append_client.append(src, raw, flags=[])
+            finally:
+                append_client.logout()
+
+            # Both ids in one call → one OR search resolves both.
+            marked = connector.update_message(
+                ids_local, flagged=True, account=test_account,
+                source_mailbox=src,
+            )
+            assert marked == 2
+
+            verify = IMAPClient(host, port=port, ssl=True, timeout=30)
+            verify.login(email, pw)
+            try:
+                verify.select_folder(src, readonly=True)
+                for mid in ids_local:
+                    uids = verify.search(["HEADER", "Message-ID", f"<{mid}>"])
+                    assert len(uids) == 1
+                    assert b"\\Flagged" in verify.get_flags(uids)[uids[0]]
+            finally:
+                verify.logout()
+        finally:
+            try:
+                connector.delete_mailbox(
+                    account=test_account, name=src, delete_messages=True
+                )
+            except Exception:
+                pass
+
     def test_search_messages_returns_rfc_message_id_via_applescript(
         self,
         connector: AppleMailConnector,
@@ -1169,7 +1837,7 @@ class TestDraftsLifecycleIntegration:
 
         suffix = _uuid.uuid4().hex[:8]
         src = f"ZZZ-AMM-DUAL-EMIT-{suffix}"
-        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-mcp-test.invalid"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
         bracketed = f"<{msg_id_local}>"
 
         host, port, email = connector._resolve_imap_config(test_account)
@@ -1180,8 +1848,8 @@ class TestDraftsLifecycleIntegration:
         try:
             now = format_datetime(datetime.now(tz=timezone.utc))
             raw = (
-                f"From: sender@apple-mail-mcp-test.invalid\r\n"
-                f"To: rcpt@apple-mail-mcp-test.invalid\r\n"
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
                 f"Subject: AMM #148 dual-emit test\r\n"
                 f"Date: {now}\r\n"
                 f"Message-ID: {bracketed}\r\n"
@@ -1233,6 +1901,94 @@ class TestDraftsLifecycleIntegration:
             assert row["id"] != row["rfc_message_id"], (
                 "AppleScript path should yield divergent id and "
                 "rfc_message_id; got equal values"
+            )
+        finally:
+            try:
+                connector.delete_mailbox(
+                    account=test_account, name=src, delete_messages=True
+                )
+            except Exception:
+                pass
+
+    def test_update_message_flag_via_applescript_matches_rfc_id(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+    ) -> None:
+        """#291: update_message's AppleScript pass must match an RFC 5322
+        Message-ID, not only Mail's numeric `id`. `flag_color` can't go
+        through IMAP, so it always falls to the AppleScript pass; passing
+        the bracketless RFC id that read tools emit used to match nothing
+        and silently return 0. This forces the AppleScript path, APPENDs a
+        message with a known Message-ID, then flags it BY that RFC id and
+        asserts the patch counted 1 (pre-#291 this returned 0). Unit tests
+        only assert the generated script string and cannot catch this.
+        """
+        import time as _time
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        from email.utils import format_datetime
+
+        from imapclient import IMAPClient
+
+        from apple_mail_mcp.keychain import get_imap_password
+
+        suffix = _uuid.uuid4().hex[:8]
+        src = f"ZZZ-AMM-RFC-FLAG-{suffix}"
+        msg_id_local = f"{_uuid.uuid4().hex}@apple-mail-fast-mcp-test.invalid"
+        bracketed = f"<{msg_id_local}>"
+
+        host, port, email = connector._resolve_imap_config(test_account)
+        pw = get_imap_password(test_account, email)
+
+        assert connector.create_mailbox(account=test_account, name=src)
+        try:
+            now = format_datetime(datetime.now(tz=timezone.utc))
+            raw = (
+                f"From: sender@apple-mail-fast-mcp-test.invalid\r\n"
+                f"To: rcpt@apple-mail-fast-mcp-test.invalid\r\n"
+                f"Subject: AMM #291 rfc-id flag test\r\n"
+                f"Date: {now}\r\n"
+                f"Message-ID: {bracketed}\r\n"
+                f"\r\n"
+                f"body\r\n"
+            ).encode()
+
+            append_client = IMAPClient(host, port=port, ssl=True, timeout=30)
+            append_client.login(email, pw)
+            try:
+                append_client.append(src, raw, flags=[])
+            finally:
+                append_client.logout()
+
+            # Force the AppleScript pass (flag_color can't use IMAP anyway).
+            connector._imap_failure_until[test_account] = (
+                _time.monotonic() + 60
+            )
+
+            # Mail.app's IMAP sync may lag the APPEND. Poll up to ~30s for
+            # the message to surface before we flag it by RFC id.
+            for _ in range(10):
+                rows = connector.search_messages(
+                    account=test_account, mailbox=src, limit=10,
+                )
+                if any(r.get("rfc_message_id") == msg_id_local for r in rows):
+                    break
+                _time.sleep(3)
+            else:
+                raise AssertionError(
+                    "Mail.app never surfaced the APPENDed message within 30s"
+                )
+
+            updated = connector.update_message(
+                [msg_id_local],
+                flag_color="orange",
+                account=test_account,
+                source_mailbox=src,
+            )
+            assert updated == 1, (
+                "AppleScript pass failed to match the RFC Message-ID "
+                "(pre-#291 this silently returned 0)"
             )
         finally:
             try:
@@ -1310,6 +2066,12 @@ class TestDraftsLifecycleIntegration:
             from_account=test_account,
         )
         draft_id = result["draft_id"]
+        # The IMAP-APPEND path (#245) returns a bare RFC Message-ID, not
+        # Mail's internal id; resolve it so the `id of d` lookup below
+        # matches (mirrors get_draft_state / delete_draft).
+        lookup_id = draft_id
+        if "@" in draft_id:
+            lookup_id = connector.find_message_by_message_id(draft_id) or draft_id
 
         try:
             # Read the draft's headers via osascript and confirm the
@@ -1322,7 +2084,7 @@ class TestDraftsLifecycleIntegration:
                         repeat with mb in mailboxes of acc
                             if name of mb contains "Drafts" then
                                 repeat with d in messages of mb
-                                    if (id of d as text) is "{draft_id}" then
+                                    if (id of d as text) is "{lookup_id}" then
                                         return sender of d
                                     end if
                                 end repeat
@@ -1380,13 +2142,13 @@ class TestRuleCRUDIntegration:
     even if intermediate assertions fail. Idempotent: a leftover from a
     previous failed run is detected and removed at the start.
 
-    Refers to a rule whose name starts with '[apple-mail-mcp-test]' —
+    Refers to a rule whose name starts with '[apple-mail-fast-mcp-test]' —
     this is the test prefix the safety gate uses, but the connector
     itself doesn't enforce it. We use a recognizable name so manual
     cleanup is easy if all else fails.
     """
 
-    TEST_RULE_NAME = "[apple-mail-mcp-test] integration test rule"
+    TEST_RULE_NAME = "[apple-mail-fast-mcp-test] integration test rule"
 
     def _delete_test_rule_if_present(
         self, connector: AppleMailConnector
@@ -1680,3 +2442,115 @@ class TestFindMessageByMessageIdIntegration:
             pass
         finally:
             connector.delete_draft(draft_id)
+
+
+class TestTimeoutWrappingCompiles:
+    """#233 — the non-JSON mutation paths now prepend top-level handlers and
+    wrap the tell-block in `with timeout … end timeout`. AppleScript forbids
+    handler definitions inside a `with timeout` block, so this structure could
+    only be a compile error or valid — a failure mode that unit tests (which
+    mock subprocess.run) cannot catch. Run the real structure through
+    osascript to prove it compiles and executes.
+    """
+
+    def test_handler_prefixed_timeout_script_executes(
+        self, connector: AppleMailConnector
+    ) -> None:
+        # Mirror the handler-prefixed shape used by mark_as_read / move_messages
+        # / create_rule etc.: handlers OUTSIDE the timeout block, a trivial
+        # tell-block INSIDE. A syntax error (handler inside `with timeout`)
+        # would surface here as a non-zero osascript exit.
+        script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
+            'tell application "Mail"\n'
+            "    return (count of accounts) as text\n"
+            "end tell",
+            timeout=connector.timeout,
+        )
+        result = connector._run_applescript(script)
+        assert result.isdigit()
+
+    def test_no_handler_timeout_script_executes(
+        self, connector: AppleMailConnector
+    ) -> None:
+        # Mirror the no-handler shape (set_rule_enabled / save_attachments etc.).
+        script = _wrap_with_timeout(
+            'tell application "Mail"\n'
+            "    return (count of accounts) as text\n"
+            "end tell",
+            timeout=connector.timeout,
+        )
+        result = connector._run_applescript(script)
+        assert result.isdigit()
+
+
+class TestResolveImapConfigAppleScript:
+    """#267 / #272 — _resolve_imap_config coerces `server name` / `port`
+    for `missing value` so accounts without an IMAP server don't drop those
+    keys from NSJSONSerialization and KeyError the caller.
+
+    The real missing-value path needs a POP / "On My Mac" / mid-config
+    account, which a typical dev machine (all IMAP/iCloud accounts) can't
+    provide — so these two tests cover the change against real osascript
+    from both ends: the modified method still works on a server-bearing
+    account (no regression), and the coercion idiom genuinely survives
+    NSJSONSerialization (the mechanism the fix relies on)."""
+
+    def test_resolve_imap_config_real_account_no_regression(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """The edited tell-block still parses and runs against a real
+        server-bearing account, returning a usable (host, port, email)."""
+        host, port, email = connector._resolve_imap_config(test_account)
+        assert isinstance(host, str) and host  # non-empty server name
+        assert isinstance(port, int) and port > 0
+        assert isinstance(email, str) and email
+
+    def test_missing_value_coercion_survives_json_serialization(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The crux of the fix: a `missing value` host/port, once coerced to
+        ``""`` / ``0`` with the same idiom _resolve_imap_config uses, must
+        survive NSJSONSerialization as present keys (uncoerced, the keys are
+        silently dropped — the exact cause of the KeyError). Runs through
+        real osascript + the production JSON wrapper + parser."""
+        body = """
+        tell application "Mail"
+            set acctHost to missing value
+            if acctHost is missing value then set acctHost to ""
+            set acctPort to missing value
+            if acctPort is missing value then set acctPort to 0
+            set resultData to {|host|:acctHost, |port|:acctPort}
+        end tell
+        """
+        script = _wrap_as_json_script(body, timeout=connector.timeout)
+        parsed = parse_applescript_json(connector._run_applescript(script))
+        assert isinstance(parsed, dict)
+        # Keys present (not dropped) and coerced to safe defaults.
+        assert parsed.get("host") == ""
+        assert parsed.get("port") == 0
+
+
+class TestSaveAttachmentsByteCapSizeSource:
+    """#236 — the save_attachments byte caps key off `file size of att`
+    (enumerated by _get_attachments_applescript). Validate against real
+    Mail.app that the size field is actually populated for real attachment
+    content, so the pre-check has something to enforce on. Skips if the test
+    account's INBOX has no attachment-bearing message."""
+
+    def test_attachment_size_is_populated(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        msgs = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", has_attachment=True, limit=1
+        )
+        if not msgs:
+            pytest.skip("no attachment-bearing message in test INBOX")
+        atts = connector._get_attachments_applescript(str(msgs[0]["id"]))
+        if not atts:
+            pytest.skip("message reported no enumerable attachments")
+        for a in atts:
+            assert isinstance(a["size"], int)
+            assert a["size"] >= 0
+        # Meaningfully populated for real content (not all zero), so the
+        # per-attachment / aggregate caps have a real size to gate on.
+        assert any(a["size"] > 0 for a in atts)

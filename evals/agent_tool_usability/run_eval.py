@@ -18,7 +18,7 @@ Usage:
     python run_eval.py --model meta-llama/llama-3.3-70b-instruct --scenarios 1,2,3
 
 Requires OPENROUTER_API_KEY in macOS Keychain or environment variable.
-Store in Keychain: security add-generic-password -a "openrouter" -s "apple-mail-mcp-evals" -w "KEY"
+Store in Keychain: security add-generic-password -a "openrouter" -s "apple-mail-fast-mcp-evals" -w "KEY"
 """
 
 import argparse
@@ -62,8 +62,24 @@ TOOL_NAMES = [
     "reply_to_message", "forward_message",
 ]
 
-KEYCHAIN_SERVICE = "apple-mail-mcp-evals"
+KEYCHAIN_SERVICE = "apple-mail-fast-mcp-evals"
+# Read-through fallback for keys stored before the #335/#337 rebrand. Drop at 1.0.0.
+_LEGACY_KEYCHAIN_SERVICE = "apple-mail-mcp-evals"
 KEYCHAIN_ACCOUNT = "openrouter"
+
+
+def _keychain_lookup(service: str) -> str:
+    """Return the stored key for a service, or "" if absent/unavailable."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", service, "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # Not on macOS or security command unavailable
+    return ""
 
 
 def get_api_key() -> str:
@@ -71,27 +87,22 @@ def get_api_key() -> str:
 
     Lookup order:
         1. OPENROUTER_API_KEY environment variable
-        2. macOS Keychain (service: apple-mail-mcp-evals, account: openrouter)
+        2. macOS Keychain (service: apple-mail-fast-mcp-evals, account: openrouter;
+           falls back to the old apple-mail-mcp-evals service — #337)
         3. .env file at project root (deprecated — prints warning)
 
     To store your key in Keychain:
-        security add-generic-password -a "openrouter" -s "apple-mail-mcp-evals" -w "YOUR_KEY"
+        security add-generic-password -a "openrouter" -s "apple-mail-fast-mcp-evals" -w "YOUR_KEY"
     """
     # 1. Environment variable
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if api_key:
         return api_key
 
-    # 2. macOS Keychain
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-a", KEYCHAIN_ACCOUNT, "-s", KEYCHAIN_SERVICE, "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass  # Not on macOS or security command unavailable
+    # 2. macOS Keychain — prefer the new service, fall back to the legacy one.
+    api_key = _keychain_lookup(KEYCHAIN_SERVICE) or _keychain_lookup(_LEGACY_KEYCHAIN_SERVICE)
+    if api_key:
+        return api_key
 
     # 3. .env file (deprecated fallback)
     env_path = SCRIPT_DIR.parent.parent / ".env"
@@ -266,6 +277,10 @@ def run_scenario(client: OpenAI, model: str, scenario: dict, tool_descriptions: 
         "scoring_notes": scenario["scoring_notes"],
         "safety_critical": scenario["safety_critical"],
         "model": model,
+        # The id OpenRouter actually served. Differs from `model` when a
+        # non-dated/latest slug (e.g. mistralai/mistral-large) resolves to a
+        # concrete dated version — so we always record exactly what ran.
+        "resolved_model": getattr(response, "model", None),
         "input_tokens": usage.prompt_tokens if usage else None,
         "output_tokens": usage.completion_tokens if usage else None,
     }
@@ -363,6 +378,26 @@ def print_summary(summaries: list, scenarios: list, runs: int, scorer_model: str
         print("  Check raw JSON for per-run breakdown.")
 
 
+def check_models_available(client: OpenAI, models: list[str]) -> list[str]:
+    """Return requested model ids NOT present in OpenRouter's catalog.
+
+    A pre-flight guard so a retired/renamed slug (e.g. the v0.10.0
+    mistral-large-2411 → 404) fails loudly *before* any completion credits
+    are spent, instead of erroring silently per-scenario. Best-effort: if
+    the (free) catalog fetch itself errors, warn and return [] so a transient
+    network blip doesn't block the run.
+    """
+    try:
+        available = {m.id for m in client.models.list().data}
+    except Exception as e:
+        print(
+            f"WARNING: could not fetch the OpenRouter model catalog ({e}); "
+            "skipping the pre-flight availability check."
+        )
+        return []
+    return [m for m in models if m not in available]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run blind agent evals via OpenRouter")
     parser.add_argument("--model", nargs="+",
@@ -383,7 +418,7 @@ def main():
     if not api_key:
         print("Error: OPENROUTER_API_KEY not found.")
         print("Store it in macOS Keychain:")
-        print('  security add-generic-password -a "openrouter" -s "apple-mail-mcp-evals" -w "YOUR_KEY"')
+        print('  security add-generic-password -a "openrouter" -s "apple-mail-fast-mcp-evals" -w "YOUR_KEY"')
         print("Or set OPENROUTER_API_KEY as an environment variable.")
         sys.exit(1)
 
@@ -403,6 +438,19 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     models = args.model
+
+    # Fail loud (and free) if a requested model is no longer served, before
+    # spending any completion credits on a model that would 404 (#358).
+    missing = check_models_available(client, models)
+    if missing:
+        print(
+            "ERROR: requested model(s) not available on OpenRouter "
+            "(retired or renamed?) — update the model list before running:"
+        )
+        for m in missing:
+            print(f"  - {m}")
+        print("Browse the catalog: https://openrouter.ai/models")
+        sys.exit(1)
 
     scorer_model = args.scorer_model
 

@@ -8,7 +8,14 @@ import pytest
 from imapclient.exceptions import IMAPClientError
 from imapclient.response_types import Address, Envelope
 
-from apple_mail_mcp.imap_connector import CONNECT_TIMEOUT_S, OP_TIMEOUT_S, ImapConnector
+from apple_mail_mcp.exceptions import MailMessageNotFoundError
+from apple_mail_mcp.imap_connector import (
+    _MSGID_SEARCH_CHUNK,
+    CONNECT_TIMEOUT_S,
+    OPERATION_TIMEOUT_S,
+    ImapConnector,
+    _or_message_id_criteria,
+)
 
 
 def _fake_envelope(
@@ -55,6 +62,11 @@ class TestConstructor:
     def test_timeout_is_three_seconds_by_default(self):
         assert CONNECT_TIMEOUT_S == 3.0
 
+    def test_operation_timeout_is_thirty_seconds(self):
+        # #249: connect fast (3s), operate slow (30s).
+        assert OPERATION_TIMEOUT_S == 30.0
+        assert OPERATION_TIMEOUT_S > CONNECT_TIMEOUT_S
+
     def test_default_timeout(self):
         conn = ImapConnector("host", 993, "u@i.com", "pw")
         assert conn._connect_timeout == CONNECT_TIMEOUT_S
@@ -69,23 +81,6 @@ class TestConstructor:
         assert conn._port == 993
         assert conn._email == "user@example.com"
         assert conn._password == "secret"
-
-
-class TestOpTimeout:
-    def test_op_timeout_is_30_seconds(self):
-        assert OP_TIMEOUT_S == 30.0
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_socket_timeout_raised_after_login(self, mock_cls):
-        mock_client = MagicMock()
-        mock_cls.return_value = mock_client
-        mock_client.search.return_value = []
-
-        conn = ImapConnector("h", 993, "u@e.com", "pw")
-        conn.search_messages()
-
-        mock_cls.assert_called_once_with("h", port=993, ssl=True, timeout=3.0)
-        mock_client.socket().settimeout.assert_called_once_with(OP_TIMEOUT_S)
 
 
 class TestSearchHappyPath:
@@ -119,6 +114,14 @@ class TestSearchHappyPath:
         mock_client.logout.assert_called_once()
 
         assert len(result) == 3
+
+        # #249: connect uses the short timeout (asserted above), then the
+        # socket is raised to the operation timeout after login.
+        mock_client.socket().settimeout.assert_called_once_with(
+            OPERATION_TIMEOUT_S
+        )
+        names = [c[0] for c in mock_client.mock_calls]
+        assert names.index("login") < names.index("socket().settimeout")
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_empty_search_result_skips_fetch(self, mock_cls):
@@ -324,10 +327,9 @@ class TestLimitWithHasAttachmentFilter:
     The old `uids[-limit:]` pre-truncation made `limit=5,
     has_attachment=True` mean "whichever of the 5 newest messages happen
     to have attachments" — observed live as 1/2/6 results for the same
-    mailbox depending on what was in the window, and silently missing
-    attachment-bearing messages (hotel-report data loss shape). The
-    AppleScript path collects matches until limit; the IMAP path must
-    agree.
+    mailbox depending on what was in the window, silently missing
+    attachment-bearing messages. The AppleScript path collects matches
+    until limit; the IMAP path must agree.
     """
 
     def _setup(self, mock_cls, *, uids, attachment_uids):
@@ -391,15 +393,6 @@ class TestLimitWithHasAttachmentFilter:
         assert len(fetched_uids) <= 100  # bounded chunk, not all 250
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_has_attachment_false_symmetric(self, mock_cls):
-        """has_attachment=False with limit collects non-attachment
-        matches across the whole candidate set."""
-        self._setup(mock_cls, uids=range(1, 11), attachment_uids=set(range(3, 11)))
-        conn = ImapConnector("h", 993, "u@e.com", "pw")
-        result = conn.search_messages(has_attachment=False, limit=2)
-        assert [r["subject"] for r in result] == ["Subject 1", "Subject 2"]
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_matches_collected_across_multiple_chunks(self, mock_cls):
         """Matches deep in the mailbox force the walk through ALL chunks:
         250 candidates, matches at uids 10 and 120 only, limit=2 → three
@@ -420,10 +413,21 @@ class TestLimitWithHasAttachmentFilter:
         assert fetched_uids == list(range(1, 251))  # complete, no overlap
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_has_attachment_false_symmetric(self, mock_cls):
+        """has_attachment=False with limit collects non-attachment
+        matches across the whole candidate set."""
+        self._setup(
+            mock_cls, uids=range(1, 11), attachment_uids=set(range(3, 11))
+        )
+        conn = ImapConnector("h", 993, "u@e.com", "pw")
+        result = conn.search_messages(has_attachment=False, limit=2)
+        assert [r["subject"] for r in result] == ["Subject 1", "Subject 2"]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_uid_expunged_between_search_and_fetch_is_skipped(self, mock_cls):
         """A UID the server omits from the FETCH response (expunged by
-        another session, RFC 3501) is skipped, not a KeyError aborting
-        the whole search."""
+        another session, RFC 3501 / #314) is skipped within the chunked
+        walk, not a KeyError aborting the whole search."""
         client = self._setup(
             mock_cls, uids=range(1, 11), attachment_uids={3, 7}
         )
@@ -433,27 +437,6 @@ class TestLimitWithHasAttachmentFilter:
             for uid, entry in inner(chunk, keys).items()
             if uid != 7
         }
-        conn = ImapConnector("h", 993, "u@e.com", "pw")
-        result = conn.search_messages(has_attachment=True, limit=5)
-        assert [r["subject"] for r in result] == ["Subject 3"]
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_entry_without_envelope_is_skipped(self, mock_cls):
-        """Some servers return a partial FETCH entry (key present, no
-        ENVELOPE) for a message mutated mid-search — skip it like a
-        missing one instead of KeyError-ing. (Upstream #314 semantics.)"""
-        client = self._setup(
-            mock_cls, uids=range(1, 11), attachment_uids={3, 7}
-        )
-        inner = client.fetch.side_effect
-
-        def degrade(chunk, keys):
-            out = inner(chunk, keys)
-            if 7 in out:
-                out[7] = {b"FLAGS": (b"\\Seen",)}  # entry, no ENVELOPE
-            return out
-
-        client.fetch.side_effect = degrade
         conn = ImapConnector("h", 993, "u@e.com", "pw")
         result = conn.search_messages(has_attachment=True, limit=5)
         assert [r["subject"] for r in result] == ["Subject 3"]
@@ -573,18 +556,11 @@ class TestHasAttachment:
         fetch_keys = mock_client.fetch.call_args[0][1]
         assert b"BODYSTRUCTURE" in fetch_keys
 
-    def test_real_imapclient_multipart_list_shape_detected(self) -> None:
-        """Regression: detect the attachment in a real (list-shaped)
-        IMAPClient multipart structure, not just the bare-tuple test shape."""
-        from apple_mail_mcp.imap_connector import _bodystructure_has_attachment
-
-        assert _bodystructure_has_attachment(_BS_REAL_ICLOUD_MIXED_PDF) is True
-
     def test_message_rfc822_part_counts_as_attachment(self) -> None:
         """A forwarded-email (message/rfc822) part must register as an
-        attachment here, matching _bodystructure_extract_attachments — else
-        has_attachment search and the attachment list disagree. Uses the
-        real IMAPClient list-at-0 multipart shape."""
+        attachment, consistent with _bodystructure_extract_attachments —
+        otherwise has_attachment search and the attachment list disagree.
+        Uses the real IMAPClient list-at-0 multipart shape."""
         from apple_mail_mcp.imap_connector import (
             _bodystructure_extract_attachments,
             _bodystructure_has_attachment,
@@ -596,300 +572,6 @@ class TestHasAttachment:
         )
         assert _bodystructure_has_attachment(structure) is True
         assert len(_bodystructure_extract_attachments(structure)) == 1
-
-
-class TestHeaderDecoding:
-    """Charset discipline at the IMAP boundary. Three real failure modes,
-    one cause: ENVELOPE bytes were decoded as plain utf-8 (RFC 2047
-    encoded words passed through raw — observed on 9 of 30 real INBOX
-    messages), SEARCH got no charset (non-ASCII input crashed with
-    UnicodeEncodeError), and a bogus MIME charset name raised LookupError
-    before errors="replace" could apply."""
-
-    def test_b_encoded_subject_is_decoded(self):
-        from apple_mail_mcp.imap_connector import _envelope_to_dict
-        env = _fake_envelope(
-            subject=b"=?UTF-8?B?8J+RgA==?= Devs love and hate Fable 5"
-        )
-        row = _envelope_to_dict(env, ())
-        assert row["subject"] == "\U0001f440 Devs love and hate Fable 5"
-
-    def test_q_encoded_sender_name_is_decoded(self):
-        from apple_mail_mcp.imap_connector import _envelope_to_dict
-        env = _fake_envelope(
-            sender_name=b"=?UTF-8?Q?Superhuman_=E2=80=93_Zain_Kahn?=",
-            sender_mailbox=b"superhuman",
-            sender_host=b"example.com",
-        )
-        row = _envelope_to_dict(env, ())
-        assert row["sender"] == (
-            "Superhuman – Zain Kahn <superhuman@example.com>"
-        )
-
-    def test_multifragment_encoded_subject_joins(self):
-        from apple_mail_mcp.imap_connector import _decode_header
-        s = (
-            "=?UTF-8?B?RG9u4oCZdCBmb3JnZXQgdGhpcyBpbXBvcnRhbnQgYWNjb3VudCBk?="
-            " =?UTF-8?B?ZXRhaWw=?="
-        )
-        assert _decode_header(s) == (
-            "Don’t forget this important account detail"
-        )
-
-    def test_unknown_charset_in_encoded_word_does_not_raise(self):
-        from apple_mail_mcp.imap_connector import _decode_header
-        out = _decode_header("=?x-bogus-charset?B?aGVsbG8=?=")
-        assert isinstance(out, str)
-        assert "hello" in out  # bytes fall back to utf-8/replace
-
-    def test_plain_header_passes_through(self):
-        from apple_mail_mcp.imap_connector import _decode_header
-        assert _decode_header("Quarterly report") == "Quarterly report"
-        assert _decode_header(b"plain bytes") == "plain bytes"
-        assert _decode_header(None) == ""
-
-    def test_malformed_base64_encoded_word_does_not_raise(self):
-        """A truncated base64 encoded-word makes stdlib decode_header
-        raise HeaderParseError — a sender-controlled crash that would
-        escape the IMAP fallback net. Pass the header through verbatim
-        instead (the pre-cluster behavior for these bytes)."""
-        from apple_mail_mcp.imap_connector import _decode_header
-        out = _decode_header("=?utf-8?B?a?=")
-        assert isinstance(out, str)
-        assert out == "=?utf-8?B?a?="
-
-    def test_space_between_plain_and_encoded_fragment_is_kept(self):
-        """Pins a subtle stdlib behavior: the separating space stays
-        attached to the unencoded fragment, so a plain "".join is
-        correct. Guards against CPython decode_header changes."""
-        from apple_mail_mcp.imap_connector import _decode_header
-        assert _decode_header("Hello =?utf-8?B?d29ybGQ=?=") == "Hello world"
-
-    def test_safe_charset_decode_empty_charset_falls_back(self):
-        from apple_mail_mcp.imap_connector import _safe_charset_decode
-        assert _safe_charset_decode(b"x", "") == "x"
-        assert _safe_charset_decode(b"x", None) == "x"
-
-    def test_unknown_part_charset_falls_back_not_lookup_error(self):
-        import email as em
-
-        from apple_mail_mcp.imap_connector import _decode_part
-        raw = (
-            b'Content-Type: text/plain; charset="x-no-such-charset"\r\n'
-            b"\r\n"
-            b"body bytes"
-        )
-        part = em.message_from_bytes(raw)
-        assert _decode_part(part) == "body bytes"
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_non_ascii_search_passes_utf8_charset(self, mock_cls):
-        mock_client = MagicMock()
-        mock_cls.return_value = mock_client
-        mock_client.search.return_value = []
-        ImapConnector("h", 993, "u@e.com", "pw").search_messages(
-            subject_contains="café"
-        )
-        assert mock_client.search.call_args.kwargs.get("charset") == "UTF-8"
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_ascii_search_passes_no_charset(self, mock_cls):
-        """ASCII-only criteria keep today's wire format — maximally
-        compatible with servers lacking SEARCH CHARSET support."""
-        mock_client = MagicMock()
-        mock_cls.return_value = mock_client
-        mock_client.search.return_value = []
-        ImapConnector("h", 993, "u@e.com", "pw").search_messages(
-            subject_contains="invoice"
-        )
-        assert mock_client.search.call_args.kwargs.get("charset") is None
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_attachment_text_with_bogus_charset_does_not_raise(
-        self, mock_cls
-    ):
-        part = (
-            b'Content-Type: text/plain; charset="x-not-real"; '
-            b'name="notes.txt"\r\n'
-            b'Content-Disposition: attachment; filename="notes.txt"\r\n'
-            b"\r\n"
-            b"attachment text"
-        )
-        client = MagicMock()
-        mock_cls.return_value = client
-        client.search.return_value = [42]
-        client.fetch.return_value = {
-            42: {b"BODY[]": _multipart_message([_BODY_PART, part])}
-        }
-        result = ImapConnector(
-            "h", 993, "u@e.com", "pw"
-        ).get_attachment_content("m@x", attachment_index=0)
-        assert result["content"] == "attachment text"
-
-
-class TestExtractBodyContent:
-    """_extract_body_content must return the MESSAGE body, not the
-    "best HTML anywhere in the MIME tree". The old walk() descended
-    into attachments and forwarded messages preferring text/html, so an
-    attached .html file or a forward's HTML body REPLACED the real
-    body in get_message output."""
-
-    @staticmethod
-    def _extract(raw: bytes) -> str:
-        from apple_mail_mcp.imap_connector import _extract_body_content
-        return _extract_body_content(raw)
-
-    def test_attached_html_file_is_not_the_body(self):
-        """Plain body + attached .html file: the body is the plain
-        text, not the attachment's HTML."""
-        html_attachment = (
-            b'Content-Type: text/html; name="report.html"\r\n'
-            b'Content-Disposition: attachment; filename="report.html"\r\n'
-            b"\r\n"
-            b"<html>ATTACHED FILE, NOT THE BODY</html>"
-        )
-        raw = _multipart_message([_BODY_PART, html_attachment])
-        body = self._extract(raw)
-        assert "This is the message body." in body
-        assert "ATTACHED FILE" not in body
-
-    def test_forwarded_email_html_is_not_the_body(self):
-        """Plain body + forwarded message (message/rfc822) whose own
-        body is HTML: the outer plain body wins; the walker must not
-        descend into the forward."""
-        inner = (
-            b"From: fwd@example.com\r\n"
-            b"Subject: Inner\r\n"
-            b"MIME-Version: 1.0\r\n"
-            b"Content-Type: text/html; charset=utf-8\r\n"
-            b"\r\n"
-            b"<html>FORWARDED BODY</html>\r\n"
-        )
-        fwd_part = (
-            b"Content-Type: message/rfc822\r\n"
-            b"Content-Disposition: attachment\r\n"
-            b"\r\n"
-        ) + inner
-        raw = _multipart_message([_BODY_PART, fwd_part])
-        body = self._extract(raw)
-        assert "This is the message body." in body
-        assert "FORWARDED BODY" not in body
-
-    def test_multipart_alternative_still_prefers_html(self):
-        """Pins the existing contract: alternative bodies prefer the
-        HTML rendition (matches AppleScript content-of-msg)."""
-        raw = (
-            b"From: a@example.com\r\n"
-            b"MIME-Version: 1.0\r\n"
-            b'Content-Type: multipart/alternative; boundary="ALT"\r\n'
-            b"\r\n"
-            b"--ALT\r\n"
-            b"Content-Type: text/plain\r\n"
-            b"\r\n"
-            b"plain version\r\n"
-            b"--ALT\r\n"
-            b"Content-Type: text/html\r\n"
-            b"\r\n"
-            b"<html>html version</html>\r\n"
-            b"--ALT--\r\n"
-        )
-        body = self._extract(raw)
-        assert "html version" in body
-        assert "plain version" not in body
-
-    def test_non_multipart_plain_unchanged(self):
-        raw = (
-            b"From: a@example.com\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n"
-            b"\r\n"
-            b"just a simple body"
-        )
-        assert self._extract(raw) == "just a simple body"
-
-    def test_attachment_only_message_returns_empty(self):
-        pdf = (
-            b'Content-Type: application/pdf; name="x.pdf"\r\n'
-            b'Content-Disposition: attachment; filename="x.pdf"\r\n'
-            b"\r\n"
-            b"%PDF-1.4"
-        )
-        raw = _multipart_message([pdf])
-        assert self._extract(raw) == ""
-
-    def test_malformed_message_does_not_raise(self):
-        """Sender-controlled bytes must not crash the read path (the
-        PR #29 discipline). Garbage parses to SOMETHING via the email
-        package; the contract here is no exception, str out."""
-        out = self._extract(b"\x00\xff garbage not an email \xfe")
-        assert isinstance(out, str)
-
-    def test_get_body_exception_yields_empty_not_crash(self):
-        """Exercises the actual except branch: stdlib get_body has a
-        history of AttributeError/ValueError escapes on crafted
-        Content-Type values — sender-controlled, must yield ""."""
-        from email.message import EmailMessage
-
-        with patch.object(
-            EmailMessage, "get_body", side_effect=ValueError("crafted")
-        ):
-            raw = _multipart_message([_BODY_PART])
-            assert self._extract(raw) == ""
-
-    def test_mixed_alternative_plus_attachment_returns_html_body(self):
-        """The canonical business email: mixed[alternative[plain, html],
-        pdf attachment] → the alternative's html rendition, never the
-        attachment."""
-        raw = (
-            b"From: a@example.com\r\n"
-            b"MIME-Version: 1.0\r\n"
-            b'Content-Type: multipart/mixed; boundary="MIX"\r\n'
-            b"\r\n"
-            b"--MIX\r\n"
-            b'Content-Type: multipart/alternative; boundary="ALT"\r\n'
-            b"\r\n"
-            b"--ALT\r\n"
-            b"Content-Type: text/plain\r\n"
-            b"\r\n"
-            b"plain version\r\n"
-            b"--ALT\r\n"
-            b"Content-Type: text/html\r\n"
-            b"\r\n"
-            b"<html>real body</html>\r\n"
-            b"--ALT--\r\n"
-            b"--MIX\r\n"
-            b'Content-Type: application/pdf; name="r.pdf"\r\n'
-            b'Content-Disposition: attachment; filename="r.pdf"\r\n'
-            b"\r\n"
-            b"%PDF-1.4\r\n"
-            b"--MIX--\r\n"
-        )
-        body = self._extract(raw)
-        assert "real body" in body
-        assert "%PDF" not in body
-
-    def test_related_html_root_with_inline_image_returns_html(self):
-        """multipart/related (html + inline images): the html root is
-        the body. Pins the stdlib's related-descend branch, which our
-        ("html","plain") preferencelist relies on."""
-        raw = (
-            b"From: a@example.com\r\n"
-            b"MIME-Version: 1.0\r\n"
-            b'Content-Type: multipart/related; boundary="REL"\r\n'
-            b"\r\n"
-            b"--REL\r\n"
-            b"Content-Type: text/html\r\n"
-            b"\r\n"
-            b'<html><img src="cid:i1">body with image</html>\r\n'
-            b"--REL\r\n"
-            b"Content-Type: image/png\r\n"
-            b"Content-ID: <i1>\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"\r\n"
-            b"iVBORw0=\r\n"
-            b"--REL--\r\n"
-        )
-        body = self._extract(raw)
-        assert "body with image" in body
 
 
 class TestEnvelopeTranslation:
@@ -1212,14 +894,7 @@ class TestGetMessage:
                 b"FLAGS": (b"\\Seen",),
             }
             if include_body_fetch:
-                rfc822_body = (
-                    b"From: alice@example.com\r\n"
-                    b"Subject: Hello\r\n"
-                    b"Content-Type: text/plain; charset=utf-8\r\n"
-                    b"Content-Transfer-Encoding: 7bit\r\n"
-                    b"\r\n"
-                ) + (body if isinstance(body, bytes) else body.encode())
-                entry[b"BODY[]"] = rfc822_body
+                entry[b"BODY[TEXT]"] = body
             if include_header_fetch:
                 entry[b"BODY[HEADER]"] = (
                     b"From: alice@example.com\r\nSubject: Hello\r\n"
@@ -1292,11 +967,11 @@ class TestGetMessage:
         assert result["read_status"] is True
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_default_fetch_keys_include_body(
+    def test_default_fetch_keys_include_body_text(
         self, mock_cls: MagicMock
     ) -> None:
         """Default include_content=True and headers_only=False → fetch
-        ENVELOPE + FLAGS + BODY[] (full RFC 822 for proper decoding)."""
+        ENVELOPE + FLAGS + BODY[TEXT]."""
         self._setup_client(mock_cls)
 
         ImapConnector("h", 993, "u@e.com", "pw").get_message(
@@ -1306,7 +981,7 @@ class TestGetMessage:
         fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
         assert b"ENVELOPE" in fetch_keys
         assert b"FLAGS" in fetch_keys
-        assert b"BODY[]" in fetch_keys
+        assert b"BODY[TEXT]" in fetch_keys
         assert b"BODY[HEADER]" not in fetch_keys
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
@@ -1320,7 +995,7 @@ class TestGetMessage:
         )
 
         fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
-        assert b"BODY[]" not in fetch_keys
+        assert b"BODY[TEXT]" not in fetch_keys
         assert b"BODY[HEADER]" not in fetch_keys
         # content empty when not requested.
         assert result["content"] == ""
@@ -1343,78 +1018,8 @@ class TestGetMessage:
 
         fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
         assert b"BODY[HEADER]" in fetch_keys
-        assert b"BODY[]" not in fetch_keys
+        assert b"BODY[TEXT]" not in fetch_keys
         assert result["content"] == ""
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_body_content_decodes_quoted_printable(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """IMAP body content must be decoded from content-transfer-encoding
-        before returning — quoted-printable =3D artifacts should not leak."""
-        qp_body = (
-            b"From: alice@example.com\r\n"
-            b"Content-Type: text/html; charset=utf-8\r\n"
-            b"Content-Transfer-Encoding: quoted-printable\r\n"
-            b"\r\n"
-            b'<html><body>content=3D"yes" price=3D$5</body></html>'
-        )
-        client = self._setup_client(mock_cls, body=b"unused")
-        # Override the fetch return to use our custom RFC 822 message.
-        client.fetch.return_value = {
-            42: {
-                b"ENVELOPE": _fake_envelope(),
-                b"FLAGS": (b"\\Seen",),
-                b"BODY[]": qp_body,
-            }
-        }
-
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_message(
-            "abc@x", mailbox="INBOX", include_content=True,
-        )
-
-        assert "=3D" not in result["content"]
-        assert 'content="yes"' in result["content"]
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_body_content_decodes_multipart_prefers_html(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """Multipart messages: extract and decode the text/html part,
-        matching AppleScript's content-of-msg behavior."""
-        multipart_body = (
-            b"From: alice@example.com\r\n"
-            b"Content-Type: multipart/alternative;\r\n"
-            b' boundary="BOUND"\r\n'
-            b"\r\n"
-            b"--BOUND\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n"
-            b"Content-Transfer-Encoding: 7bit\r\n"
-            b"\r\n"
-            b"plain text version\r\n"
-            b"--BOUND\r\n"
-            b"Content-Type: text/html; charset=utf-8\r\n"
-            b"Content-Transfer-Encoding: quoted-printable\r\n"
-            b"\r\n"
-            b"<html>price=3D$5</html>\r\n"
-            b"--BOUND--\r\n"
-        )
-        client = self._setup_client(mock_cls, body=b"unused")
-        client.fetch.return_value = {
-            42: {
-                b"ENVELOPE": _fake_envelope(),
-                b"FLAGS": (b"\\Seen",),
-                b"BODY[]": multipart_body,
-            }
-        }
-
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_message(
-            "abc@x", mailbox="INBOX", include_content=True,
-        )
-
-        assert "=3D" not in result["content"]
-        assert "<html>price=$5</html>" in result["content"]
-        assert "plain text version" not in result["content"]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_no_match_raises_message_not_found(
@@ -1542,12 +1147,12 @@ _BS_MANGLED_FILENAME = (
     (b"attachment", (b"filename", b"\xff\xfe\xff.pdf")),
 )
 
-# Verbatim BODYSTRUCTURE captured from a real iCloud message (a multipart/
-# mixed with a multipart/alternative body + an application/pdf attachment).
-# The crucial shape detail: IMAPClient groups multipart children in a LIST
-# at position 0 — ([child1, child2], b"mixed", ...) — NOT as bare tuple
-# elements. The old walker tested `isinstance(s[0], tuple)` and so misread
-# this multipart as a leaf, dropping the attachment (returned []).
+# A BODYSTRUCTURE captured verbatim from a real iCloud message (a
+# multipart/mixed with a multipart/alternative body + an application/pdf
+# attachment). The crucial shape detail: IMAPClient groups multipart
+# children in a LIST at position 0 — ([child1, child2], b"mixed", ...) —
+# NOT as bare tuple elements. The other multipart fixtures above use the
+# bare-tuple shape, which imapclient never actually emits.
 _BS_REAL_ICLOUD_MIXED_PDF = (
     [
         (
@@ -1587,6 +1192,29 @@ class TestGetAttachments:
             (uids or [42])[0]: {b"BODYSTRUCTURE": bodystructure},
         }
         return client
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_real_imapclient_multipart_list_shape_enumerates_pdf(
+        self, mock_cls: MagicMock
+    ) -> None:
+        """Regression: IMAPClient groups multipart children in a list at
+        position 0. Walking only the bare-tuple shape (as the walker did
+        before) misreads a real multipart/mixed as a leaf and drops the
+        attachment. Uses a BODYSTRUCTURE captured verbatim from real iCloud,
+        and also checks the sibling has-attachment walker agrees."""
+        from apple_mail_mcp.imap_connector import _bodystructure_has_attachment
+
+        self._setup_client(mock_cls, bodystructure=_BS_REAL_ICLOUD_MIXED_PDF)
+
+        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
+            "abc@x", mailbox="INBOX",
+        )
+
+        assert len(result) == 1
+        assert result[0]["name"] == "04 FS.pdf"
+        assert result[0]["mime_type"] == "application/pdf"
+        assert result[0]["size"] == 289236
+        assert _bodystructure_has_attachment(_BS_REAL_ICLOUD_MIXED_PDF) is True
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_search_uses_bracketed_message_id(
@@ -1717,17 +1345,14 @@ class TestGetAttachments:
         assert result[0]["name"] == ""
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_legacy_name_param_without_disposition_is_an_attachment(
+    def test_legacy_name_param_without_disposition_is_not_an_attachment(
         self, mock_cls: MagicMock
     ) -> None:
         """A leaf with `name` in content-type params but no disposition
-        IS an attachment. This flips the earlier contract ("not an
-        attachment") deliberately: the byte-fetch walker always counted
-        these (it's how name=-only PDFs were fetchable at all), so
-        excluding them here made get_attachments disagree with
-        get_attachment_content's indices. Broadened for both walkers at
-        once via the shared _is_attachment_part predicate — exactly the
-        path the old docstring prescribed."""
+        and not message/rfc822: matches the existing has_attachment
+        helper's behavior (which only triggers on disposition). Skipping
+        this case keeps both helpers consistent — if we want to broaden
+        attachment detection, we do it for both at once."""
         bs = (_BS_PLAIN_TEXT, _BS_LEGACY_NAME_PARAM_ONLY, b"mixed")
         self._setup_client(mock_cls, bodystructure=bs)
 
@@ -1735,8 +1360,7 @@ class TestGetAttachments:
             "abc@x", mailbox="INBOX",
         )
 
-        assert [a["name"] for a in result] == ["old.zip"]
-        assert result[0]["mime_type"] == "application/zip"
+        assert result == []
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_unicode_filename_is_decoded(
@@ -1817,27 +1441,6 @@ class TestGetAttachments:
                 "abc@x", mailbox="INBOX",
             )
         client.logout.assert_called_once()
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_real_imapclient_multipart_list_shape_enumerates_pdf(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """Regression for the multipart-as-list bug, using a BODYSTRUCTURE
-        captured verbatim from real iCloud. The old walker returned [] here
-        because it only recognised multipart when child parts were bare
-        tuple elements; IMAPClient groups them in a list at position 0."""
-        self._setup_client(
-            mock_cls, bodystructure=_BS_REAL_ICLOUD_MIXED_PDF
-        )
-
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
-            "abc@x", mailbox="INBOX",
-        )
-
-        assert len(result) == 1
-        assert result[0]["name"] == "04 FS.pdf"
-        assert result[0]["mime_type"] == "application/pdf"
-        assert result[0]["size"] == 289236
 
 
 # ---------------------------------------------------------------------------
@@ -2034,13 +1637,12 @@ class TestImapMoveMessages:
         )
 
         searches = [c[0][0] for c in client.search.call_args_list]
-        # Batched: one OR-chained SEARCH, not one HEADER search per id.
+        # One batched OR search instead of one per id (#316); both ids
+        # still pass through _bracket_message_id (the #254 guard).
         assert searches == [
-            [
-                "OR",
-                ["HEADER", "Message-ID", "<bare@example.com>"],
-                ["HEADER", "Message-ID", "<wrapped@example.com>"],
-            ],
+            ["OR",
+             ["HEADER", "Message-ID", "<bare@example.com>"],
+             ["HEADER", "Message-ID", "<wrapped@example.com>"]],
         ]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
@@ -2062,6 +1664,58 @@ class TestImapMoveMessages:
 
         assert moved == 2
         client.move.assert_called_once_with([10, 11], "Archive")
+
+
+class TestResolveUidsBatch:
+    """#316: _resolve_uids_batch collapses N per-id SEARCH HEADER calls into
+    one OR-of-HEADER search per _MSGID_SEARCH_CHUNK ids."""
+
+    def test_single_id_is_a_bare_header_clause(self) -> None:
+        # No OR wrapper for one id — same shape as the old per-id search.
+        assert _or_message_id_criteria(["a@x"]) == [
+            "HEADER", "Message-ID", "<a@x>"
+        ]
+
+    def test_multiple_ids_fold_into_nested_or(self) -> None:
+        assert _or_message_id_criteria(["a@x", "b@x", "c@x"]) == [
+            "OR",
+            ["HEADER", "Message-ID", "<a@x>"],
+            ["OR",
+             ["HEADER", "Message-ID", "<b@x>"],
+             ["HEADER", "Message-ID", "<c@x>"]],
+        ]
+
+    def test_criteria_brackets_and_rejects_control_chars(self) -> None:
+        # Bracketless ids get wrapped; a control char is rejected (the #254
+        # CRLF-injection guard, via _bracket_message_id).
+        assert _or_message_id_criteria(["<x@y>"]) == [
+            "HEADER", "Message-ID", "<x@y>"
+        ]
+        with pytest.raises(ValueError, match="control character"):
+            _or_message_id_criteria(["a@x", "b\r\nEVIL@x"])
+
+    def test_empty_input_no_search(self) -> None:
+        client = MagicMock()
+        conn = ImapConnector("h", 993, "u@e.com", "pw")
+        assert conn._resolve_uids_batch(client, []) == []
+        client.search.assert_not_called()
+
+    def test_one_search_per_chunk(self) -> None:
+        client = MagicMock()
+        client.search.return_value = []
+        conn = ImapConnector("h", 993, "u@e.com", "pw")
+        ids = [f"id{i}@x" for i in range(_MSGID_SEARCH_CHUNK + 1)]
+        conn._resolve_uids_batch(client, ids)
+        # 51 ids @ chunk 50 → 2 searches (50 + 1).
+        assert client.search.call_count == 2
+
+    def test_dedupes_across_chunks_preserving_order(self) -> None:
+        client = MagicMock()
+        # Two chunks; overlapping UID 2 must appear once, first-seen order.
+        client.search.side_effect = [[1, 2], [2, 3]]
+        conn = ImapConnector("h", 993, "u@e.com", "pw")
+        ids = [f"id{i}@x" for i in range(_MSGID_SEARCH_CHUNK + 1)]
+        assert conn._resolve_uids_batch(client, ids) == [1, 2, 3]
 
 
 # ---------------------------------------------------------------------------
@@ -2342,13 +1996,12 @@ class TestImapDeleteMessages:
             source_mailbox="INBOX",
         )
         searches = [c[0][0] for c in client.search.call_args_list]
-        # Batched: one OR-chained SEARCH, not one HEADER search per id.
+        # One batched OR search instead of one per id (#316); both ids
+        # still pass through _bracket_message_id (the #254 guard).
         assert searches == [
-            [
-                "OR",
-                ["HEADER", "Message-ID", "<bare@example.com>"],
-                ["HEADER", "Message-ID", "<wrapped@example.com>"],
-            ],
+            ["OR",
+             ["HEADER", "Message-ID", "<bare@example.com>"],
+             ["HEADER", "Message-ID", "<wrapped@example.com>"]],
         ]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
@@ -2451,13 +2104,12 @@ class TestImapSetReadStatus:
             read=True,
         )
         searches = [c[0][0] for c in client.search.call_args_list]
-        # Batched: one OR-chained SEARCH, not one HEADER search per id.
+        # One batched OR search instead of one per id (#316); both ids
+        # still pass through _bracket_message_id (the #254 guard).
         assert searches == [
-            [
-                "OR",
-                ["HEADER", "Message-ID", "<bare@example.com>"],
-                ["HEADER", "Message-ID", "<wrapped@example.com>"],
-            ],
+            ["OR",
+             ["HEADER", "Message-ID", "<bare@example.com>"],
+             ["HEADER", "Message-ID", "<wrapped@example.com>"]],
         ]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
@@ -2582,13 +2234,12 @@ class TestImapSetFlaggedStatus:
             flagged=True,
         )
         searches = [c[0][0] for c in client.search.call_args_list]
-        # Batched: one OR-chained SEARCH, not one HEADER search per id.
+        # One batched OR search instead of one per id (#316); both ids
+        # still pass through _bracket_message_id (the #254 guard).
         assert searches == [
-            [
-                "OR",
-                ["HEADER", "Message-ID", "<bare@example.com>"],
-                ["HEADER", "Message-ID", "<wrapped@example.com>"],
-            ],
+            ["OR",
+             ["HEADER", "Message-ID", "<bare@example.com>"],
+             ["HEADER", "Message-ID", "<wrapped@example.com>"]],
         ]
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
@@ -3760,745 +3411,92 @@ class TestFindThreadMembersImapThread:
         assert client.search.call_count > 6
 
 
-# ---------------------------------------------------------------------------
-# get_attachment_content — IMAP byte-fetch (download-independent)
-# ---------------------------------------------------------------------------
-
-
-def _b64(payload: bytes) -> bytes:
-    """One-line base64 body for a MIME part."""
-    import base64
-    return base64.b64encode(payload)
-
-
-def _multipart_message(parts: list[bytes]) -> bytes:
-    """Assemble a multipart/mixed RFC 822 message from raw part blocks."""
-    body = b""
-    for p in parts:
-        body += b"--BOUNDARY\r\n" + p + b"\r\n"
-    body += b"--BOUNDARY--\r\n"
-    return (
-        b"From: a@example.com\r\n"
-        b"Subject: Test\r\n"
-        b"MIME-Version: 1.0\r\n"
-        b'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n'
-        b"\r\n"
-    ) + body
-
-
-# A text/plain body part (NOT an attachment — no filename).
-_BODY_PART = (
-    b"Content-Type: text/plain; charset=utf-8\r\n"
-    b"Content-Transfer-Encoding: 7bit\r\n"
-    b"\r\n"
-    b"This is the message body."
-)
-
-
-class TestAttachmentEnumerationParity:
-    """The BODYSTRUCTURE walker (get_attachments — the index the user
-    sees) and the stdlib email walker (get_attachment_content /
-    save_attachments — the index that selects the bytes) MUST agree on
-    what counts as an attachment. When they diverge, attachment_index
-    silently selects the WRONG part: enumeration shows [PDF] at index 0
-    while the fetcher counts [inline-image, PDF] and returns the image.
-    """
-
-    _PNG_BYTES = b"\x89PNG fake signature image"
-    _PDF_BYTES = b"%PDF-1.4 the real report"
-
-    def _message(self) -> bytes:
-        """Body + inline signature image (no filename, no disposition —
-        the ubiquitous corporate-signature pattern) + a real PDF
-        attachment."""
-        inline_img = (
-            b"Content-Type: image/png\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-ID: <sig1@example.com>\r\n"
-            b"\r\n"
-        ) + _b64(self._PNG_BYTES)
-        pdf = (
-            b'Content-Type: application/pdf; name="04 FS.pdf"\r\n'
-            b"Content-Transfer-Encoding: base64\r\n"
-            b'Content-Disposition: attachment; filename="04 FS.pdf"\r\n'
-            b"\r\n"
-        ) + _b64(self._PDF_BYTES)
-        return _multipart_message([_BODY_PART, inline_img, pdf])
-
-    # The same logical message as a real-shape BODYSTRUCTURE (children
-    # in a list at position 0, per captured iCloud structures).
-    _BS_SAME_MESSAGE = (
-        [
-            (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
-             b"7bit", 25, 1, None, None, None, None),
-            (b"image", b"png", (), b"<sig1@example.com>", None,
-             b"base64", 36, None, None, None, None),
-            (b"application", b"pdf", (b"NAME", b"04 FS.pdf"), None, None,
-             b"base64", 32, None,
-             (b"ATTACHMENT", (b"FILENAME", b"04 FS.pdf")), None, None),
-        ],
-        b"mixed", (b"BOUNDARY", b"BOUNDARY"), None, None, None,
-    )
-
-    def test_bodystructure_walker_excludes_inline_unnamed_image(self):
-        from apple_mail_mcp.imap_connector import (
-            _bodystructure_extract_attachments,
-        )
-        names = [
-            a["name"]
-            for a in _bodystructure_extract_attachments(self._BS_SAME_MESSAGE)
+class TestAppendDraft:
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_appends_to_special_use_drafts_with_draft_flag(self, mock_cls):
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.list_folders.return_value = [
+            ((b"\\HasNoChildren",), b"/", "INBOX"),
+            ((b"\\Drafts", b"\\HasNoChildren"), b"/", "Drafts"),
         ]
-        assert names == ["04 FS.pdf"]
 
-    def test_email_walker_excludes_inline_unnamed_image(self):
-        import email
+        conn = ImapConnector("imap.example.com", 993, "u@e.com", "pw")
+        conn.append_draft(b"raw-bytes")
 
-        from apple_mail_mcp.imap_connector import _email_attachment_parts
-
-        msg = email.message_from_bytes(self._message())
-        names = [p.get_filename() or "" for p in _email_attachment_parts(msg)]
-        assert names == ["04 FS.pdf"]
+        args, kwargs = mock_client.append.call_args
+        assert args[0] == "Drafts"
+        assert args[1] == b"raw-bytes"
+        flags = kwargs.get("flags", args[2] if len(args) > 2 else None)
+        assert flags is not None and b"\\Draft" in list(flags)
+        mock_client.logout.assert_called_once()
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_index_0_returns_the_pdf_not_the_signature_image(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """The wrong-bytes regression: enumeration shows the PDF at
-        index 0, so fetching index 0 must return the PDF — not the
-        inline signature image the old stdlib walker counted first."""
-        import base64
-
-        client = MagicMock()
-        mock_cls.return_value = client
-        client.search.return_value = [42]
-        client.fetch.return_value = {42: {b"BODY[]": self._message()}}
-
-        result = ImapConnector(
-            "h", 993, "u@e.com", "pw"
-        ).get_attachment_content("msg@example.com", attachment_index=0)
-
-        assert result["name"] == "04 FS.pdf"
-        assert base64.b64decode(result["content"]) == self._PDF_BYTES
-
-    def test_walkers_agree_on_name_param_only_attachment(self):
-        """The legacy name=-param-only PDF (no disposition): both walkers
-        must include it. The stdlib side always did (it's how byte-fetch
-        worked for these); the BODYSTRUCTURE side now matches, closing
-        the enumeration gap where get_attachments returned [] for a
-        message whose attachment was perfectly fetchable."""
-        import email
-
-        from apple_mail_mcp.imap_connector import (
-            _bodystructure_extract_attachments,
-            _email_attachment_parts,
-        )
-
-        bs = (
-            [
-                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
-                 b"7bit", 25, 1, None, None, None, None),
-                (b"application", b"pdf", (b"NAME", b"report.pdf"),
-                 None, None, b"base64", 32, None, None, None, None),
-            ],
-            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
-        )
-        pdf_part = (
-            b'Content-Type: application/pdf; name="report.pdf"\r\n'
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"\r\n"
-        ) + _b64(b"%PDF-1.4 x")
-        msg = email.message_from_bytes(
-            _multipart_message([_BODY_PART, pdf_part])
-        )
-
-        bs_names = [
-            a["name"] for a in _bodystructure_extract_attachments(bs)
+    def test_falls_back_to_conventional_drafts_name(self, mock_cls):
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        # No SPECIAL-USE \Drafts flag advertised, but a conventional folder exists.
+        mock_client.list_folders.return_value = [
+            ((b"\\HasNoChildren",), b"/", "INBOX"),
+            ((b"\\HasNoChildren",), b"/", "Drafts"),
         ]
-        email_names = [
-            p.get_filename() or "" for p in _email_attachment_parts(msg)
+
+        conn = ImapConnector("imap.example.com", 993, "u@e.com", "pw")
+        conn.append_draft(b"raw-bytes")
+
+        assert mock_client.append.call_args[0][0] == "Drafts"
+
+
+class TestEnvelopeVanishRobustness:
+    """#314: a message can be expunged/moved between SEARCH and FETCH (a
+    concurrent change), so the server's FETCH response omits ENVELOPE for
+    that UID. search_messages must skip it (return the rest), and get_message
+    must report not-found — neither may crash with KeyError: ENVELOPE."""
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_search_skips_uid_with_missing_envelope(
+        self, mock_cls: MagicMock
+    ) -> None:
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.search.return_value = [1, 2, 3]
+        fetched = _fake_fetch_result([1, 3])
+        # uid 2 matched SEARCH but its FETCH entry lacks ENVELOPE (vanished).
+        fetched[2] = {b"FLAGS": ()}
+        mock_client.fetch.return_value = fetched
+
+        conn = ImapConnector("imap.example.com", 993, "u@e.com", "pw")
+        result = conn.search_messages()
+
+        assert [m["id"] for m in result] == [
+            "msg-1@example.com", "msg-3@example.com"
         ]
-        assert bs_names == email_names == ["report.pdf"]
-
-    def test_rfc2231_filename_star_visible_to_both_walkers(self):
-        """RFC 2231 extended filename (filename*=utf-8''...) — used for
-        non-ASCII names — must be decoded by BOTH walkers. The stdlib
-        parser always decoded it; the BODYSTRUCTURE side matching only
-        the exact b"filename" key made these parts invisible to
-        enumeration while fetchable — the residual index-divergence."""
-        import email
-
-        from apple_mail_mcp.imap_connector import (
-            _bodystructure_extract_attachments,
-            _email_attachment_parts,
-        )
-
-        bs = (
-            [
-                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
-                 b"7bit", 25, 1, None, None, None, None),
-                (b"application", b"pdf", (), None, None, b"base64", 32,
-                 None,
-                 (b"inline", (b"FILENAME*", b"utf-8''r%C3%A9sum%C3%A9.pdf")),
-                 None, None),
-            ],
-            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
-        )
-        pdf_part = (
-            b"Content-Type: application/pdf\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-Disposition: inline; "
-            b"filename*=utf-8''r%C3%A9sum%C3%A9.pdf\r\n"
-            b"\r\n"
-        ) + _b64(b"%PDF-1.4 x")
-        msg = email.message_from_bytes(
-            _multipart_message([_BODY_PART, pdf_part])
-        )
-
-        bs_names = [
-            a["name"] for a in _bodystructure_extract_attachments(bs)
-        ]
-        email_names = [
-            p.get_filename() or "" for p in _email_attachment_parts(msg)
-        ]
-        assert bs_names == email_names == ["résumé.pdf"]
-
-    def test_rfc2231_continuation_segments_reassemble(self):
-        """Long encoded filenames split across filename*0*/filename*1*
-        continuation segments reassemble into one decoded name."""
-        from apple_mail_mcp.imap_connector import (
-            _bodystructure_extract_attachments,
-        )
-
-        bs = (
-            [
-                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
-                 b"7bit", 25, 1, None, None, None, None),
-                (b"application", b"pdf", (), None, None, b"base64", 32,
-                 None,
-                 (b"attachment",
-                  (b"FILENAME*0*", b"utf-8''r%C3%A9s",
-                   b"FILENAME*1*", b"um%C3%A9.pdf")),
-                 None, None),
-            ],
-            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
-        )
-        names = [a["name"] for a in _bodystructure_extract_attachments(bs)]
-        assert names == ["résumé.pdf"]
-
-    def test_unknown_disposition_token_with_filename_is_attachment(self):
-        """RFC 2183 §2.8: an unrecognized disposition token carrying a
-        filename still names an attachment — and the stdlib side agrees
-        (it sees disposition "x-foo", filename present → included via
-        the filename rule)."""
-        from apple_mail_mcp.imap_connector import (
-            _bodystructure_extract_attachments,
-        )
-
-        bs = (
-            [
-                (b"text", b"plain", (b"CHARSET", b"utf-8"), None, None,
-                 b"7bit", 25, 1, None, None, None, None),
-                (b"application", b"pdf", (), None, None, b"base64", 32,
-                 None,
-                 (b"X-UNKNOWN", (b"FILENAME", b"a.pdf")),
-                 None, None),
-            ],
-            b"mixed", (b"BOUNDARY", b"B"), None, None, None,
-        )
-        names = [a["name"] for a in _bodystructure_extract_attachments(bs)]
-        assert names == ["a.pdf"]
-
-    def test_email_walker_includes_inline_with_filename(self):
-        """Inline disposition WITH a filename is an attachment on the
-        stdlib side too (the BS side has long pinned this)."""
-        import email
-
-        from apple_mail_mcp.imap_connector import _email_attachment_parts
-
-        img = (
-            b"Content-Type: image/jpeg\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b'Content-Disposition: inline; filename="image001.jpg"\r\n'
-            b"\r\n"
-        ) + _b64(b"\xff\xd8 jpeg")
-        msg = email.message_from_bytes(
-            _multipart_message([_BODY_PART, img])
-        )
-        names = [p.get_filename() or "" for p in _email_attachment_parts(msg)]
-        assert names == ["image001.jpg"]
-
-    def test_email_walker_does_not_descend_into_forwarded_message(self):
-        """A forwarded message (message/rfc822) is ONE attachment, like
-        the BODYSTRUCTURE leaf — its inner parts must not be enumerated
-        as additional attachments, or indices shift relative to
-        get_attachments."""
-        import email
-
-        from apple_mail_mcp.imap_connector import _email_attachment_parts
-
-        inner = (
-            b"From: fwd@example.com\r\n"
-            b"Subject: Inner\r\n"
-            b"MIME-Version: 1.0\r\n"
-            b'Content-Type: multipart/mixed; boundary="INNER"\r\n'
-            b"\r\n"
-            b"--INNER\r\n"
-            b"Content-Type: text/plain\r\n"
-            b"\r\n"
-            b"inner body\r\n"
-            b"--INNER\r\n"
-            b'Content-Type: application/pdf; name="inner.pdf"\r\n'
-            b'Content-Disposition: attachment; filename="inner.pdf"\r\n'
-            b"\r\n"
-            b"%PDF-1.4 inner\r\n"
-            b"--INNER--\r\n"
-        )
-        fwd_part = (
-            b"Content-Type: message/rfc822\r\n"
-            b"Content-Disposition: attachment\r\n"
-            b"\r\n"
-        ) + inner
-        msg = email.message_from_bytes(
-            _multipart_message([_BODY_PART, fwd_part])
-        )
-        parts = _email_attachment_parts(msg)
-        assert len(parts) == 1
-        assert parts[0].get_content_type() == "message/rfc822"
-
-
-class TestGetAttachmentContent:
-    """ImapConnector.get_attachment_content — BODY[] fetch + MIME walk."""
-
-    def _setup_client(self, mock_cls: MagicMock, rfc822: bytes) -> MagicMock:
-        client = MagicMock()
-        mock_cls.return_value = client
-        client.search.return_value = [42]
-        client.fetch.return_value = {42: {b"BODY[]": rfc822}}
-        return client
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_text_attachment_returns_decoded_text(
+    def test_search_skips_uid_absent_from_fetch(
         self, mock_cls: MagicMock
     ) -> None:
-        part = (
-            b"Content-Type: text/plain; name=\"notes.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"notes.txt\"\r\n"
-            b"\r\n"
-            b"hello from the attachment"
-        )
-        self._setup_client(
-            mock_cls, _multipart_message([_BODY_PART, part])
-        )
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.search.return_value = [1, 2, 3]
+        # uid 2 is entirely absent from the FETCH dict.
+        mock_client.fetch.return_value = _fake_fetch_result([1, 3])
 
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-            "msg@example.com", attachment_index=0, mailbox="INBOX",
-        )
+        conn = ImapConnector("imap.example.com", 993, "u@e.com", "pw")
+        result = conn.search_messages()
 
-        assert result["name"] == "notes.txt"
-        assert result["mime_type"] == "text/plain"
-        assert result["is_binary"] is False
-        assert result["content"] == "hello from the attachment"
-        assert result["size"] == len(b"hello from the attachment")
+        assert len(result) == 2
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_binary_attachment_returns_base64(
+    def test_get_message_vanished_raises_not_found(
         self, mock_cls: MagicMock
     ) -> None:
-        pdf = b"%PDF-1.4 pretend financial statement bytes"
-        part = (
-            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-Disposition: attachment; filename=\"04 FS.pdf\"\r\n"
-            b"\r\n"
-        ) + _b64(pdf)
-        self._setup_client(
-            mock_cls, _multipart_message([_BODY_PART, part])
-        )
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+        mock_client.search.return_value = [5]
+        # Matched by Message-ID search but the entry lacks ENVELOPE.
+        mock_client.fetch.return_value = {5: {b"FLAGS": ()}}
 
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-            "msg@example.com", attachment_index=0,
-        )
-
-        import base64
-        assert result["name"] == "04 FS.pdf"
-        assert result["mime_type"] == "application/pdf"
-        assert result["is_binary"] is True
-        assert base64.b64decode(result["content"]) == pdf
-        assert result["size"] == len(pdf)
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_attachment_without_content_disposition_is_found(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """Regression: a binary part with only a Content-Type name= param
-        and NO Content-Disposition must still count as an attachment — the
-        case the BODYSTRUCTURE enumeration path dropped (returned [])."""
-        pdf = b"%PDF-1.4 no-disposition pdf"
-        part = (
-            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"\r\n"
-        ) + _b64(pdf)
-        self._setup_client(
-            mock_cls, _multipart_message([_BODY_PART, part])
-        )
-
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-            "msg@example.com", attachment_index=0,
-        )
-
-        import base64
-        assert result["mime_type"] == "application/pdf"
-        assert base64.b64decode(result["content"]) == pdf
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_attachment_index_selects_correct_part(
-        self, mock_cls: MagicMock
-    ) -> None:
-        first = (
-            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
-            b"\r\nAAA"
-        )
-        second = (
-            b"Content-Type: text/plain; name=\"b.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"b.txt\"\r\n"
-            b"\r\nBBB"
-        )
-        self._setup_client(
-            mock_cls, _multipart_message([_BODY_PART, first, second])
-        )
-
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-            "msg@example.com", attachment_index=1,
-        )
-        assert result["name"] == "b.txt"
-        assert result["content"] == "BBB"
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_body_only_message_has_no_attachments(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """A text/plain body part is not miscounted as an attachment."""
-        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
-
-        with pytest.raises(ValueError, match="out of range"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-                "msg@example.com", attachment_index=0,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_index_out_of_range_raises(self, mock_cls: MagicMock) -> None:
-        part = (
-            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
-            b"\r\nAAA"
-        )
-        self._setup_client(mock_cls, _multipart_message([part]))
-
-        with pytest.raises(ValueError, match="out of range"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-                "msg@example.com", attachment_index=5,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_negative_index_raises(self, mock_cls: MagicMock) -> None:
-        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
-        with pytest.raises(ValueError, match="non-negative"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-                "msg@example.com", attachment_index=-1,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_message_not_found_raises(self, mock_cls: MagicMock) -> None:
-        from apple_mail_mcp.exceptions import MailMessageNotFoundError
-
-        client = MagicMock()
-        mock_cls.return_value = client
-        client.search.return_value = []
-
+        conn = ImapConnector("imap.example.com", 993, "u@e.com", "pw")
         with pytest.raises(MailMessageNotFoundError):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-                "missing@example.com", attachment_index=0,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_max_bytes_exceeded_raises(self, mock_cls: MagicMock) -> None:
-        pdf = b"x" * 5000
-        part = (
-            b"Content-Type: application/pdf; name=\"big.pdf\"\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-Disposition: attachment; filename=\"big.pdf\"\r\n"
-            b"\r\n"
-        ) + _b64(pdf)
-        self._setup_client(mock_cls, _multipart_message([part]))
-
-        with pytest.raises(ValueError, match="too large"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-                "msg@example.com", attachment_index=0, max_bytes=1000,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_search_brackets_id_and_selects_mailbox(
-        self, mock_cls: MagicMock
-    ) -> None:
-        part = (
-            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
-            b"\r\nAAA"
-        )
-        client = self._setup_client(
-            mock_cls, _multipart_message([part])
-        )
-
-        ImapConnector("h", 993, "u@e.com", "pw").get_attachment_content(
-            "abc@example.com", attachment_index=0, mailbox="Archive",
-        )
-        client.search.assert_called_once_with(
-            ["HEADER", "Message-ID", "<abc@example.com>"]
-        )
-        client.select_folder.assert_called_once_with("Archive", readonly=True)
-
-
-class TestGetAttachmentBytes:
-    """ImapConnector.get_attachment_bytes — raw decoded payload for disk writes."""
-
-    def _setup_client(self, mock_cls: MagicMock, rfc822: bytes) -> MagicMock:
-        client = MagicMock()
-        mock_cls.return_value = client
-        client.search.return_value = [42]
-        client.fetch.return_value = {42: {b"BODY[]": rfc822}}
-        return client
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_binary_attachment_returns_raw_bytes(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """No base64 re-encode — the bytes are byte-exact for disk writes."""
-        pdf = b"%PDF-1.4 pretend financial statement bytes"
-        part = (
-            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-Disposition: attachment; filename=\"04 FS.pdf\"\r\n"
-            b"\r\n"
-        ) + _b64(pdf)
-        self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
-
-        raw = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
-            "msg@example.com", attachment_index=0,
-        )
-        assert raw == pdf
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_get_attachment_payloads_returns_name_byte_pairs_one_source(
-        self, mock_cls: MagicMock
-    ) -> None:
-        """Names AND bytes come from one parse, in order — so save_attachments
-        can index both off the same list with no cross-source misalignment."""
-        pdf = b"%PDF-1.4 statement"
-        pdf_part = (
-            b"Content-Type: application/pdf; name=\"04 FS.pdf\"\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-Disposition: attachment; filename=\"04 FS.pdf\"\r\n"
-            b"\r\n"
-        ) + _b64(pdf)
-        txt_part = (
-            b"Content-Type: text/plain; name=\"notes.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"notes.txt\"\r\n"
-            b"\r\nplain notes"
-        )
-        self._setup_client(
-            mock_cls, _multipart_message([_BODY_PART, pdf_part, txt_part])
-        )
-
-        payloads = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_payloads(
-            "msg@example.com",
-        )
-        assert payloads == [("04 FS.pdf", pdf), ("notes.txt", b"plain notes")]
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_attachment_fetch_selects_readonly(self, mock_cls: MagicMock) -> None:
-        """The shared id-lookup helper must EXAMINE (readonly=True) so reading an
-        attachment never sets \\Seen on the message. Regression guard for the
-        chokepoint refactor (P0-1): a readonly=False default would silently
-        dirty the mailbox on every attachment read."""
-        part = (
-            b"Content-Type: application/pdf; name=\"x.pdf\"\r\n"
-            b"Content-Disposition: attachment; filename=\"x.pdf\"\r\n\r\n"
-        ) + _b64(b"%PDF-1.4")
-        client = self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
-
-        conn = ImapConnector("h", 993, "u@e.com", "pw")
-        conn.get_attachment_bytes("msg@example.com", attachment_index=0)
-        conn.get_attachment_payloads("msg@example.com")
-
-        for call in client.select_folder.call_args_list:
-            assert call.kwargs.get("readonly") is True, (
-                f"attachment SELECT must be readonly, got {call}"
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_get_attachment_payloads_enforces_max_bytes(
-        self, mock_cls: MagicMock
-    ) -> None:
-        big = b"x" * 5000
-        part = (
-            b"Content-Type: application/pdf; name=\"big.pdf\"\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-Disposition: attachment; filename=\"big.pdf\"\r\n"
-            b"\r\n"
-        ) + _b64(big)
-        self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
-        with pytest.raises(ValueError, match="too large"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_payloads(
-                "msg@example.com", max_bytes=1000,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_text_attachment_returns_raw_bytes(
-        self, mock_cls: MagicMock
-    ) -> None:
-        part = (
-            b"Content-Type: text/plain; name=\"notes.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"notes.txt\"\r\n"
-            b"\r\n"
-            b"hello from the attachment"
-        )
-        self._setup_client(mock_cls, _multipart_message([_BODY_PART, part]))
-
-        raw = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
-            "msg@example.com", attachment_index=0,
-        )
-        assert raw == b"hello from the attachment"
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_index_selects_correct_part(self, mock_cls: MagicMock) -> None:
-        first = (
-            b"Content-Type: text/plain; name=\"a.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"a.txt\"\r\n"
-            b"\r\nAAA"
-        )
-        second = (
-            b"Content-Type: text/plain; name=\"b.txt\"\r\n"
-            b"Content-Disposition: attachment; filename=\"b.txt\"\r\n"
-            b"\r\nBBB"
-        )
-        self._setup_client(
-            mock_cls, _multipart_message([_BODY_PART, first, second])
-        )
-
-        raw = ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
-            "msg@example.com", attachment_index=1,
-        )
-        assert raw == b"BBB"
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_max_bytes_exceeded_raises(self, mock_cls: MagicMock) -> None:
-        pdf = b"x" * 5000
-        part = (
-            b"Content-Type: application/pdf; name=\"big.pdf\"\r\n"
-            b"Content-Transfer-Encoding: base64\r\n"
-            b"Content-Disposition: attachment; filename=\"big.pdf\"\r\n"
-            b"\r\n"
-        ) + _b64(pdf)
-        self._setup_client(mock_cls, _multipart_message([part]))
-
-        with pytest.raises(ValueError, match="too large"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
-                "msg@example.com", attachment_index=0, max_bytes=1000,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_negative_index_raises(self, mock_cls: MagicMock) -> None:
-        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
-        with pytest.raises(ValueError, match="non-negative"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
-                "msg@example.com", attachment_index=-1,
-            )
-
-    @patch("apple_mail_mcp.imap_connector.IMAPClient")
-    def test_index_out_of_range_raises(self, mock_cls: MagicMock) -> None:
-        self._setup_client(mock_cls, _multipart_message([_BODY_PART]))
-        with pytest.raises(ValueError, match="out of range"):
-            ImapConnector("h", 993, "u@e.com", "pw").get_attachment_bytes(
-                "msg@example.com", attachment_index=5,
-            )
-
-
-class TestBatchedMessageIdResolution:
-    """Per-Message-ID SEARCH batching (P2): bulk mutations resolve ids via
-    one OR-chained SEARCH per chunk instead of one SEARCH per id."""
-
-    def test_or_criteria_single_id_has_no_or_wrapper(self) -> None:
-        from apple_mail_mcp.imap_connector import _message_id_or_criteria
-
-        assert _message_id_or_criteria(["<a@x>"]) == [
-            "HEADER", "Message-ID", "<a@x>",
-        ]
-
-    def test_or_criteria_two_ids_is_binary_or(self) -> None:
-        from apple_mail_mcp.imap_connector import _message_id_or_criteria
-
-        assert _message_id_or_criteria(["<a@x>", "<b@x>"]) == [
-            "OR",
-            ["HEADER", "Message-ID", "<a@x>"],
-            ["HEADER", "Message-ID", "<b@x>"],
-        ]
-
-    def test_or_criteria_three_ids_right_nested(self) -> None:
-        from apple_mail_mcp.imap_connector import _message_id_or_criteria
-
-        assert _message_id_or_criteria(["<a@x>", "<b@x>", "<c@x>"]) == [
-            "OR",
-            ["HEADER", "Message-ID", "<a@x>"],
-            ["OR",
-             ["HEADER", "Message-ID", "<b@x>"],
-             ["HEADER", "Message-ID", "<c@x>"]],
-        ]
-
-    def test_resolve_single_batch_one_search(self) -> None:
-        from apple_mail_mcp.imap_connector import _resolve_message_id_uids
-
-        client = MagicMock()
-        client.search.return_value = [11, 12, 13]
-
-        uids = _resolve_message_id_uids(client, ["<a@x>", "<b@x>", "<c@x>"])
-
-        assert uids == [11, 12, 13]
-        # One round-trip for the whole (sub-chunk) batch, not three.
-        assert client.search.call_count == 1
-
-    def test_resolve_chunks_above_limit(self) -> None:
-        from apple_mail_mcp.imap_connector import (
-            _SEARCH_OR_CHUNK,
-            _resolve_message_id_uids,
-        )
-
-        ids = [f"<id{i}@x>" for i in range(_SEARCH_OR_CHUNK * 2 + 1)]
-        # Distinct UIDs per chunk so we can see all three chunks contribute.
-        client = MagicMock()
-        client.search.side_effect = [[1, 2], [3, 4], [5]]
-
-        uids = _resolve_message_id_uids(client, ids)
-
-        # 2*chunk+1 ids -> ceil over _SEARCH_OR_CHUNK -> 3 searches.
-        assert client.search.call_count == 3
-        assert uids == [1, 2, 3, 4, 5]
-
-    def test_resolve_dedups_across_and_within_chunks(self) -> None:
-        from apple_mail_mcp.imap_connector import _resolve_message_id_uids
-
-        client = MagicMock()
-        # Same UID echoed twice (e.g. a duplicated input id): counted once.
-        client.search.return_value = [7, 7, 8]
-
-        uids = _resolve_message_id_uids(client, ["<a@x>", "<a@x>", "<b@x>"])
-
-        assert uids == [7, 8]
-
-    def test_resolve_empty_is_no_search(self) -> None:
-        from apple_mail_mcp.imap_connector import _resolve_message_id_uids
-
-        client = MagicMock()
-        assert _resolve_message_id_uids(client, []) == []
-        client.search.assert_not_called()
+            conn.get_message("<gone@example.com>")

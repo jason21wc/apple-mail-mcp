@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+from apple_mail_mcp import __version__
 from apple_mail_mcp.exceptions import MailAppleScriptError
 from apple_mail_mcp.mail_connector import AppleMailConnector
 
@@ -35,6 +36,10 @@ DEFAULT_RUNS = 5
 BASELINE_PATH = Path(__file__).parent / "baseline.json"
 
 BENCH_MAILBOX_NAME = "[apple-mail-mcp-bench]"
+# Dedicated synthetic source for the generic bulk benchmarks (#287). Seeded
+# via IMAP APPEND like the Gmail variant, so the bulk benchmarks never touch
+# the user's real mail and don't depend on a real >=50-message mailbox.
+BENCH_SOURCE_NAME = "[apple-mail-mcp-bench-source]"
 BULK_SIZE = 50
 
 # Gmail variant fixtures (#101): benchmarks against a Gmail account use a
@@ -125,22 +130,25 @@ def measure_median(
 # Baseline I/O + assertion
 # ---------------------------------------------------------------------------
 
-def _load_baselines() -> dict[str, float]:
+# baseline.json holds benchmark name -> median seconds (float), plus a
+# `_version` string stamp recording the release the timings were captured for
+# (the release-artifact gate, #356, checks it). Hence dict[str, Any].
+def _load_baselines() -> dict[str, Any]:
     if not BASELINE_PATH.exists():
         return {}
     with BASELINE_PATH.open() as f:
         return json.load(f)
 
 
-def _save_baselines(baselines: dict[str, float]) -> None:
+def _save_baselines(baselines: dict[str, Any]) -> None:
     BASELINE_PATH.write_text(
         json.dumps(baselines, indent=2, sort_keys=True) + "\n"
     )
 
 
 @pytest.fixture(scope="session")
-def baselines() -> dict[str, float]:
-    """Loaded baseline timings, keyed by benchmark name."""
+def baselines() -> dict[str, Any]:
+    """Loaded baseline timings, keyed by benchmark name (plus `_version`)."""
     return _load_baselines()
 
 
@@ -158,7 +166,7 @@ def capture_mode(request: pytest.FixtureRequest) -> bool:
 def assert_within_baseline(
     name: str,
     result: BenchmarkResult,
-    baselines: dict[str, float],
+    baselines: dict[str, Any],
     capture_mode: bool,
     *,
     ratio: float = REGRESSION_RATIO,
@@ -194,10 +202,13 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     # bulk_ops baselines).
     merged = _load_baselines()
     merged.update(_captured)
+    # Stamp the release this baseline was captured for, so the release-artifact
+    # gate (#356) can tell a fresh baseline from a stale one.
+    merged["_version"] = __version__
     _save_baselines(merged)
     print(
-        f"\nbaseline.json updated with {len(_captured)} entries: "
-        f"{sorted(_captured.keys())}"
+        f"\nbaseline.json updated with {len(_captured)} entries "
+        f"(_version={__version__}): {sorted(_captured.keys())}"
     )
 
 
@@ -227,26 +238,55 @@ def test_account() -> str:
 def bench_source(
     connector: AppleMailConnector, test_account: str
 ) -> str:
-    """First mailbox in the test account that has at least BULK_SIZE
-    messages. Used as the source pool for bulk fixtures and as the
-    move-back destination during teardown.
+    """Dedicated synthetic source pool for the bulk fixtures, also the
+    move-back destination during teardown (#287).
 
-    Skips the entire benchmark session if no mailbox has enough
-    messages — see BENCHMARKING.md for setup."""
-    for mb in ("INBOX", "Archive", "Sent Messages"):
-        try:
-            results = connector.search_messages(
-                account=test_account, mailbox=mb, limit=BULK_SIZE
-            )
-        except Exception:
-            continue
-        if len(results) >= BULK_SIZE:
-            return mb
-    pytest.skip(
-        f"Need at least {BULK_SIZE} messages in account {test_account!r} "
-        f"(across INBOX/Archive/Sent Messages). See "
-        f"docs/guides/BENCHMARKING.md for setup."
+    Creates [apple-mail-mcp-bench-source] if missing and IMAP-APPENDs
+    BULK_SIZE synthetic messages into it (idempotent — only appends the
+    shortfall). Same approach as ``gmail_bench_source`` so the generic bulk
+    benchmarks never touch the user's real mail and don't depend on a real
+    >=50-message mailbox existing. Session-scoped; the populate cost is paid
+    once per run.
+
+    Skips cleanly if MAIL_TEST_ACCOUNT has no Keychain IMAP creds (the
+    synthetic seeding needs the IMAP path). Run `apple-mail-fast-mcp setup-imap
+    --account <acct>` first."""
+    from imapclient import IMAPClient
+
+    from apple_mail_mcp.exceptions import (
+        MailKeychainAccessDeniedError,
+        MailKeychainEntryNotFoundError,
     )
+    from apple_mail_mcp.keychain import get_imap_password
+
+    mailboxes = connector.list_mailboxes(test_account)
+    names = {mb["name"] for mb in mailboxes}
+    if BENCH_SOURCE_NAME not in names:
+        connector.create_mailbox(account=test_account, name=BENCH_SOURCE_NAME)
+
+    host, port, email = connector._resolve_imap_config(test_account)
+    try:
+        pw = get_imap_password(test_account, email)
+    except (MailKeychainEntryNotFoundError, MailKeychainAccessDeniedError):
+        pytest.skip(
+            f"No Keychain IMAP creds for {test_account!r}; the synthetic "
+            f"bench source can't be seeded. Run `apple-mail-fast-mcp setup-imap "
+            f"--account {test_account}`. See docs/guides/BENCHMARKING.md."
+        )
+
+    client = IMAPClient(host, port=port, ssl=True, timeout=60)
+    client.login(email, pw)
+    try:
+        info = client.select_folder(BENCH_SOURCE_NAME)
+        existing = int(info.get(b"EXISTS", 0))
+        if existing < BULK_SIZE:
+            client.unselect_folder()
+            for i in range(existing, BULK_SIZE):
+                client.append(BENCH_SOURCE_NAME, _make_synthetic_message(i))
+    finally:
+        client.logout()
+
+    return BENCH_SOURCE_NAME
 
 
 @pytest.fixture(scope="session")
@@ -370,7 +410,7 @@ def _make_synthetic_message(i: int) -> bytes:
         f"Date: Thu, 01 May 2026 12:00:00 +0000\r\n"
         f"\r\n"
         f"Synthetic benchmark message #{i} for issue #101. "
-        f"If you see this in your inbox, the apple-mail-mcp benchmark "
+        f"If you see this in your inbox, the apple-mail-fast-mcp benchmark "
         f"fixture leaked.\r\n"
     ).encode()
 

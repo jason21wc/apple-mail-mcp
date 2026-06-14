@@ -5,6 +5,198 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-06-13
+
+A bug-fix patch release for four reliability and data-integrity issues surfaced from real Claude Desktop usage on Gmail and iCloud: a full-body read that could crash the whole server, a Gmail label move that silently trashed the message, an IMAP search that silently dropped matching results, and an attachment save that hung for minutes on Gmail. No new tools (still 24).
+
+### Added
+
+**`save_attachments` IMAP fast path (#371):** `save_attachments` gains optional `account` + `mailbox` parameters. When supplied, the message is fetched once over IMAP and its attachment bytes are written straight to disk — avoiding the O(accounts × mailboxes) AppleScript cross-scan whose unindexed `whose message id` lookup (~20s/mailbox) ran for minutes and timed out on Gmail's many labels. Mirrors `get_attachment_content`'s fast path; without the parameters the AppleScript fallback is unchanged.
+
+**Truncation signal on `get_messages` (#365):** a bounded body carries `content_truncated: true` and `content_original_bytes: <int>` so callers can tell when a body was clipped.
+
+### Changed
+
+**`get_messages` bounds and scrubs message bodies (#365):** each `content` is now capped at 1 MB of UTF-8 text (override via `APPLE_MAIL_MCP_MAX_BODY_BYTES`) and stripped of transport-hostile characters before it leaves the tool, so a single large or non-UTF8-encodable body can't blow the JSON-RPC frame.
+
+### Deprecated
+
+**`gmail_mode` on `update_message` (#364):** the parameter is now accepted but ignored — the move strategy is chosen automatically (IMAP relabel when configured, otherwise a verified AppleScript move). Removal is tracked for v1.0 in #369.
+
+### Fixed
+
+**`get_messages` full-body fetch could crash the entire server (#365):** retrieving full bodies on iCloud returned `-32000: Connection closed` and took the whole stdio server down (every tool unavailable until relaunch). An unbounded, un-scrubbed body produced a JSON-RPC frame the client rejected — outside the tool's `try/except`. Bodies are now bounded and scrubbed at the single resolve chokepoint (covers the IMAP, AppleScript, and `SELECTED` paths).
+
+**Gmail INBOX→label move silently trashed the message (#364):** `update_message` with `gmail_mode=true` ran an AppleScript copy+delete; on Gmail `delete` always routes to Trash and Trash strips all other labels, so the destination label was lost and the message landed in `[Gmail]/Trash` only — while the tool still reported success. Moves now use a relabel (`set mailbox`) and verify the message left the source; an unconfirmed move fails loud with `error_type: "imap_required"` instead of losing mail.
+
+**IMAP `search_messages` `limit` bounded the candidate window, not the matches (#366, #368):** with `has_attachment` set, `limit` was applied before the post-FETCH filter, so a limited search silently missed attachment-bearing messages (observed live: 2 results at `limit=5` vs 6 at `limit=20` on the same mailbox). The IMAP path now walks candidates newest-first in bounded chunks and short-circuits once `limit` *matching* rows are found. (Contributed by @jason21wc.)
+
+**`save_attachments` hung and timed out on Gmail (#371):** see the IMAP fast path under Added — the cross-scan that caused the hang is now bypassed when `account`+`mailbox` are supplied.
+
+## [0.10.1] - 2026-06-08
+
+A maintenance release. The one user-facing fix lets an iCloud account whose Apple ID is a third-party address (e.g. a Gmail sign-in) resolve its IMAP login. The rest is release-engineering hardening: a gate that makes the Phase 8.5 derived-artifact refresh impossible to skip silently — the gap that shipped a stale eval snapshot at v0.10.0 — and a more robust blind-eval model list that tracks each family's latest model and fails loud on retired ids.
+
+### Added
+
+**Release-artifact freshness gate (#356):** [`scripts/check_release_artifacts.sh`](scripts/check_release_artifacts.sh) fails the release validation when a derived artifact (`tests/benchmarks/baseline.json`, `evals/agent_tool_usability/results/scored_results.md`) isn't stamped for the release being cut — unless an explicit, issue-tracked waiver is recorded in [`release_artifact_waivers.txt`](release_artifact_waivers.txt). The v0.10.0 release silently shipped an eval snapshot stamped `v0.9.0` because Phase 8.5 was skippable without a check; this closes that gap. See [docs/guides/RELEASE_ARTIFACTS.md](docs/guides/RELEASE_ARTIFACTS.md).
+
+### Changed
+
+**Blind-eval model list tracks latest-per-family and fails loud on retired ids (#358):** `make eval-tools` had pinned `mistralai/mistral-large-2411`, which OpenRouter retired — its calls 404'd and produced a silent zero-token row. The model list now uses each family's latest non-dated slug where one exists (`mistralai/mistral-large`, `deepseek/deepseek-chat`), each run records the exact version OpenRouter served (`resolved_model`), and `run_eval` pre-checks model availability against the catalog, exiting before any credits are spent if a requested id is missing.
+
+### Fixed
+
+**iCloud IMAP login resolution for third-party Apple IDs (#341):** `_resolve_imap_config` couldn't determine the login for an iCloud/MobileMe account whose Apple ID is a non-iCloud address (e.g. a Gmail sign-in) and whose AppleScript `email addresses` list is empty — the #299 apple-alias rule had nothing to resolve from, so the connection failed. A persisted per-account login override (`~/.apple_mail_mcp/imap_login_overrides.json`, set via the IMAP setup CLI) is now consulted first, letting these accounts connect.
+
+## [0.10.0] - 2026-06-05
+
+First release under the new name **`apple-mail-fast-mcp`** (#335) — the PyPI distribution, CLI command, and repo were renamed, and publishing now goes through PyPI OIDC trusted publishing. Feature-wise the theme is **richer composition and inspection**: drafts can carry an HTML body, a new tool reads an attachment's content inline without writing to disk, and IMAP credentials can come from an environment variable for uvx/headless/CI contexts. Alongside: a confirmation-prompt fix for current FastMCP, and CI/release hardening so parity drift and dependency advisories can't slip through (or hard-block a release) unnoticed.
+
+> **Renaming note:** install as `apple-mail-fast-mcp` (e.g. `pip install apple-mail-fast-mcp` / `uvx apple-mail-fast-mcp`) and invoke the CLI as `apple-mail-fast-mcp`. The Python import package remains `apple_mail_mcp` for now, and Keychain entries remain under the `apple-mail-mcp.imap.<account>` prefix (a brand migration is tracked in #336/#337).
+
+### Added
+
+**HTML body support for `create_draft` / `update_draft` (#251):** a new optional `body_html` parameter builds a `multipart/alternative` draft (HTML + a plain-text alternative, derived from the HTML when no plain `body` is given) over the clean IMAP-APPEND path. Limited to fresh save-as-draft and requires IMAP credentials; combining it with `send_now` or reply/forward is rejected, and if the IMAP path can't engage the call fails (`html_requires_imap`) rather than silently downgrading to plain text. HTML is caller-trusted (not sanitized).
+
+**`get_attachment_content` tool (#250):** read a single attachment's content inline — UTF-8 text for text-like types (`text/*`, `application/json`, …) or base64 otherwise — without writing to disk, for triage workflows. 0-based `attachment_index` matching `get_attachments` / `get_messages(include_attachments=True)`; ~25 MB inline cap (override via `APPLE_MAIL_MCP_MAX_INLINE_ATTACHMENT_BYTES`), over which it returns `attachment_too_large` and points at `save_attachments`.
+
+**Environment-variable fallback for the IMAP password (#248):** `APPLE_MAIL_MCP_IMAP_PASSWORD_<ACCOUNT>` (account name uppercased, non-alphanumerics → `_`) supplies the IMAP password where the macOS Keychain isn't usable (uvx, Docker/CI, headless). Checked before the Keychain and composes with the name↔UUID dual-form lookup (#243). Env vars are less private than the Keychain — documented as uvx/CI-only.
+
+**Weekly dependency-advisory workflow (#296):** a scheduled CI job (`dependency-audit.yml`) runs `pip-audit` and opens/updates (and auto-closes) a tracking issue when advisories appear, so freshly-disclosed CVEs on unchanged pins are discovered continuously and bumped on their own PRs — not mid-release.
+
+### Changed
+
+**Confirmation prompts pass an explicit `response_type` to `ctx.elicit` (#282):** the destructive-action confirmation gate now uses a boolean `response_type` (clearing FastMCP ≥3.3.1's `FastMCPDeprecationWarning` and the empty-form rendering bug in some clients, e.g. VS Code). Only an explicit affirmative proceeds; decline, cancel, accept-with-false, missing context, and elicit errors all block (fail-closed).
+
+**`update_rule` confirmation is dangerous-action-aware (#280):** updating a rule only elicits confirmation when the change touches conditions/match-logic or introduces a destructive action (delete/forward/move/copy), mirroring `create_rule` (#222) — purely organizational tweaks no longer prompt.
+
+**Clean drafts adopt the sole enabled account + warn on fallback (#321, #270):** with no explicit `from_account`, a single enabled account is adopted so the clean (no iOS cite-blockquote) IMAP-APPEND draft path can engage; save-as-draft calls that fall back to the AppleScript path now surface a warning.
+
+**Release dependency gate split: direct vs transitive (#296):** `check_dependencies.sh` now hard-fails only on advisories in direct deps (`fastmcp`/`imapclient`); transitive advisories are warnings (handled by the scheduled workflow above), so a freshly-disclosed transitive CVE no longer hard-blocks an otherwise-ready release.
+
+**Client/server parity check is now blocking (#277):** `check_client_server_parity.sh` fails CI when a public connector method is neither exposed as a tool nor in an intentionally-internal allowlist (and on stale allowlist entries), instead of always passing.
+
+**Faster bulk IMAP id resolution (#316):** `update_message`'s RFC Message-ID→UID resolution now batches into a chunked `OR` SEARCH instead of per-id lookups (~6× faster bulk moves on the IMAP path).
+
+### Fixed
+
+**Drafts surface promptly after IMAP-APPEND (#269):** the account is synchronized after an IMAP-APPEND draft so it appears in Mail.app's local Drafts pane without waiting for Mail's background poll.
+
+**Stricter name / draft_id validation (#325):** the forbidden-character set is now enforced in the name and `draft_id` validators.
+
+**`check_readme_claims.sh` tool-count under the `@_tool` wrapper (#346):** the doc-claims check counted bare `@mcp.tool()` (always 0 since the `@_tool` wrapper, #217); it now counts the wrapper, and CLAUDE.md's test counts were refreshed.
+
+**Env-var IMAP password whitespace stripped (#349):** the `APPLE_MAIL_MCP_IMAP_PASSWORD_<ACCOUNT>` value is now stripped of surrounding whitespace, so a trailing newline from a `.env` file / Docker / `export` no longer breaks IMAP login (mirrors the Keychain path's behavior).
+
+**Reply/forward draft folder-miss no longer trips the IMAP circuit breaker (#350):** when the seed message isn't in the guessed `seed_mailbox` the call falls back to AppleScript (which resolves across all folders) without opening the 30s breaker, so a normal reply to filed mail no longer degrades subsequent IMAP reads for the account.
+
+### Docs
+
+**Issue-claiming convention for non-collaborators (#327):** corrected the contributing docs for how non-collaborators claim issues.
+
+## [0.9.1] - 2026-06-03
+
+Patch release. The theme is **IMAP-path correctness and interop robustness**: several contributor-relevant crashes and login edge cases on the IMAP fast path are fixed (concurrent-mutation FETCH, iCloud login resolution, split connect/operation timeouts), tool parameters arriving as stringified JSON from clients like Cowork are now coerced, and reply/forward drafts no longer render with an iOS cite-blockquote wrapper. Alongside the fixes: a new warn-only prompt-injection detector on read responses, an automated doc/artifact drift gate wired into CI and the release flow, and test-suite hardening (Hypothesis property tests on the escape/sanitize boundary, plus a fix for the unit suite leaking to real `osascript`).
+
+### Added
+
+**Warn-only prompt-injection detection on read responses (#225):** `get_message` (and other read paths) now scan returned message content for prompt-injection patterns and attach a non-blocking warning when matches are found. This is detection-only — content is never altered or withheld — giving clients a signal without changing behavior. First slice of the broader #225 planning issue.
+
+### Changed
+
+**Automated doc/artifact drift gate + release refresh hooks (#288):** A new `scripts/check_docs.sh` gate fails CI on tool-set coverage gaps, references to removed names, broken cross-references, and eval-description drift. The release workflow gains a mandatory artifact-refresh phase so derived snapshots (eval descriptions, benchmark baseline, blind-eval scores) can't silently rot between releases.
+
+**Bulk-mutation benchmarks captured via a self-seeding source (#287):** The previously-skipped IMAP bulk-mutation benchmarks now run against a self-seeding source account, closing the perf-coverage gap that needed a 50+-message mailbox.
+
+### Fixed
+
+**IMAP `search_messages` / `get_message` survive a message vanishing mid-FETCH (#314):** Concurrent mailbox mutation could leave a FETCH response missing its `ENVELOPE`, raising `KeyError: ENVELOPE`. Both paths now tolerate a message disappearing between the search and the fetch.
+
+**Tool parameters coerced from stringified arrays/dicts (#309):** `create_draft`'s `to` / `cc` / `bcc` (and other list/dict params) failed when a client such as Cowork serialized them as JSON strings instead of arrays. Parameters are now coerced before use, restoring interop.
+
+**iCloud IMAP login resolves to the `@icloud.com` address (#299):** `_resolve_imap_config` could pick a third-party Apple ID as the IMAP login, producing `AUTHENTICATIONFAILED` against iCloud (the inverse of #201). Login now resolves to the `@icloud.com` address.
+
+**Split IMAP connect vs operation timeouts (#249):** A single timeout covered both connect and operations; these are now split (3s connect, 30s operation) so a slow connect can't consume the operation budget and a slow operation isn't capped at the connect timeout.
+
+**Reply/forward drafts written via IMAP APPEND (#292, #245 follow-up):** Saving a reply/forward as a draft still rendered as an iOS cite-blockquote; these drafts are now written via IMAP APPEND, bypassing Mail.app's compose mangling (extending the #245 fix to the reply/forward paths).
+
+**`update_message` matches RFC 5322 Message-ID (#291):** Message lookup now matches the RFC 5322 `Message-ID` in addition to Mail's numeric id, so callers holding an RFC id can target a message directly.
+
+**`draft_id` interpolation hardened + RFC ids resolved in extract (#294):** Defense-in-depth escaping of `draft_id` and resolution of RFC Message-ID draft ids in the extract path, closing the gap tracked from the v0.9.0 release review.
+
+**Unit suite no longer leaks to real `osascript` (#298):** IMAP error-path unit tests were stalling ~30s each on a real socket timeout, pushing CI to ~5min; the suite is now fully isolated from real `osascript`, dropping unit-test time back to seconds.
+
+**`/merge-and-status` robustness (#253, #268):** The status catch-net is now resilient to transient empty results (#253), and milestone selection uses a version-aware sort instead of an alphabetic one that picked v0.10.0 over v0.9.0 (#268).
+
+### Security
+
+**`draft_id` defense-in-depth (#294):** See Fixed — the `draft_id` interpolation hardening also closes the latent injection surface tracked from the v0.9.0 release review, even though `_validate_draft_id`'s regex already made it injection-safe.
+
+### Tests
+
+**Hypothesis property tests on the escape/sanitize/validate boundary (#214):** Property-based tests now fuzz the `sanitize_input` → `escape_applescript_string` → validation boundary, exercising input shapes the example-based suite didn't cover.
+
+### Dependencies
+
+**Consolidated dependency bump + pyjwt security fix (#235):** A consolidated transitive-dependency bump that also clears the pyjwt PYSEC-2025-183 advisory now that the fastmcp/mcp range ships a fixed version.
+
+## [0.9.0] - 2026-06-01
+
+Minor release. The theme is **hardening the destructive-operation surface and the IMAP fast path**: explicit user-confirmation gates now front the remaining unguarded deletes and rule mutations, `save_attachments` is bounded against disk-fill, a contributor-reported IMAP CRLF command-injection vector is closed, and a STRIDE threat model now documents the trust boundaries those defenses sit on. Alongside the security work: an opt-in read-only server mode, a new recency search filter, several IMAP correctness fixes (three of them contributor-authored), and a full documentation reconciliation to the current 23-tool surface.
+
+Thanks to external contributors [@fmasi](https://github.com/fmasi), [@allenpan05](https://github.com/allenpan05), and [@jason21wc](https://github.com/jason21wc) for the fixes credited below.
+
+### Added
+
+**Read-only server mode + MCP tool annotations (#217):** Tools now carry MCP annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so clients can reason about each tool's effect before calling it. A new `--read-only` flag starts a split server that exposes only the non-mutating tools — a least-privilege deployment for "let the model read my mail but never change it."
+
+**`received_within_hours` search filter (#230):** `search_messages` gains a relative-recency filter (e.g. "messages in the last 6 hours") that compiles to an AppleScript date comparison server-side, avoiding a fetch-all-then-filter pass.
+
+### Changed
+
+**Destructive operations now require confirmation (#239, #222):** `delete_messages` and `create_rule` (when the rule carries a dangerous action — `delete` / `forward_to` / `move_to` / `copy_to`) now route through the `_elicit_confirmation` gate, joining the deletes and rule/draft mutations already gated. As with the existing gates, the flow fails closed: an MCP client that can't elicit gets a typed `confirmation_required` error rather than a silent execution.
+
+**`save_attachments` byte caps (#236):** Attachment saves are now bounded by per-file and total byte caps (a pre-write check plus a post-write net), defending against a malicious/oversized-attachment disk-fill DoS. The tool return now includes a `rejected` list naming any attachments skipped for exceeding a cap. Caps are configurable via `APPLE_MAIL_MCP_MAX_ATTACHMENT_BYTES` / `APPLE_MAIL_MCP_MAX_TOTAL_ATTACHMENT_BYTES`.
+
+**Complexity and type-check CI gates are now blocking (#274):** The cyclomatic-complexity gate (CC ≤ 20) and `mypy --strict` step in PR CI lost their `continue-on-error` — a complexity or type regression now fails the build instead of being advisory. (A CC-25 regression had previously merged undetected because the gate was non-blocking.)
+
+### Fixed
+
+**IMAP multipart attachment enumeration drops attachments (#266, by @jason21wc):** The IMAP BODYSTRUCTURE walk failed to enumerate attachments on some multipart message shapes, so `save_attachments` / attachment listing could under-report. Fixed alongside an `rfc822`-consistency cleanup.
+
+**`_resolve_imap_config` raises `KeyError` on accounts with no IMAP server (#267, by @jason21wc):** Accounts lacking an IMAP server property (e.g. some local/POP setups) raised `KeyError` instead of degrading gracefully; the resolver now coerces the missing value and falls back cleanly.
+
+**Compose drafts created via IMAP APPEND (#245, fix #246 by @fmasi):** Creating a compose draft through Mail.app introduced an unwanted cite-blockquote wrapper. Drafts are now written via IMAP APPEND, bypassing Mail.app's compose-window mangling.
+
+**Connector timeout threaded into non-JSON AppleScript paths (#233):** The `with timeout` protection added in v0.8.2 covered only `_wrap_as_json_script` call sites; the direct-AppleScript mutation paths (`mark_as_read`, `move_messages`, `update_message`, …) now also honor the configured connector timeout, closing the gap that entry tracked.
+
+**AppleScript mailbox resolver — nested paths + Gmail custom labels (#247):** The mailbox-name resolver mishandled nested mailbox paths and Gmail custom labels; resolution now walks the hierarchy correctly.
+
+**`search_messages` iteration order + date-literal bug (#242):** AppleScript message iteration is now reversed to return newest-first as documented, and a date-literal construction bug in the filter path is fixed.
+
+**IMAP Keychain lookup tries both name and UUID forms (#243):** `setup-imap` may key the Keychain entry under either the account display name or its UUID; runtime lookup now tries both forms before falling back to AppleScript.
+
+**Stale e2e elicitation harness repaired (#257):** The `delete_mailbox` / `delete_messages` e2e tests had drifted out of sync with the elicitation gates and were silently failing; repaired, and the manual-e2e policy (CI excludes e2e; `make test-e2e` is a mandatory pre-release gate) is now documented.
+
+### Security
+
+**IMAP CRLF command injection + attachment path traversal (#254, by @allenpan05):** Closed a CRLF-injection vector where crafted input could smuggle additional IMAP protocol commands across a line boundary, plus attachment-path traversal cases. Reported and fixed by an external contributor.
+
+**Removed latent AppleScript-injection vector (#258):** Deleted the unused `parse_date_filter` helper, which built AppleScript from input without the standard escape path — dead code, but a live injection vector if ever wired up.
+
+**Threat model documented (#213):** Added `docs/guides/THREAT_MODEL.md` — a STRIDE pass across the five trust boundaries (MCP client, server process, AppleScript bridge, IMAP, on-disk user data) — and cross-linked it from the per-feature security checklist.
+
+**Release-review hardening:** The release-gate code review surfaced three pre-existing gaps (none regressions), two fixed here: (1) `create_draft`'s recipient lists now pass through the mandated `sanitize_input` → `escape_applescript_string` two-step before AppleScript interpolation, matching every other interpolation site (previously only `escape_applescript_string` was applied, so a null byte in a recipient address would reach the generated script); (2) `delete_messages` is now an account-gated operation and calls `check_test_mode_safety` when an `account` is supplied — in `MAIL_TEST_MODE` a delete aimed at a non-test account is now rejected before the connector is touched — and its success path now records to the audit trail like every other mutating tool. The third (defense-in-depth escaping of `draft_id`, which `_validate_draft_id`'s regex already makes injection-safe) is tracked as #294.
+
+### Dependencies
+
+Bumped three transitive dependencies to clear newly-disclosed advisories (the pins were unchanged since v0.8.2; only the advisories are new): `idna` 3.11 → 3.17, `starlette` 1.0.0 → 1.2.1, `urllib3` 2.6.3 → 2.7.0.
+
+### Docs
+
+**Documentation reconciled to the current surface (#220):** Major refresh of README, `ARCHITECTURE.md` (now documents the AppleScript-default + IMAP-fast-path dispatch model, dual-emit IDs, drafts lifecycle, and thread tiers), `TOOLS.md` (corrected to 23 tools, stale `get_message` examples fixed), `DEVELOPMENT.md` (rewritten as a dev-workflow guide), `APPLESCRIPT_GOTCHAS.md` (JSON-via-ASObjC patterns), `TESTING.md`, and `SECURITY.md` (reconciled with the threat model). Refreshed the blind-agent-eval baseline (#219) and the performance benchmark baseline (#216), and added the claim-by-comment convention to `CONTRIBUTING.md` (#259).
+
 ## [0.8.2] - 2026-05-20
 
 Patch release. Three substantive bug fixes — one security regression in our own gate chain, one regression introduced at v0.8.1, and one long-latent AppleEvent timeout bug surfaced by use on slow Exchange/EWS accounts. Two of the three are contributor-authored: [@fmasi](https://github.com/fmasi) reported and fixed the v0.8.1 regression they noticed within hours of release; [@allenpan05](https://github.com/allenpan05) reported and fixed the AppleEvent timeout bug. Thanks to both.

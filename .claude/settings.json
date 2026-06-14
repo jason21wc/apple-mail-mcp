@@ -1,15 +1,4 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(uv *)",
-      "Bash(make *)",
-      "Bash(./scripts/*)"
-    ],
-    "deny": [
-      "Bash(git push --force*)",
-      "Bash(git push -f*)"
-    ]
-  },
   "hooks": {
     "PreToolUse": [
       {

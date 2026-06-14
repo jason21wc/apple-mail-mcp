@@ -2,6 +2,8 @@
 
 Every new feature should be reviewed against the five concerns below before opening a PR. Each section names the canonical implementation in the codebase — reuse it rather than rolling your own. Linked file:line numbers are stable references; if a function moves, update this doc.
 
+For *why* these concerns matter — the trust boundaries and the STRIDE analysis they defend — see [`THREAT_MODEL.md`](THREAT_MODEL.md). This checklist is the per-feature "did I cover it?"; the threat model is the architectural rationale.
+
 ## Input sanitization
 
 Any string that originates from an MCP tool argument, an environment variable, or any other external source must pass through [`sanitize_input`](../../src/apple_mail_mcp/utils.py#L156) before further processing. It strips null bytes, truncates oversized strings (currently 10000 chars), and coerces non-strings to strings.
@@ -16,7 +18,7 @@ Any sanitized string that gets interpolated into AppleScript source must additio
 safe = escape_applescript_string(sanitize_input(user_value))
 ```
 
-A common mistake is escaping but forgetting the literal AppleScript string quotes around the interpolation site — `whose id is {safe}` parses dashes as subtraction operators on UUID-style ids and crashes. Always wrap in quotes: `whose id is "{safe}"`. See [#86](https://github.com/s-morgan-jeffries/apple-mail-mcp/issues/86) for the bug this prevented.
+A common mistake is escaping but forgetting the literal AppleScript string quotes around the interpolation site — `whose id is {safe}` parses dashes as subtraction operators on UUID-style ids and crashes. Always wrap in quotes: `whose id is "{safe}"`. See [#86](https://github.com/s-morgan-jeffries/apple-mail-fast-mcp/issues/86) for the bug this prevented.
 
 For lists of values (e.g. message-id lists), each element must be individually sanitized + escaped + quoted, then joined:
 

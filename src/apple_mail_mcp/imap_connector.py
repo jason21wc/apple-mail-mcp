@@ -22,10 +22,6 @@ See ``docs/plans/2026-04-23-imap-connector-design.md``.
 
 from __future__ import annotations
 
-import email as _email
-import email.errors
-import email.header
-import email.policy as _email_policy
 import logging
 import re
 import threading
@@ -37,9 +33,8 @@ from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from typing import Any, cast
-from urllib.parse import unquote_to_bytes
 
-from imapclient import IMAPClient
+from imapclient import DRAFT, IMAPClient
 from imapclient.exceptions import IMAPClientError, LoginError
 from imapclient.response_types import Envelope
 
@@ -61,14 +56,23 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONNECT_TIMEOUT_S: float = 3.0
 """Per invariant 4 in imap-auth-options-decision.md: ≤3s so offline
 fallback happens inside the graceful-degradation window without
-waiting for TCP's default timeout."""
+waiting for TCP's default timeout. Bounds connect + login only — once
+logged in the socket timeout is raised to OPERATION_TIMEOUT_S (#249)."""
 
-OP_TIMEOUT_S: float = 30.0
-"""Socket timeout applied after login for SEARCH/FETCH operations.
-Filtered IMAP SEARCH (FROM/SUBJECT) on large mailboxes can take 10-20s
-server-side on iCloud.  The connect timeout stays at 3s for fast
-offline detection; this higher ceiling prevents premature timeouts
-on legitimate queries."""
+OPERATION_TIMEOUT_S: float = 30.0
+"""Socket read timeout for SEARCH/FETCH after login. imapclient's
+``timeout=`` applies to every socket read, so the short CONNECT_TIMEOUT_S
+would otherwise kill a legitimate server-side SEARCH (10–20s on a large
+iCloud mailbox) mid-operation, silently dropping the IMAP fast path to the
+slower AppleScript fallback. We connect fast (offline detection) then raise
+the timeout for real work. (#249)"""
+
+
+def _apply_operation_timeout(client: IMAPClient) -> None:
+    """Raise the socket read timeout from the connect window to
+    OPERATION_TIMEOUT_S, post-login. Call immediately after
+    ``client.login(...)`` at every connection-open site. (#249)"""
+    client.socket().settimeout(OPERATION_TIMEOUT_S)
 
 POOL_IDLE_TIMEOUT_S: float = 270.0
 """Default pool idle threshold. iCloud and most providers drop IMAP
@@ -79,9 +83,9 @@ a couple minutes of each other reuses one connection)."""
 
 _FILTER_FETCH_CHUNK: int = 100
 """FETCH batch size when a limited search needs post-FETCH filtering
-(has_attachment). Matches the project-wide bulk-operation cap of 100.
-Newest chunks are fetched first and the scan stops at `limit` matches,
-so this bounds the per-round-trip cost, not the total scan depth."""
+(has_attachment). Newest chunks are fetched first and the scan stops at
+`limit` matches, so this bounds the per-round-trip cost, not the total
+scan depth."""
 
 _FLAG_SEEN = b"\\Seen"
 _FLAG_FLAGGED = b"\\Flagged"
@@ -173,7 +177,7 @@ class ImapConnectionPool:
                     host, port=port, ssl=True, timeout=connect_timeout
                 )
                 client.login(email, password)
-                client.socket().settimeout(OP_TIMEOUT_S)
+                _apply_operation_timeout(client)
                 entry = _PooledClient(client=client)
                 self._cache[key] = entry
 
@@ -291,56 +295,39 @@ def _bracket_message_id(message_id: str) -> str:
     return f"<{message_id}>"
 
 
-# Max Message-IDs resolved per batched SEARCH. IMAP `OR` is binary, so an
-# N-id match is a right-nested chain N-1 deep — both command length and
-# paren-nesting depth grow with the chunk. 50 keeps each SEARCH well under
-# the ~8 KB command-line limit and the nesting shallow enough for every
-# server tested (iCloud, Gmail), while collapsing a 100-id bulk op from
-# 100 round-trips to 2. Callers cap bulk ops at 100 ids today, so the chunk
-# loop yields at most 2 batches — but the math is load-bearing, not
-# vestigial, if that cap is ever lifted.
-_SEARCH_OR_CHUNK: int = 50
+# Max Message-IDs folded into a single OR SEARCH. Keeps the command well
+# under server line-length limits while still collapsing the common
+# bulk-mutation case (≤50 ids) into one round-trip. (#316)
+_MSGID_SEARCH_CHUNK = 50
 
 
-def _message_id_or_criteria(bracketed_ids: list[str]) -> list[Any]:
-    """IMAP SEARCH criteria matching ANY of the given bracketed Message-IDs.
+def _validate_message_ids(message_ids: list[str]) -> None:
+    """Reject control characters in every Message-ID up front (the #254
+    CRLF-injection guard), before any SELECT/capability work — so a crafted
+    id is refused regardless of server capabilities or where resolution
+    happens. ``_resolve_uids_batch`` re-applies the guard when it brackets
+    ids, but the chokepoint must also fail closed early."""
+    for mid in message_ids:
+        _bracket_message_id(mid)
 
-    Built as a right-nested binary ``OR`` chain (IMAP has no n-ary OR); a
-    single id needs no OR wrapper. IMAPClient 3.x parenthesises nested
-    lists, so ``["OR", ["HEADER", "Message-ID", a], ["HEADER", "Message-ID",
-    b]]`` renders on the wire as
-    ``OR (HEADER "Message-ID" "a") (HEADER "Message-ID" "b")``.
 
-    Caller must pass a non-empty list (callers chunk and guard for empty).
+def _or_message_id_criteria(message_ids: list[str]) -> list[Any]:
+    """Build an IMAP SEARCH criteria matching ANY of ``message_ids`` by
+    ``HEADER "Message-ID"``, so a batch resolves in one round-trip. (#316)
+
+    Each id is routed through :func:`_bracket_message_id` (the CRLF-injection
+    chokepoint, #254). One id yields a bare ``HEADER`` clause; N ids fold
+    into right-nested binary ``OR`` (IMAP's ``OR`` takes exactly two keys):
+    ``["OR", a, ["OR", b, c]]``. Assumes ``message_ids`` is non-empty.
     """
-    criteria: list[Any] = ["HEADER", "Message-ID", bracketed_ids[-1]]
-    for bid in reversed(bracketed_ids[:-1]):
-        criteria = ["OR", ["HEADER", "Message-ID", bid], criteria]
+    clauses = [
+        ["HEADER", "Message-ID", _bracket_message_id(mid)]
+        for mid in message_ids
+    ]
+    criteria: list[Any] = clauses[-1]
+    for clause in reversed(clauses[:-1]):
+        criteria = ["OR", clause, criteria]
     return criteria
-
-
-def _resolve_message_id_uids(
-    client: IMAPClient, bracketed_ids: list[str]
-) -> list[int]:
-    """Resolve bracketed Message-IDs to UIDs in the SELECTED mailbox via
-    batched OR-chained SEARCH — one round-trip per ``_SEARCH_OR_CHUNK`` ids
-    instead of one SEARCH per id.
-
-    Returns the matched UIDs, de-duplicated and first-seen-ordered.
-    Message-IDs that don't resolve are simply absent (best-effort partial
-    success, matching the prior per-id loop). De-duping also means a
-    repeated input id can no longer inflate the returned count — a
-    deliberate correctness improvement over the prior ``uids.extend`` loop.
-    """
-    seen: set[int] = set()
-    uids: list[int] = []
-    for start in range(0, len(bracketed_ids), _SEARCH_OR_CHUNK):
-        chunk = bracketed_ids[start : start + _SEARCH_OR_CHUNK]
-        for uid in client.search(_message_id_or_criteria(chunk)):
-            if uid not in seen:
-                seen.add(uid)
-                uids.append(uid)
-    return uids
 
 
 def _build_search_criteria(
@@ -395,104 +382,10 @@ def _decode(b: bytes | bytearray | str | None) -> str:
     return b.decode("utf-8", errors="replace")
 
 
-def _safe_charset_decode(raw: bytes, charset: str | None) -> str:
-    """Decode ``raw`` with ``charset``, never raising on a bad name.
-
-    THE chokepoint for "decode these bytes with a sender-supplied
-    charset". ``bytes.decode(charset, errors="replace")`` raises
-    LookupError BEFORE ``errors=`` applies when the charset name itself
-    is unknown ("x-mac-foo", "unknown-8bit", typos) — sender-controlled
-    input crashing the read path. Unknown names fall back to utf-8;
-    undecodable bytes are replaced, both directions covered.
-    """
-    try:
-        return raw.decode(charset or "utf-8", errors="replace")
-    except (LookupError, ValueError):
-        # LookupError: unknown name. ValueError: codecs.lookup rejects
-        # names with embedded NULs (reachable via a crafted charset=).
-        return raw.decode("utf-8", errors="replace")
-
-
-def _decode_header(value: bytes | bytearray | str | None) -> str:
-    """Decode an RFC 2047 header (subject, display name) to readable text.
-
-    ENVELOPE fields arrive as raw header bytes — an encoded-word subject
-    like ``=?UTF-8?B?...?=`` is pure ASCII, so a plain utf-8 decode
-    passes the gibberish through verbatim (observed on 9 of 30 real
-    INBOX messages). Fragments with unknown charsets go through
-    :func:`_safe_charset_decode` instead of raising. The AppleScript
-    path returns Mail.app-decoded headers, so this also restores
-    cross-path parity.
-    """
-    s = _decode(value)
-    if "=?" not in s:
-        return s
-    try:
-        fragments = _email.header.decode_header(s)
-    except _email.errors.HeaderParseError:
-        # Malformed encoded-word (e.g. truncated base64): pass the header
-        # through verbatim. Raising here is a sender-controlled crash
-        # that would escape the IMAP→AppleScript fallback net — the same
-        # threat class as the LookupError this module defends against.
-        return s
-    parts: list[str] = []
-    for frag, charset in fragments:
-        if isinstance(frag, bytes):
-            parts.append(_safe_charset_decode(frag, charset))
-        else:
-            parts.append(frag)
-    return "".join(parts)
-
-
 def _strip_brackets(s: str) -> str:
     if s.startswith("<") and s.endswith(">"):
         return s[1:-1]
     return s
-
-
-def _extract_body_content(raw_rfc822: bytes) -> str:
-    """Parse a raw RFC 822 message and return the decoded BODY text.
-
-    Body selection uses ``EmailMessage.get_body(("html", "plain"))`` —
-    the stdlib's RFC-aware body finder. The previous ``msg.walk()``
-    scan preferred text/html from ANYWHERE in the MIME tree, so an
-    attached ``.html`` file or a forwarded message's HTML body silently
-    REPLACED the real body. ``get_body`` skips attachment-disposition
-    parts and does not descend into ``message/rfc822``. The
-    html-over-plain preference matches what AppleScript's ``content of
-    msg`` returns from Mail.app.
-
-    Never raises on sender-controlled bytes (the PR #29 discipline): a
-    message ``get_body`` can't make sense of yields ``""``.
-    """
-    msg = _email.message_from_bytes(raw_rfc822, policy=_email_policy.default)
-
-    if not msg.is_multipart():
-        return _decode_part(msg)
-
-    try:
-        # policy=default guarantees an EmailMessage, which has get_body.
-        body_part = msg.get_body(preferencelist=("html", "plain"))
-    except Exception:  # noqa: BLE001 — malformed MIME must not crash reads
-        logger.debug("get_body failed on malformed message", exc_info=True)
-        return ""
-    if body_part is None:
-        # Distinguishable-from-bug trace: e.g. a forward-as-attachment
-        # with no cover text genuinely has no body.
-        logger.debug(
-            "get_body found no body part (content-type=%s)",
-            msg.get_content_type(),
-        )
-        return ""
-    return _decode_part(body_part)
-
-
-def _decode_part(part: _email.message.Message) -> str:
-    """Decode a single MIME part's payload to a string."""
-    raw = part.get_payload(decode=True)
-    if not isinstance(raw, bytes):
-        return str(raw) if raw is not None else ""
-    return _safe_charset_decode(raw, part.get_content_charset())
 
 
 def _flatten_thread_clusters(tree: Any) -> Iterator[set[int]]:
@@ -536,48 +429,11 @@ def _format_sender(envelope: Envelope) -> str:
     if not from_:
         return ""
     first = from_[0]
-    name = _decode_header(first.name)
+    name = _decode(first.name)
     mailbox = _decode(first.mailbox)
     host = _decode(first.host)
     email = f"{mailbox}@{host}" if mailbox and host else mailbox or ""
     return f"{name} <{email}>" if name else email
-
-
-def _is_attachment_part(
-    disposition: str | None,
-    filename: str | None,
-    maintype: str,
-    subtype: str,
-) -> bool:
-    """THE single definition of "this MIME part is an attachment".
-
-    Both attachment walkers — :func:`_bodystructure_extract_attachments`
-    (feeds ``get_attachments``, the index the user sees) and
-    :func:`_email_attachment_parts` (feeds ``get_attachment_content`` /
-    ``save_attachments``, the index that selects the bytes) — MUST call
-    this. When the two used separate inline-coded rules they drifted:
-    the stdlib side counted any non-text part, so a message with an
-    inline no-filename signature image enumerated as ``[PDF]`` but
-    fetched index 0 as the *image* — silently wrong attachment bytes.
-
-    A part is an attachment when any of:
-    - explicit ``attachment`` disposition;
-    - it carries a filename (disposition ``filename`` or legacy
-      Content-Type ``name=`` param — some mailers send binary parts
-      with no disposition at all);
-    - it is ``message/rfc822`` (forwarded email, conventionally an
-      attachment per RFC 2046 §5.2.1).
-
-    Deliberately NOT an attachment: a no-filename, no-disposition
-    non-text part (the inline-signature-image pattern). Such a part was
-    never visible in enumeration, so making it unfetchable-by-index
-    loses nothing and keeps the two index spaces identical.
-    """
-    if disposition == "attachment":
-        return True
-    if filename:
-        return True
-    return maintype == "message" and subtype == "rfc822"
 
 
 def _bodystructure_extract_attachments(
@@ -585,9 +441,12 @@ def _bodystructure_extract_attachments(
 ) -> list[dict[str, Any]]:
     """Walk a BODYSTRUCTURE tuple and emit attachment metadata.
 
-    Inclusion is decided by :func:`_is_attachment_part` — the shared
-    predicate that keeps this enumeration aligned with the stdlib
-    byte-fetch walker (same indices by construction).
+    A part counts as an attachment if any of:
+    - Its disposition is ``attachment``.
+    - Its disposition is ``inline`` AND it has a ``filename`` param.
+    - It's a ``message/rfc822`` part (forwarded email — conventionally
+      an attachment per RFC 2046 §5.2.1, and the case Mail.app's
+      AppleScript surface sometimes silently drops).
 
     Returns dicts with keys: ``name``, ``mime_type``, ``size``,
     ``downloaded``. ``downloaded`` is always False on the IMAP path —
@@ -598,53 +457,16 @@ def _bodystructure_extract_attachments(
     out: list[dict[str, Any]] = []
 
     def _filename_from_params(params: Any, key_name: bytes) -> str | None:
-        """Pull a value out of a flat (k, v, k, v, ...) param tuple.
-
-        Handles the plain form (``filename=``) and RFC 2231 extended
-        forms: ``filename*=charset'lang'pct-encoded`` and continuation
-        segments ``filename*0*=`` / ``filename*1=`` / ... (used for
-        non-ASCII and long names). The stdlib parser on the byte-fetch
-        side decodes these natively — missing them here re-opened the
-        enumeration/fetch index divergence for such messages.
-        """
+        """Pull a value out of a flat (k, v, k, v, ...) param tuple."""
         if not isinstance(params, tuple):
             return None
-        plain: str | None = None
-        segments: list[tuple[int, bool, bytes]] = []  # (seq, encoded, val)
         for i in range(0, len(params) - 1, 2):
-            k, v = params[i], params[i + 1]
-            if not isinstance(k, bytes) or not isinstance(
-                v, (bytes, bytearray)
-            ):
-                continue
-            kl = k.lower()
-            if kl == key_name:
-                plain = _decode(v)
-            elif kl.startswith(key_name + b"*"):
-                suffix = kl[len(key_name):]  # b"*", b"*0*", b"*1", ...
-                encoded = suffix.endswith(b"*")
-                digits = suffix.strip(b"*")
-                seq = int(digits) if digits.isdigit() else 0
-                segments.append((seq, encoded, bytes(v)))
-        if not segments:
-            return plain
-        segments.sort(key=lambda t: t[0])
-        charset = "utf-8"
-        pieces: list[str] = []
-        for idx, (_seq, encoded, val) in enumerate(segments):
-            if encoded:
-                if idx == 0 and val.count(b"'") >= 2:
-                    cs, rest = val.split(b"'", 1)
-                    _lang, rest = rest.split(b"'", 1)
-                    charset = _decode(cs) or "utf-8"
-                    val = rest
-                pieces.append(
-                    unquote_to_bytes(val.decode("ascii", errors="replace"))
-                    .decode(charset, errors="replace")
-                )
-            else:
-                pieces.append(_decode(val))
-        return "".join(pieces) or plain
+            k = params[i]
+            if isinstance(k, bytes) and k.lower() == key_name:
+                v = params[i + 1]
+                if isinstance(v, (bytes, bytearray)):
+                    return _decode(v)
+        return None
 
     def _walk(s: Any) -> None:
         if not isinstance(s, tuple) or not s:
@@ -652,9 +474,8 @@ def _bodystructure_extract_attachments(
 
         # Multipart: IMAPClient groups the child parts in a LIST at
         # position 0 — ``([child1, child2, ...], subtype, params, ...)``.
-        # (Real iCloud/Gmail BODYSTRUCTUREs take this shape; missing it is
-        # why multipart attachments were silently dropped — see the
-        # regression tests built from a captured real structure.)
+        # (Real iCloud/Gmail BODYSTRUCTUREs take this shape; missing it
+        # silently dropped attachments on every multipart message.)
         if isinstance(s[0], list):
             for child in s[0]:
                 _walk(child)
@@ -683,43 +504,31 @@ def _bodystructure_extract_attachments(
         disp_kind: bytes | None = None
         disp_filename: str | None = None
         for elem in leaf:
-            if not (
+            if (
                 isinstance(elem, tuple)
                 and elem
                 and isinstance(elem[0], bytes)
+                and elem[0].lower() in (b"attachment", b"inline")
             ):
-                continue
-            head = elem[0].lower()
-            disp_params = elem[1] if len(elem) > 1 else None
-            if head in (b"attachment", b"inline"):
-                disp_kind = head
+                disp_kind = elem[0].lower()
+                disp_params = elem[1] if len(elem) > 1 else ()
                 disp_filename = _filename_from_params(disp_params, b"filename")
                 break
-            # Unknown disposition token (RFC 2183 §2.8) carrying params —
-            # discriminated from ct_params/extension elements by shape:
-            # a disposition tuple's second element is a params TUPLE,
-            # never bytes. Harvest its filename so a `X-Foo;
-            # filename="a.pdf"` part stays visible to enumeration (the
-            # stdlib walker sees it via get_filename()).
-            if isinstance(disp_params, tuple):
-                harvested = _filename_from_params(disp_params, b"filename")
-                if harvested is not None:
-                    disp_kind = head
-                    disp_filename = harvested
-                    break
+
+        is_rfc822 = (
+            type_.lower() == b"message" and subtype.lower() == b"rfc822"
+        )
+        is_attachment = (
+            disp_kind == b"attachment"
+            or (disp_kind == b"inline" and disp_filename is not None)
+            or is_rfc822
+        )
+        if not is_attachment:
+            return
 
         # Filename precedence: disposition's filename → content-type's
         # `name` param (legacy mailers) → empty string.
         name = disp_filename or _filename_from_params(ct_params, b"name") or ""
-
-        if not _is_attachment_part(
-            _decode(disp_kind) if disp_kind is not None else None,
-            name or None,
-            _decode(type_).lower(),
-            _decode(subtype).lower(),
-        ):
-            return
-
         mime_type = f"{_decode(type_)}/{_decode(subtype)}"
 
         out.append({
@@ -733,57 +542,76 @@ def _bodystructure_extract_attachments(
     return out
 
 
-def _email_attachment_parts(
-    msg: _email.message.Message,
-) -> list[_email.message.Message]:
-    """Walk a stdlib-parsed message and return its attachment parts.
+def _disposition_marks_attachment(elem: Any) -> bool:
+    """True if a BODYSTRUCTURE element is a disposition tuple that marks an
+    attachment — ``attachment``, or ``inline`` carrying a ``filename`` param.
 
-    Operates on a fully-parsed ``email.message`` tree rather than a
-    BODYSTRUCTURE tuple; inclusion is decided by the SAME
-    :func:`_is_attachment_part` predicate the BODYSTRUCTURE walker uses,
-    so ``attachment_index`` selects the same part the user saw in
-    ``get_attachments`` — by construction, not by parallel maintenance.
-
-    Walk shape also mirrors the BODYSTRUCTURE walker: multipart
-    containers recurse, ``message/rfc822`` is ONE attachment leaf (its
-    inner parts are NOT enumerated — descending would shift indices
-    relative to the BODYSTRUCTURE view, which treats the forward as a
-    single leaf).
+    Disposition tuples look like ``(b"attachment", (b"filename", b"x.pdf"))``;
+    the params are a flat ``(key, value, key, value, ...)`` tuple.
     """
-    out: list[_email.message.Message] = []
+    if not (isinstance(elem, tuple) and elem and isinstance(elem[0], bytes)):
+        return False
+    disp = elem[0].lower()
+    if disp == b"attachment":
+        return True
+    if disp != b"inline":
+        return False
+    params = elem[1] if len(elem) > 1 else ()
+    if not isinstance(params, tuple):
+        return False
+    return any(
+        isinstance(params[i], bytes) and params[i].lower() == b"filename"
+        for i in range(0, len(params) - 1, 2)
+    )
 
-    def _walk(part: _email.message.Message) -> None:
-        if part.get_content_maintype() == "multipart":
-            payload = part.get_payload()
-            if isinstance(payload, list):
-                for sub in payload:
-                    if isinstance(sub, _email.message.Message):
-                        _walk(sub)
-            return
-        if _is_attachment_part(
-            part.get_content_disposition(),
-            part.get_filename(),
-            part.get_content_maintype(),
-            part.get_content_subtype(),
-        ):
-            out.append(part)
-        # message/rfc822 (or anything else): leaf — never descend.
 
-    _walk(msg)
-    return out
+def _leaf_has_attachment(structure: tuple[Any, ...]) -> bool:
+    """True if a leaf BODYSTRUCTURE part is an attachment.
+
+    A ``message/rfc822`` (forwarded email) part counts, matching
+    ``_bodystructure_extract_attachments`` — otherwise the has_attachment
+    search filter and the attachment list disagree (a forwarded-only message
+    would be filtered out yet report an attachment). Otherwise, any element
+    that is an attachment/inline-filename disposition tuple qualifies.
+    """
+    type_ = structure[0] if isinstance(structure[0], bytes) else b""
+    subtype = (
+        structure[1]
+        if len(structure) > 1 and isinstance(structure[1], bytes)
+        else b""
+    )
+    if type_.lower() == b"message" and subtype.lower() == b"rfc822":
+        return True
+    return any(_disposition_marks_attachment(elem) for elem in structure)
 
 
 def _bodystructure_has_attachment(structure: Any) -> bool:
-    """True if the BODYSTRUCTURE carries any attachment.
+    """Walk an IMAPClient-parsed BODYSTRUCTURE tree and detect attachments.
 
-    Delegates to :func:`_bodystructure_extract_attachments` so the
-    has-attachment search filter and the attachment list can never disagree
-    on what counts as an attachment — that drift was a real bug (the
-    message/rfc822 case). The two used to duplicate the same tree walk;
-    sharing one keeps them consistent by construction. Attachment lists are
-    tiny, so materializing the list to test emptiness is negligible.
+    IMAPClient represents multipart as a tuple ``(part_tuple, ..., subtype)``
+    where each ``part_tuple`` is either another multipart (starts with a
+    tuple) or a leaf (starts with bytes like ``b"text"``, ``b"application"``).
+
+    A message "has an attachment" if any leaf carries a disposition of
+    ``attachment`` or ``inline`` with a ``filename`` parameter (see
+    ``_leaf_has_attachment``).
     """
-    return bool(_bodystructure_extract_attachments(structure))
+    if not isinstance(structure, tuple) or not structure:
+        return False
+
+    # Multipart — children grouped in a list at position 0 (IMAPClient).
+    if isinstance(structure[0], list):
+        return any(
+            _bodystructure_has_attachment(child) for child in structure[0]
+        )
+    # Defensive: children nested as direct tuple elements.
+    if isinstance(structure[0], tuple):
+        return any(
+            isinstance(child, tuple) and _bodystructure_has_attachment(child)
+            for child in structure
+        )
+
+    return _leaf_has_attachment(structure)
 
 
 def _envelope_to_dict(
@@ -804,7 +632,7 @@ def _envelope_to_dict(
     return {
         "id": rfc_id,
         "rfc_message_id": rfc_id,
-        "subject": _decode_header(envelope.subject),
+        "subject": _decode(envelope.subject),
         "sender": _format_sender(envelope),
         "date_received": date_str,
         "read_status": _FLAG_SEEN in flags,
@@ -853,7 +681,7 @@ class ImapConnector:
         )
         try:
             client.login(self._email, self._password)
-            client.socket().settimeout(OP_TIMEOUT_S)
+            _apply_operation_timeout(client)
             yield client
         finally:
             client.logout()
@@ -890,19 +718,7 @@ class ImapConnector:
         with self._session() as client:
             client.select_folder(mailbox, readonly=True)
 
-            # IMAP SEARCH is US-ASCII unless a CHARSET is declared;
-            # non-ASCII filter text (subject_contains="café") otherwise
-            # dies in imapclient with a raw UnicodeEncodeError. ASCII-only
-            # criteria keep today's wire format — maximally compatible
-            # with servers lacking SEARCH CHARSET support; a server that
-            # rejects UTF-8 fails into the AppleScript fallback.
-            needs_utf8 = any(
-                isinstance(c, str) and not c.isascii() for c in criteria
-            )
-            if needs_utf8:
-                uids = client.search(criteria, charset="UTF-8")
-            else:
-                uids = client.search(criteria)
+            uids = client.search(criteria)
             # `limit` bounds MATCHING results. With no post-filter, every
             # candidate matches, so truncating the window up front is both
             # correct and the cheapest possible FETCH. With has_attachment
@@ -961,12 +777,12 @@ class ImapConnector:
             chunk = uids[max(0, end - chunk_size) : end]
             fetched = client.fetch(chunk, fetch_keys)
             for uid in reversed(chunk):
-                # A message expunged by another session between SEARCH and
-                # FETCH is silently absent from the response (RFC 3501) —
-                # a vanished message is not a match, not an error. The
-                # ENVELOPE guard also covers servers returning a partial
-                # entry for a mid-search-mutated message (upstream #314).
                 entry = fetched.get(uid)
+                # A message can vanish between SEARCH and FETCH (expunged or
+                # moved by a concurrent change — another client, a rule, or
+                # our own move/delete on this mailbox). The server then omits
+                # ENVELOPE for that UID. Skip it rather than crashing the
+                # whole search. (#314)
                 if entry is None or b"ENVELOPE" not in entry:
                     continue
                 if has_attachment is not None:
@@ -978,7 +794,7 @@ class ImapConnector:
                     if has_attachment is False and has:
                         continue
                 row = _envelope_to_dict(
-                    entry[b"ENVELOPE"], tuple(entry[b"FLAGS"])
+                    entry[b"ENVELOPE"], tuple(entry.get(b"FLAGS", ()))
                 )
                 if include_attachments:
                     row["attachments"] = _bodystructure_extract_attachments(
@@ -1035,10 +851,13 @@ class ImapConnector:
                 back to AppleScript.)
             IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
         """
+        bracketed = _bracket_message_id(message_id)
+        _reject_control_chars(mailbox, "mailbox")
+
         fetch_keys: list[bytes] = [b"ENVELOPE", b"FLAGS"]
         want_body = include_content and not headers_only
         if want_body:
-            fetch_keys.append(b"BODY[]")
+            fetch_keys.append(b"BODY[TEXT]")
         elif headers_only:
             # We don't currently use the raw header block for anything in
             # the response (envelope already gives us subject/sender/date),
@@ -1050,19 +869,32 @@ class ImapConnector:
             fetch_keys.append(b"BODYSTRUCTURE")
 
         with self._session() as client:
-            uids = self._select_and_search_message_id(
-                client, mailbox, message_id, readonly=True
-            )
+            client.select_folder(mailbox, readonly=True)
+
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if not uids:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} not found in mailbox "
+                    f"{mailbox!r} on {self._host}."
+                )
 
             fetched = client.fetch(uids[:1], fetch_keys)
-            entry = next(iter(fetched.values()))
+            entry = next(iter(fetched.values()), None)
+            # The message matched SEARCH but vanished before FETCH (expunged
+            # or moved by a concurrent change) — treat as not-found rather
+            # than crashing on the missing ENVELOPE. (#314)
+            if entry is None or b"ENVELOPE" not in entry:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} vanished from mailbox "
+                    f"{mailbox!r} between SEARCH and FETCH."
+                )
 
             result = _envelope_to_dict(
-                entry[b"ENVELOPE"], tuple(entry[b"FLAGS"])
+                entry[b"ENVELOPE"], tuple(entry.get(b"FLAGS", ()))
             )
             if want_body:
-                rfc822_bytes = entry.get(b"BODY[]") or b""
-                result["content"] = _extract_body_content(rfc822_bytes)
+                body_bytes = entry.get(b"BODY[TEXT]") or b""
+                result["content"] = _decode(body_bytes)
             else:
                 result["content"] = ""
             if include_attachments:
@@ -1070,6 +902,46 @@ class ImapConnector:
                     entry.get(b"BODYSTRUCTURE")
                 )
             return result
+
+    def fetch_raw_message(
+        self, message_id: str, mailbox: str = "INBOX"
+    ) -> bytes:
+        """Fetch the full raw RFC 822 bytes of a message by Message-ID.
+
+        Used to rebuild a clean reply/forward draft (#245 follow-up):
+        parsing the raw original yields headers, body, and attachment
+        payloads in a single fetch.
+
+        Args:
+            message_id: RFC 5322 Message-ID, with or without ``<>``.
+            mailbox: Folder to SELECT and search. The caller supplies the
+                seed message's folder (or defaults to INBOX); a miss
+                raises so the orchestrator can fall back to AppleScript,
+                which resolves the message across all folders.
+
+        Raises:
+            MailMessageNotFoundError: No message in ``mailbox`` matches.
+            IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
+        """
+        bracketed = _bracket_message_id(message_id)
+        _reject_control_chars(mailbox, "mailbox")
+        with self._session() as client:
+            client.select_folder(mailbox, readonly=True)
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if not uids:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} not found in mailbox "
+                    f"{mailbox!r} on {self._host}."
+                )
+            fetched = client.fetch(uids[:1], [b"BODY[]"])
+            entry = next(iter(fetched.values()))
+            raw = entry.get(b"BODY[]") or b""
+            if not raw:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} in {mailbox!r} returned an "
+                    f"empty body on {self._host}."
+                )
+            return bytes(raw)
 
     def get_attachments(
         self,
@@ -1109,244 +981,24 @@ class ImapConnector:
                 the Message-ID.
             IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
         """
+        bracketed = _bracket_message_id(message_id)
+        _reject_control_chars(mailbox, "mailbox")
+
         with self._session() as client:
-            uids = self._select_and_search_message_id(
-                client, mailbox, message_id, readonly=True
-            )
+            client.select_folder(mailbox, readonly=True)
+
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if not uids:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} not found in mailbox "
+                    f"{mailbox!r} on {self._host}."
+                )
 
             fetched = client.fetch(uids[:1], [b"BODYSTRUCTURE"])
             entry = next(iter(fetched.values()))
             return _bodystructure_extract_attachments(
                 entry.get(b"BODYSTRUCTURE")
             )
-
-    def get_attachment_content(
-        self,
-        message_id: str,
-        attachment_index: int = 0,
-        mailbox: str = "INBOX",
-        *,
-        max_bytes: int | None = None,
-    ) -> dict[str, Any]:
-        """Fetch one attachment's bytes via IMAP and return its content.
-
-        Looks the message up by RFC 5322 Message-ID, fetches the full
-        RFC 822 source (``BODY[]``), and walks the MIME tree with the
-        stdlib ``email`` parser to pull the attachment at
-        ``attachment_index``. The bytes come straight from the server, so
-        — unlike the AppleScript path — this works even when Mail.app has
-        not downloaded the attachment locally (AppleScript's ``save``
-        raises ``-10000`` on an undownloaded placeholder).
-
-        Args:
-            message_id: RFC 5322 Message-ID, with or without ``<>``.
-            attachment_index: Zero-based index into the message's
-                attachment parts, in the same order ``get_attachments``
-                enumerates them.
-            mailbox: Folder to SELECT before fetching.
-            max_bytes: Optional ceiling; raises ``ValueError`` when the
-                decoded attachment exceeds it (mirrors the AppleScript
-                path's size guard).
-
-        Returns:
-            Dict with keys ``name``, ``mime_type``, ``size``, ``content``
-            (text for text/* parts, base64 otherwise), and ``is_binary``.
-
-        Raises:
-            ValueError: ``attachment_index`` is negative or out of range,
-                or the attachment exceeds ``max_bytes``.
-            MailMessageNotFoundError: No message matches the Message-ID.
-            IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
-        """
-        import base64
-
-        part, raw = self._fetch_attachment_part(
-            message_id,
-            attachment_index,
-            mailbox,
-            max_bytes=max_bytes,
-        )
-
-        if part.get_content_maintype() == "text":
-            content = _safe_charset_decode(raw, part.get_content_charset())
-            is_binary = False
-        else:
-            content = base64.b64encode(raw).decode("ascii")
-            is_binary = True
-
-        return {
-            "name": part.get_filename() or "",
-            "mime_type": part.get_content_type(),
-            "size": len(raw),
-            "content": content,
-            "is_binary": is_binary,
-        }
-
-    def get_attachment_bytes(
-        self,
-        message_id: str,
-        attachment_index: int = 0,
-        mailbox: str = "INBOX",
-        *,
-        max_bytes: int | None = None,
-    ) -> bytes:
-        """Fetch one attachment's raw, decoded bytes via IMAP.
-
-        Same lookup/extraction path as :meth:`get_attachment_content`, but
-        returns the raw decoded payload bytes directly — no base64/text
-        re-encode — so callers writing to disk (``save_attachments``) get a
-        byte-exact copy. The bytes come straight from the server, so this
-        works even when Mail.app has not downloaded the attachment locally.
-
-        Args:
-            message_id: RFC 5322 Message-ID, with or without ``<>``.
-            attachment_index: Zero-based index into the message's
-                attachment parts, in the same order ``get_attachments``
-                enumerates them.
-            mailbox: Folder to SELECT before fetching.
-            max_bytes: Optional ceiling; raises ``ValueError`` when the
-                decoded attachment exceeds it.
-
-        Returns:
-            The attachment's raw decoded bytes.
-
-        Raises:
-            ValueError: ``attachment_index`` is negative or out of range,
-                or the attachment exceeds ``max_bytes``.
-            MailMessageNotFoundError: No message matches the Message-ID.
-            IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
-        """
-        _part, raw = self._fetch_attachment_part(
-            message_id,
-            attachment_index,
-            mailbox,
-            max_bytes=max_bytes,
-        )
-        return raw
-
-    def _select_and_search_message_id(
-        self,
-        client: Any,
-        mailbox: str,
-        message_id: str,
-        *,
-        readonly: bool,
-    ) -> list[int]:
-        """Validate, SELECT, and SEARCH a mailbox for a single Message-ID.
-
-        The one chokepoint for "open a folder and look up a message by id":
-        rejects control characters in ``mailbox`` (CWE-93, see
-        :func:`_reject_control_chars`) and routes the id through
-        :func:`_bracket_message_id` so no call site can reach
-        ``select_folder``/``search`` with an unvalidated value. ``readonly``
-        is explicit — every attachment/message read path passes ``True`` so
-        the SELECT (EXAMINE) does not set ``\\Seen``; callers that mutate must
-        opt into ``False`` deliberately.
-
-        Returns the non-empty UID list; raises ``MailMessageNotFoundError`` if
-        the id matches nothing in ``mailbox``.
-        """
-        _reject_control_chars(mailbox, "mailbox")
-        bracketed = _bracket_message_id(message_id)
-        client.select_folder(mailbox, readonly=readonly)
-        uids = cast("list[int]", client.search(["HEADER", "Message-ID", bracketed]))
-        if not uids:
-            raise MailMessageNotFoundError(
-                f"Message-ID {message_id!r} not found in mailbox "
-                f"{mailbox!r} on {self._host}."
-            )
-        return uids
-
-    def _fetch_attachment_part(
-        self,
-        message_id: str,
-        attachment_index: int,
-        mailbox: str,
-        *,
-        max_bytes: int | None,
-    ) -> tuple[_email.message.Message, bytes]:
-        """Look a message up by Message-ID, fetch its RFC 822 source, and
-        return the ``(part, raw_bytes)`` for ``attachment_index``.
-
-        Shared by :meth:`get_attachment_content` (which re-encodes to
-        text/base64) and :meth:`get_attachment_bytes` (which returns the
-        bytes unchanged). Enforces ``max_bytes`` on the decoded payload.
-        """
-        if attachment_index < 0:
-            raise ValueError("attachment_index must be non-negative")
-
-        with self._session() as client:
-            uids = self._select_and_search_message_id(
-                client, mailbox, message_id, readonly=True
-            )
-            fetched = client.fetch(uids[:1], [b"BODY[]"])
-            entry = next(iter(fetched.values()))
-            rfc822_bytes = entry.get(b"BODY[]") or b""
-
-        msg = _email.message_from_bytes(
-            rfc822_bytes, policy=_email_policy.default
-        )
-        parts = _email_attachment_parts(msg)
-        if attachment_index >= len(parts):
-            raise ValueError("Attachment index out of range")
-
-        part = parts[attachment_index]
-        raw = part.get_payload(decode=True)
-        raw = bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
-
-        if max_bytes is not None and len(raw) > max_bytes:
-            raise ValueError(
-                f"Attachment too large ({len(raw) // (1024 * 1024)} MB); "
-                f"use save_attachments to download to disk instead"
-            )
-
-        return part, raw
-
-    def get_attachment_payloads(
-        self,
-        message_id: str,
-        mailbox: str = "INBOX",
-        *,
-        max_bytes: int | None = None,
-    ) -> list[tuple[str, bytes]]:
-        """Return ``(filename, raw_bytes)`` for every attachment, in one fetch.
-
-        A single ``BODY[]`` fetch + one MIME parse, so the filenames and the
-        bytes come from the SAME enumeration (:func:`_email_attachment_parts`).
-        Callers like ``save_attachments`` index names and bytes off this one
-        list, so a name can never be paired with another part's bytes — unlike
-        pairing a BODYSTRUCTURE enumeration with per-index byte fetches, whose
-        attachment definitions can differ. ``max_bytes`` is enforced per
-        attachment. Bytes come straight from the server (no Mail.app download
-        required).
-
-        Raises:
-            MailMessageNotFoundError: No message matches the Message-ID.
-            ValueError: An attachment exceeds ``max_bytes``.
-            IMAPClientError: Login / SELECT / SEARCH / FETCH failed.
-        """
-        with self._session() as client:
-            uids = self._select_and_search_message_id(
-                client, mailbox, message_id, readonly=True
-            )
-            fetched = client.fetch(uids[:1], [b"BODY[]"])
-            entry = next(iter(fetched.values()))
-            rfc822_bytes = entry.get(b"BODY[]") or b""
-
-        msg = _email.message_from_bytes(
-            rfc822_bytes, policy=_email_policy.default
-        )
-        out: list[tuple[str, bytes]] = []
-        for part in _email_attachment_parts(msg):
-            raw = part.get_payload(decode=True)
-            raw = bytes(raw) if isinstance(raw, (bytes, bytearray)) else b""
-            if max_bytes is not None and len(raw) > max_bytes:
-                raise ValueError(
-                    f"Attachment too large ({len(raw) // (1024 * 1024)} MB); "
-                    f"use save_attachments to download to disk instead"
-                )
-            out.append((part.get_filename() or "", raw))
-        return out
 
     def find_thread_members(
         self,
@@ -1508,6 +1160,30 @@ class ImapConnector:
         with self._session() as client:
             client.rename_folder(old_name, new_name)
 
+    def _resolve_uids_batch(
+        self,
+        client: IMAPClient,
+        message_ids: list[str],
+    ) -> list[int]:
+        """Resolve RFC 5322 Message-IDs to UIDs in the selected mailbox,
+        batching the lookups into one ``OR HEADER "Message-ID"`` SEARCH per
+        ``_MSGID_SEARCH_CHUNK`` ids instead of one SEARCH per id. (#316)
+
+        Returns the matched UIDs (first-seen order, de-duplicated). Ids that
+        don't resolve are silently skipped — callers act on the whole set,
+        matching the AppleScript path's best-effort partial-success. Each id
+        is validated via :func:`_bracket_message_id` (the #254 guard).
+        """
+        uids: list[int] = []
+        seen: set[int] = set()
+        for i in range(0, len(message_ids), _MSGID_SEARCH_CHUNK):
+            chunk = message_ids[i:i + _MSGID_SEARCH_CHUNK]
+            for uid in client.search(_or_message_id_criteria(chunk)):
+                if uid not in seen:
+                    seen.add(uid)
+                    uids.append(uid)
+        return uids
+
     def move_messages(
         self,
         message_ids: list[str],
@@ -1548,7 +1224,7 @@ class ImapConnector:
             IMAPClientError: SELECT / SEARCH / MOVE / COPY / STORE /
                 EXPUNGE failed at the protocol level.
         """
-        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
         _reject_control_chars(destination_mailbox, "destination_mailbox")
 
@@ -1564,7 +1240,7 @@ class ImapConnector:
                     f"safe scoped move"
                 )
 
-            uids = _resolve_message_id_uids(client, bracketed_ids)
+            uids = self._resolve_uids_batch(client, message_ids)
             if not uids:
                 return 0
 
@@ -1585,6 +1261,63 @@ class ImapConnector:
         "Deleted Messages",
         "Deleted Items",
     )
+
+    # Conventional Drafts folder names to fall back on when the server
+    # doesn't advertise \\Drafts via SPECIAL-USE (RFC 6154). Issue #245.
+    _CONVENTIONAL_DRAFTS_NAMES: tuple[str, ...] = (
+        "Drafts",
+        "[Gmail]/Drafts",
+        "INBOX.Drafts",
+    )
+
+    def append_draft(self, raw_message: bytes) -> str:
+        """APPEND a pre-built RFC822 message to the account's Drafts
+        folder with the ``\\Draft`` flag, and return the folder used.
+
+        Bypasses Mail.app's AppleScript ``content`` setter, which wraps
+        every body in an ``Apple-Mail-URLShareWrapper``
+        ``<blockquote type="cite">`` that renders as a quote on iOS
+        (Mail.app bug FB11734014, issue #245). The caller builds
+        ``raw_message`` via :func:`apple_mail_mcp.draft_builder.build_draft_mime`.
+        """
+        with self._session() as client:
+            folder = self._find_drafts_folder(
+                client
+            ) or self._find_drafts_by_convention(client)
+            if folder is None:
+                raise MailMessageNotFoundError(
+                    f"No Drafts folder found on {self._host} "
+                    f"(no \\Drafts SPECIAL-USE flag and none of "
+                    f"{list(self._CONVENTIONAL_DRAFTS_NAMES)} present)."
+                )
+            client.append(folder, raw_message, flags=[DRAFT])
+            return folder
+
+    @staticmethod
+    def _find_drafts_folder(client: IMAPClient) -> str | None:
+        """Return the Drafts folder name via the ``\\Drafts`` SPECIAL-USE
+        flag (RFC 6154), or None if the server doesn't advertise it."""
+        for flags, _delim, name in client.list_folders():
+            if b"\\Drafts" in flags:
+                if isinstance(name, (bytes, bytearray)):
+                    return name.decode("utf-8", errors="replace")
+                return cast(str, name)
+        return None
+
+    def _find_drafts_by_convention(self, client: IMAPClient) -> str | None:
+        """Fall back to conventional Drafts names for servers that don't
+        advertise SPECIAL-USE ``\\Drafts``. First match wins in
+        :attr:`_CONVENTIONAL_DRAFTS_NAMES` order."""
+        present: set[str] = set()
+        for _flags, _delim, name in client.list_folders():
+            if isinstance(name, (bytes, bytearray)):
+                present.add(name.decode("utf-8", errors="replace"))
+            else:
+                present.add(name)
+        for candidate in self._CONVENTIONAL_DRAFTS_NAMES:
+            if candidate in present:
+                return candidate
+        return None
 
     def delete_messages(
         self,
@@ -1622,7 +1355,7 @@ class ImapConnector:
                 SPECIAL-USE or conventional names.
             IMAPClientError: Protocol-level failure.
         """
-        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
@@ -1654,7 +1387,7 @@ class ImapConnector:
 
             client.select_folder(source_mailbox, readonly=False)
 
-            uids = _resolve_message_id_uids(client, bracketed_ids)
+            uids = self._resolve_uids_batch(client, message_ids)
             if not uids:
                 return 0
 
@@ -1696,13 +1429,13 @@ class ImapConnector:
             IMAPClientError: SELECT / SEARCH / STORE failed at the
                 protocol level.
         """
-        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
             client.select_folder(source_mailbox, readonly=False)
 
-            uids = _resolve_message_id_uids(client, bracketed_ids)
+            uids = self._resolve_uids_batch(client, message_ids)
             if not uids:
                 return 0
 
@@ -1750,13 +1483,13 @@ class ImapConnector:
             IMAPClientError: SELECT / SEARCH / STORE failed at the
                 protocol level.
         """
-        bracketed_ids = [_bracket_message_id(mid) for mid in message_ids]
+        _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
 
         with self._session() as client:
             client.select_folder(source_mailbox, readonly=False)
 
-            uids = _resolve_message_id_uids(client, bracketed_ids)
+            uids = self._resolve_uids_batch(client, message_ids)
             if not uids:
                 return 0
 

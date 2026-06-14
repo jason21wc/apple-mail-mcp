@@ -2,6 +2,7 @@
 Utility functions for Apple Mail MCP.
 """
 
+import base64
 import json
 import re
 from typing import Any
@@ -9,6 +10,17 @@ from typing import Any
 _UUID_RE = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
+
+# Cap for a single message body returned inline by get_messages (#365).
+# Bodies are returned as part of a possibly multi-message JSON-RPC response;
+# an unbounded body can produce an oversized frame the stdio client rejects,
+# which takes the whole server down. Overridable via the server layer
+# (APPLE_MAIL_MCP_MAX_BODY_BYTES), mirroring the attachment byte caps.
+DEFAULT_MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB per message body
+
+# C0 control characters minus tab (09), newline (0a), carriage return (0d) —
+# the rest corrupt the JSON-RPC stream and carry no body content.
+_C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def is_account_uuid(value: str) -> bool:
@@ -146,6 +158,45 @@ def sanitize_input(value: Any) -> str:
         s = s[:max_length]
 
     return s
+
+
+def make_body_safe(content: str, max_bytes: int) -> tuple[str, bool, int]:
+    """Make a message body safe to return over the stdio MCP transport (#365).
+
+    A single message body that is either huge or not UTF-8-encodable can take
+    the whole server down: the oversized/invalid JSON-RPC frame is rejected by
+    the client (pipe closes, server process exits) or raises UnicodeEncodeError
+    on the stdout write — both *outside* the tool's ``try/except`` boundary.
+    This bounds and scrubs the body so neither can happen.
+
+    Scrub: coerce to encodable UTF-8 (lone surrogates / un-encodable codepoints
+    become ``?``) and drop C0 control characters except tab, newline, and
+    carriage return. Bound: if the scrubbed body exceeds ``max_bytes`` UTF-8
+    bytes, truncate on a character boundary.
+
+    Args:
+        content: Raw message body text.
+        max_bytes: Maximum UTF-8 byte length to return.
+
+    Returns:
+        ``(safe_content, truncated, original_bytes)`` where ``original_bytes``
+        is the UTF-8 byte length of the scrubbed body *before* any truncation.
+    """
+    if not content:
+        return "", False, 0
+    # Coerce to encodable UTF-8 first — a lone surrogate would otherwise raise
+    # UnicodeEncodeError when the response is written to stdout.
+    scrubbed = content.encode("utf-8", "replace").decode("utf-8")
+    # Drop control chars that corrupt the JSON-RPC stream, keeping the
+    # whitespace that carries real body structure.
+    scrubbed = _C0_CONTROL_RE.sub("", scrubbed)
+    encoded = scrubbed.encode("utf-8")
+    original_bytes = len(encoded)
+    if original_bytes <= max_bytes:
+        return scrubbed, False, original_bytes
+    # Truncate on a character boundary: slice bytes, then drop any partial
+    # trailing multibyte sequence via errors="ignore".
+    return encoded[:max_bytes].decode("utf-8", "ignore"), True, original_bytes
 
 
 def sanitize_filename(filename: str) -> str:
@@ -442,3 +493,101 @@ def walk_thread_graph(
             break
 
     return accepted
+
+
+def coerce_json_list(v: Any) -> Any:
+    """Coerce a stringified array back to a list (#309).
+
+    Some MCP hosts (e.g. Cowork) serialize every tool argument as a string,
+    so a ``list[...]`` param arrives as ``'["a@b.com"]'`` and Pydantic
+    rejects it with a ``list_type`` error. Used as a Pydantic
+    ``BeforeValidator`` on list-typed tool params: a JSON-array string
+    becomes the list, a bare non-JSON string becomes a single-element list,
+    an empty string becomes ``[]``. Real lists and ``None`` pass through
+    untouched, so well-behaved clients are unaffected. Element types are
+    still validated by Pydantic afterwards.
+    """
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+        except (ValueError, TypeError):
+            return [v]
+        return parsed if isinstance(parsed, list) else [v]
+    return v
+
+
+def coerce_json_dict(v: Any) -> Any:
+    """Coerce a stringified object back to a dict (#309).
+
+    Companion to :func:`coerce_json_list` for ``dict``-typed tool params
+    (e.g. rule ``actions``, template ``vars``). A JSON-object string becomes
+    the dict; anything else (real dict, ``None``, non-object JSON, garbage)
+    passes through to be validated/rejected normally.
+    """
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except (ValueError, TypeError):
+            return v
+        return parsed if isinstance(parsed, dict) else v
+    return v
+
+
+def is_apple_hosted_address(address: str) -> bool:
+    """True if ``address`` is on an Apple-hosted iCloud Mail domain.
+
+    iCloud Mail's IMAP server authenticates one of the account's own
+    Apple-hosted addresses (``@icloud.com`` / ``@me.com`` / legacy
+    ``@mac.com``). Used by ``_resolve_imap_config`` to pick the right IMAP
+    login when an iCloud account's Apple ID is a third-party email (#299).
+    """
+    return address.strip().lower().endswith(
+        ("@icloud.com", "@me.com", "@mac.com")
+    )
+
+
+def is_icloud_imap_host(host: str) -> bool:
+    """True if ``host`` is an iCloud Mail IMAP server (``*.mail.me.com``).
+
+    Covers the per-partition hostnames Mail.app reports (e.g.
+    ``p42-imap.mail.me.com``) as well as ``imap.mail.me.com``.
+    """
+    return host.strip().lower().endswith(".mail.me.com")
+
+
+def is_texty_mime(mime_type: str) -> bool:
+    """True for MIME types whose payload is human-readable text and worth
+    returning as a UTF-8 string rather than base64 (#250).
+
+    Covers ``text/*`` plus the common structured-text application types
+    (``application/json``, ``application/xml``, and any ``+json`` / ``+xml``
+    structured-syntax suffix, e.g. ``image/svg+xml``).
+    """
+    m = (mime_type or "").strip().lower()
+    if m.startswith("text/"):
+        return True
+    if m in ("application/json", "application/xml"):
+        return True
+    return m.endswith("+json") or m.endswith("+xml")
+
+
+def attachment_content_encoding(
+    payload: bytes, mime_type: str
+) -> tuple[str, str]:
+    """Encode attachment bytes for inline return (#250).
+
+    Returns ``(content, encoding)``. For texty MIME types
+    (:func:`is_texty_mime`) the payload is returned as a UTF-8 string with
+    ``encoding="text"``; if it isn't valid UTF-8 — or the type isn't texty —
+    it's base64-encoded with ``encoding="base64"``. Fail-safe: anything that
+    can't be decoded as text round-trips losslessly through base64.
+    """
+    if is_texty_mime(mime_type):
+        try:
+            return payload.decode("utf-8"), "text"
+        except UnicodeDecodeError:
+            pass
+    return base64.b64encode(payload).decode("ascii"), "base64"

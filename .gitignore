@@ -57,7 +57,6 @@ dmypy.json
 *.log
 .env
 .env.local
-reports/
 
 # Documentation builds
 docs/_build/

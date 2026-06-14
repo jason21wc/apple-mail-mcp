@@ -6,12 +6,18 @@ import pytest
 
 from apple_mail_mcp.exceptions import MailAppleScriptError
 from apple_mail_mcp.utils import (
+    DEFAULT_MAX_BODY_BYTES,
     applescript_account_clause,
+    coerce_json_dict,
+    coerce_json_list,
     escape_applescript_string,
     format_applescript_list,
     get_flag_index,
     is_account_uuid,
+    is_apple_hosted_address,
     is_gmail_system_label,
+    is_icloud_imap_host,
+    make_body_safe,
     normalize_subject,
     parse_applescript_json,
     parse_applescript_list,
@@ -415,5 +421,226 @@ class TestGetFlagIndex:
 
     def test_case_insensitive(self) -> None:
         assert get_flag_index("RED") == 0
+
+
+class TestIsAppleHostedAddress:
+    """#299: detect the account's own Apple-hosted iCloud Mail addresses."""
+
+    def test_icloud_me_mac_are_apple_hosted(self) -> None:
+        assert is_apple_hosted_address("a@icloud.com") is True
+        assert is_apple_hosted_address("a@me.com") is True
+        assert is_apple_hosted_address("a@mac.com") is True
+
+    def test_case_and_whitespace_insensitive(self) -> None:
+        assert is_apple_hosted_address("  A@ICloud.Com ") is True
+
+    def test_third_party_and_custom_domains_not_apple_hosted(self) -> None:
+        assert is_apple_hosted_address("a@gmail.com") is False
+        assert is_apple_hosted_address("a@example.com") is False
+        assert is_apple_hosted_address("") is False
+
+    def test_substring_spoof_not_apple_hosted(self) -> None:
+        # The Apple domain must be the actual host, not a prefix of a
+        # look-alike domain.
+        assert is_apple_hosted_address("a@icloud.com.evil.com") is False
+        assert is_apple_hosted_address("icloud.com@evil.com") is False
+
+
+class TestIsIcloudImapHost:
+    """#299: detect iCloud Mail IMAP servers (*.mail.me.com)."""
+
+    def test_partition_and_canonical_hosts(self) -> None:
+        assert is_icloud_imap_host("p42-imap.mail.me.com") is True
+        assert is_icloud_imap_host("imap.mail.me.com") is True
+        assert is_icloud_imap_host("P66-IMAP.MAIL.ME.COM") is True
+
+    def test_non_icloud_hosts(self) -> None:
+        assert is_icloud_imap_host("imap.gmail.com") is False
+        assert is_icloud_imap_host("imap.mail.yahoo.com") is False
+        assert is_icloud_imap_host("") is False
+
+    def test_substring_spoof_not_matched(self) -> None:
+        assert is_icloud_imap_host("mail.me.com.evil.com") is False
+
+
+class TestCoerceJsonList:
+    """#309: coerce stringified arrays (MCP hosts that serialize params)."""
+
+    def test_json_array_string_becomes_list(self) -> None:
+        assert coerce_json_list('["a@b.com", "c@d.com"]') == ["a@b.com", "c@d.com"]
+
+    def test_json_int_array_string_becomes_list(self) -> None:
+        assert coerce_json_list("[0, 2]") == [0, 2]
+
+    def test_bare_string_becomes_single_element(self) -> None:
+        assert coerce_json_list("john@example.com") == ["john@example.com"]
+
+    def test_empty_string_becomes_empty_list(self) -> None:
+        assert coerce_json_list("") == []
+        assert coerce_json_list("   ") == []
+
+    def test_non_list_json_string_wraps_as_single_element(self) -> None:
+        # A JSON scalar string isn't a list → treat the original as one elem.
+        assert coerce_json_list("5") == ["5"]
+
+    def test_real_list_passes_through(self) -> None:
+        v = ["x@y.com"]
+        assert coerce_json_list(v) is v
+
+    def test_none_passes_through(self) -> None:
+        assert coerce_json_list(None) is None
+
+
+class TestCoerceJsonDict:
+    """#309: coerce stringified objects."""
+
+    def test_json_object_string_becomes_dict(self) -> None:
+        assert coerce_json_dict('{"name": "Bob"}') == {"name": "Bob"}
+
+    def test_real_dict_passes_through(self) -> None:
+        v = {"k": "v"}
+        assert coerce_json_dict(v) is v
+
+    def test_none_passes_through(self) -> None:
+        assert coerce_json_dict(None) is None
+
+    def test_non_object_json_passes_through_to_fail_validation(self) -> None:
+        # A JSON array/scalar isn't a dict → leave as-is for Pydantic to reject.
+        assert coerce_json_dict("[1, 2]") == "[1, 2]"
+
+    def test_garbage_string_passes_through(self) -> None:
+        assert coerce_json_dict("not json") == "not json"
         assert get_flag_index("Red") == 0
         assert get_flag_index("oRaNgE") == 1
+
+
+# --- Attachment content encoding (#250) ----------------------------------
+
+import base64 as _base64  # noqa: E402
+
+from apple_mail_mcp.utils import (  # noqa: E402
+    attachment_content_encoding,
+    is_texty_mime,
+)
+
+
+class TestIsTextyMime:
+    @pytest.mark.parametrize(
+        "mime",
+        [
+            "text/plain",
+            "text/html",
+            "TEXT/CSV",
+            "application/json",
+            "application/xml",
+            "application/ld+json",
+            "image/svg+xml",
+        ],
+    )
+    def test_texty(self, mime):
+        assert is_texty_mime(mime) is True
+
+    @pytest.mark.parametrize(
+        "mime",
+        ["application/pdf", "image/png", "application/octet-stream", "", "audio/mpeg"],
+    )
+    def test_not_texty(self, mime):
+        assert is_texty_mime(mime) is False
+
+
+class TestAttachmentContentEncoding:
+    def test_text_mime_utf8_returns_text(self):
+        content, encoding = attachment_content_encoding(
+            b"hello, world\n", "text/plain"
+        )
+        assert encoding == "text"
+        assert content == "hello, world\n"
+
+    def test_json_mime_returns_text(self):
+        content, encoding = attachment_content_encoding(
+            b'{"a": 1}', "application/json"
+        )
+        assert encoding == "text"
+        assert content == '{"a": 1}'
+
+    def test_texty_mime_invalid_utf8_falls_back_to_base64(self):
+        payload = b"\xff\xfe\x00\x01bad utf8"
+        content, encoding = attachment_content_encoding(payload, "text/plain")
+        assert encoding == "base64"
+        assert _base64.b64decode(content) == payload
+
+    def test_binary_mime_returns_base64(self):
+        payload = b"%PDF-1.7\n\x00\x01\x02"
+        content, encoding = attachment_content_encoding(
+            payload, "application/pdf"
+        )
+        assert encoding == "base64"
+        assert _base64.b64decode(content) == payload
+
+    def test_empty_payload_text_mime(self):
+        content, encoding = attachment_content_encoding(b"", "text/plain")
+        assert encoding == "text"
+        assert content == ""
+
+
+class TestMakeBodySafe:
+    """Tests for make_body_safe (#365): message bodies must be bounded and
+    serialization-safe before they leave get_messages, or a single oversized
+    or non-UTF8-encodable body crashes the whole stdio MCP server."""
+
+    def test_small_clean_content_unchanged(self):
+        safe, truncated, original = make_body_safe(
+            "hello world", DEFAULT_MAX_BODY_BYTES
+        )
+        assert safe == "hello world"
+        assert truncated is False
+        assert original == len(b"hello world")
+
+    def test_empty_content(self):
+        assert make_body_safe("", DEFAULT_MAX_BODY_BYTES) == ("", False, 0)
+
+    def test_preserves_tab_newline_carriage_return(self):
+        safe, truncated, _ = make_body_safe("a\tb\nc\rd", DEFAULT_MAX_BODY_BYTES)
+        assert safe == "a\tb\nc\rd"
+        assert truncated is False
+
+    def test_strips_nul_and_c0_control_chars(self):
+        safe, _, _ = make_body_safe(
+            "a\x00b\x07c\x1fd", DEFAULT_MAX_BODY_BYTES
+        )
+        assert safe == "abcd"
+
+    def test_scrubs_lone_surrogate_to_be_serializable(self):
+        # A lone surrogate is the classic cause of UnicodeEncodeError on the
+        # stdout write — the failure that escapes the tool's try/except.
+        safe, _, _ = make_body_safe("hi\ud800there", DEFAULT_MAX_BODY_BYTES)
+        safe.encode("utf-8")  # must not raise
+        assert "\ud800" not in safe
+
+    def test_truncates_oversized_content_and_reports_original(self):
+        big = "x" * (DEFAULT_MAX_BODY_BYTES + 5000)
+        safe, truncated, original = make_body_safe(big, DEFAULT_MAX_BODY_BYTES)
+        assert truncated is True
+        assert original == DEFAULT_MAX_BODY_BYTES + 5000
+        assert len(safe.encode("utf-8")) <= DEFAULT_MAX_BODY_BYTES
+
+    def test_truncation_does_not_split_multibyte_char(self):
+        # "😀" is 4 UTF-8 bytes; a 10-byte cap must yield 2 whole emoji
+        # (8 bytes), never a broken trailing byte sequence.
+        safe, truncated, _ = make_body_safe("😀" * 100, 10)
+        assert truncated is True
+        safe.encode("utf-8")  # valid
+        assert "�" not in safe  # no replacement char from a broken split
+        assert len(safe.encode("utf-8")) <= 10
+
+    def test_output_always_json_serializable(self):
+        pathological = [
+            "plain",
+            "a\x00b\x1fc",
+            "x" * (DEFAULT_MAX_BODY_BYTES + 100),
+            "surrogate\ud800tail",
+        ]
+        for content in pathological:
+            safe, _, _ = make_body_safe(content, DEFAULT_MAX_BODY_BYTES)
+            # The assertion that the original bug would have failed.
+            json.dumps({"content": safe}).encode("utf-8")
