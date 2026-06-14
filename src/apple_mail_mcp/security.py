@@ -196,63 +196,6 @@ def check_rate_limit(operation: str, params: dict[str, Any]) -> dict[str, Any] |
     }
 
 
-def validate_attachment_type(filename: str, allow_executables: bool = False) -> bool:
-    """
-    Validate attachment file type for security.
-
-    Args:
-        filename: Name of the attachment file
-        allow_executables: Whether to allow executable files (default: False)
-
-    Returns:
-        True if file type is allowed, False otherwise
-
-    Example:
-        >>> validate_attachment_type("document.pdf")
-        True
-        >>> validate_attachment_type("malware.exe")
-        False
-    """
-    # Dangerous executable extensions (block by default)
-    dangerous_extensions = {
-        '.exe', '.bat', '.cmd', '.com', '.scr', '.pif',
-        '.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh',
-        '.msi', '.msp', '.scf', '.lnk', '.inf', '.reg',
-        '.ps1', '.psm1', '.app', '.deb', '.rpm', '.sh',
-        '.bash', '.csh', '.ksh', '.zsh', '.command'
-    }
-
-    filename_lower = filename.lower()
-
-    # Check for dangerous extensions
-    for ext in dangerous_extensions:
-        if filename_lower.endswith(ext):
-            return allow_executables
-
-    # All other types are allowed
-    return True
-
-
-def validate_attachment_size(size_bytes: int, max_size: int = 25 * 1024 * 1024) -> bool:
-    """
-    Validate attachment file size.
-
-    Args:
-        size_bytes: Size of file in bytes
-        max_size: Maximum allowed size in bytes (default: 25MB)
-
-    Returns:
-        True if within limit, False otherwise
-
-    Example:
-        >>> validate_attachment_size(1024 * 1024)  # 1MB
-        True
-        >>> validate_attachment_size(30 * 1024 * 1024)  # 30MB
-        False
-    """
-    return size_bytes <= max_size
-
-
 # ---------------------------------------------------------------------------
 # Test-mode safety system (MAIL_TEST_MODE)
 # ---------------------------------------------------------------------------
