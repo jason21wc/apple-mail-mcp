@@ -5,9 +5,11 @@ FastMCP server for Apple Mail integration.
 import argparse
 import atexit
 import logging
+import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from fastmcp import Context, FastMCP
 from fastmcp.server.elicitation import AcceptedElicitation
@@ -51,8 +53,50 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# Read-only mode (#217 / upstream #240). The connector can be launched with
+# `--read-only` to skip registration of the 14 mutating tools so Claude
+# Desktop users can run two server entries side-by-side and batch-approve the
+# read-only one. `_pre_parse_read_only` parses argv at module load (tolerant of
+# unknown args, which `main()` parses again with the full schema) so the
+# `@_tool(..., mutating=True)` decorator below can decide registration at
+# decoration time without restructuring the per-tool decoration sites.
+def _pre_parse_read_only(argv: list[str] | None = None) -> bool:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--read-only", action="store_true")
+    args, _ = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
+    return bool(args.read_only)
+
+
+_READ_ONLY = _pre_parse_read_only()
+
 # Create FastMCP server
 mcp = FastMCP("apple-mail")
+
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _tool(
+    annotations: dict[str, Any], *, mutating: bool = False
+) -> Callable[[F], F]:
+    """Annotation-aware tool decorator that gates registration on `_READ_ONLY`.
+
+    `mutating=True` tools are skipped when the server was launched with
+    `--read-only`; the function stays callable (handy for tests) but is not
+    registered with MCP. Non-mutating tools always register.
+    """
+
+    def wrap(fn: F) -> F:
+        if mutating and _READ_ONLY:
+            return fn
+        # Registered tools return a FastMCP FunctionTool, not `F`; the `-> F`
+        # annotation is a deliberate convenience lie so call sites read as
+        # plain functions. Only the read-only-skip branch returns the real fn.
+        return mcp.tool(annotations=annotations)(fn)
+
+    return wrap
+
 
 # Initialize mail connector. Pool is opt-in via APPLE_MAIL_MCP_IMAP_POOL=1
 # (default off, per #75 acceptance criteria — keep per-call lifecycle the
@@ -140,7 +184,9 @@ async def _elicit_confirmation(
     return None
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def list_accounts() -> dict[str, Any]:
     """
     List all configured email accounts in Apple Mail.
@@ -185,7 +231,9 @@ def list_accounts() -> dict[str, Any]:
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def list_rules() -> dict[str, Any]:
     """
     List all Mail.app rules (read-only).
@@ -244,7 +292,10 @@ def _resolve_rule_name(rule_index: int) -> str | None:
     return None
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 async def delete_rule(
     rule_index: int,
     ctx: Context | None = None,
@@ -323,7 +374,10 @@ async def delete_rule(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    mutating=True,
+)
 def create_rule(
     name: str,
     conditions: list[dict[str, Any]],
@@ -406,7 +460,10 @@ def create_rule(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 async def update_rule(
     rule_index: int,
     name: str | None = None,
@@ -528,7 +585,9 @@ async def update_rule(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def list_mailboxes(account: str) -> dict[str, Any]:
     """
     List all mailboxes for an account.
@@ -720,7 +779,9 @@ def _apply_search_filters(
     return [m for m in messages if matches(m)][:limit]
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def search_messages(
     account: str | None = None,
     mailbox: str = "INBOX",
@@ -986,7 +1047,9 @@ def search_messages(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def get_messages(
     message_ids: list[str],
     include_content: bool = True,
@@ -1109,7 +1172,10 @@ def get_messages(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 def update_message(
     message_ids: list[str],
     read_status: bool | None = None,
@@ -1288,7 +1354,9 @@ def update_message(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def get_thread(message_id: str) -> dict[str, Any]:
     """
     Return all messages in the thread containing the given message.
@@ -1353,7 +1421,9 @@ def get_thread(message_id: str) -> dict[str, Any]:
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def get_attachment_content(
     message_id: str,
     attachment_index: int = 0,
@@ -1440,7 +1510,10 @@ def get_attachment_content(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    mutating=True,
+)
 def save_attachments(
     message_id: str,
     save_directory: str,
@@ -1596,7 +1669,10 @@ def save_attachments(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    mutating=True,
+)
 def create_mailbox(
     account: str,
     name: str,
@@ -1684,7 +1760,10 @@ def create_mailbox(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 def update_mailbox(
     account: str,
     name: str,
@@ -1828,7 +1907,10 @@ def update_mailbox(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 async def delete_mailbox(
     account: str,
     name: str,
@@ -1958,7 +2040,10 @@ async def delete_mailbox(
         }
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 def delete_messages(
     message_ids: list[str],
     permanent: bool = False,
@@ -2104,7 +2189,9 @@ def _template_error_response(e: MailTemplateError) -> dict[str, Any]:
     return {"success": False, "error": str(e), "error_type": et}
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def list_templates() -> dict[str, Any]:
     """List all stored email templates.
 
@@ -2134,7 +2221,9 @@ def list_templates() -> dict[str, Any]:
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def get_template(name: str) -> dict[str, Any]:
     """Read a single template by name.
 
@@ -2165,7 +2254,10 @@ def get_template(name: str) -> dict[str, Any]:
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    mutating=True,
+)
 def save_template(
     name: str, body: str, subject: str | None = None
 ) -> dict[str, Any]:
@@ -2210,7 +2302,10 @@ def save_template(
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 async def delete_template(
     name: str, ctx: Context | None = None
 ) -> dict[str, Any]:
@@ -2255,7 +2350,9 @@ async def delete_template(
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+)
 def render_template(
     name: str,
     message_id: str | None = None,
@@ -2698,7 +2795,10 @@ def _merge_draft_recipients(
     )
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    mutating=True,
+)
 async def create_draft(
     reply_to: str | None = None,
     forward_of: str | None = None,
@@ -2871,7 +2971,10 @@ async def create_draft(
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 async def update_draft(
     draft_id: str,
     to: list[str] | None = None,
@@ -3038,7 +3141,10 @@ async def update_draft(
                 pass
 
 
-@mcp.tool()
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    mutating=True,
+)
 def delete_draft(draft_id: str) -> dict[str, Any]:
     """Delete (move to Trash) an existing draft.
 
@@ -3082,6 +3188,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "Apple Mail MCP server. With no subcommand, starts the MCP "
             "server (this is what Claude Desktop / mcp clients invoke)."
+        ),
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help=(
+            "Start the server with only the 10 read-only tools registered "
+            "(skips the 14 mutating tools). Pair with a second non-read-only "
+            "server entry in your MCP client to batch-approve reads while "
+            "still gating writes per call. See docs/reference/TOOLS.md."
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -3136,6 +3252,11 @@ def main(argv: list[str] | None = None) -> int:
             uninstall=args.uninstall,
         )
 
+    if _READ_ONLY:
+        logger.info(
+            "Read-only mode: 14 mutating tools skipped (--read-only). "
+            "Only the 10 read tools are registered."
+        )
     logger.info("Starting Apple Mail MCP server")
     mcp.run()
     return 0
