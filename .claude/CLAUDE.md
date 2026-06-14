@@ -1,5 +1,16 @@
 # Apple Mail MCP Server
 
+> **CHMG Fork (jason21wc).** Re-baselined onto upstream s-morgan-jeffries/apple-mail-mcp **v0.10.2** (was pinned v0.8.2). Owner: Jason Collier (Collier Hotel Management Group). Primary use case: automated hotel property report extraction (see `.claude/skills/hotel-report-extraction/`). The re-baseline rationale + plan live in the `project-upstream-resync` memory file.
+>
+> **Governance:** This server runs ONLY behind ai-governance-proxy (hard mode) per claude_desktop_config.json. Never run it directly — always via the governance proxy.
+>
+> **Fork modifications kept on top of upstream** — everything else converged INTO upstream and was dropped (get_attachment_content, nested-mailbox resolution, attachment path-traversal hardening, and the save_attachments IMAP fast path are all upstream now):
+> 1. `save_attachments` `output_filename` — save a single attachment under a caller-chosen, sanitized name (used by the hotel-report skill).
+> 2. `content_is_untrusted` / `security_notice` marking on `get_messages` + `get_attachment_content` (composes with upstream's #225 per-message `prompt_injection`).
+> 3. Fork infra: governance integration + the hotel-report extraction skill. (Re-port pending: the real-execution smoke suite + pre-push hook — upstream's integration tests cover the gap meanwhile.)
+>
+> **Upstream sync:** `git fetch upstream && git log upstream/main --oneline -5`. Do not auto-merge.
+
 An MCP server bridging Claude and Apple Mail via AppleScript on macOS.
 
 **Stack:** Python 3.10+, FastMCP, AppleScript (via `osascript`)
