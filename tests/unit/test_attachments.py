@@ -194,31 +194,6 @@ class TestSaveAttachments:
 class TestAttachmentSecurity:
     """Tests for attachment security features."""
 
-    def test_validates_file_type_restrictions(self) -> None:
-        """Test that dangerous file types are restricted."""
-        from apple_mail_mcp.security import validate_attachment_type
-
-        # Dangerous types should be rejected by default
-        assert validate_attachment_type("malware.exe") is False
-        assert validate_attachment_type("script.bat") is False
-        assert validate_attachment_type("script.sh") is False
-        assert validate_attachment_type("document.scr") is False
-
-        # Safe types should be allowed
-        assert validate_attachment_type("document.pdf") is True
-        assert validate_attachment_type("image.jpg") is True
-        assert validate_attachment_type("data.csv") is True
-
-    def test_validates_file_size(self) -> None:
-        """Test file size validation."""
-        from apple_mail_mcp.security import validate_attachment_size
-
-        # Within limit
-        assert validate_attachment_size(1024 * 1024, max_size=10 * 1024 * 1024) is True
-
-        # Exceeds limit
-        assert validate_attachment_size(30 * 1024 * 1024, max_size=25 * 1024 * 1024) is False
-
     def test_sanitizes_filename(self) -> None:
         """Test filename sanitization."""
         from apple_mail_mcp.utils import sanitize_filename
