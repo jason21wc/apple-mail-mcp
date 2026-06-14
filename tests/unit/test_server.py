@@ -658,6 +658,51 @@ class TestSearchMessages:
         assert logged_status == "success"
         assert logged_params["filters"]["sender"] == "alice@example.com"
 
+    # ---- Bulk cap (P2 Item C) -------------------------------------------
+    # search_messages had no upper bound: limit (account path) and len(source)
+    # (source path) were both unbounded fetch vectors, unlike delete_messages /
+    # update_message which cap at 100. Reject (not silently clamp) — silent
+    # truncation is the bug class PR #24 fixed.
+
+    def test_limit_over_cap_returns_validation_error(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        result = search_messages("Gmail", limit=101)
+
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        mock_mail.search_messages.assert_not_called()
+
+    def test_limit_at_cap_is_allowed(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail.search_messages.return_value = []
+
+        result = search_messages("Gmail", limit=100)
+
+        assert result["success"] is True
+        mock_mail.search_messages.assert_called_once()
+
+    def test_source_list_over_cap_returns_validation_error(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        result = search_messages(source=[str(i) for i in range(101)])
+
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        # Resolver must never run for an over-cap source list.
+        mock_mail.get_message.assert_not_called()
+
+    def test_empty_source_list_still_no_op(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        # The cap is upper-bound only; empty source stays a valid no-op.
+        result = search_messages(source=[])
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        mock_mail.get_message.assert_not_called()
+
     def test_account_not_found_maps_to_not_found(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
@@ -1277,6 +1322,32 @@ class TestGetMessages:
         assert result["messages"] == []
         mock_mail.get_message.assert_not_called()
         mock_mail.get_selected_messages.assert_not_called()
+
+    # ---- Bulk cap (P2 Item C) -------------------------------------------
+    # get_messages was bound only by len(message_ids) with no upper cap,
+    # unlike delete_messages / update_message (max 100). Enforce the same cap
+    # while preserving the documented empty-list-as-no-op contract.
+
+    def test_over_limit_returns_validation_error(
+        self, mock_mail: MagicMock
+    ) -> None:
+        result = get_messages([str(i) for i in range(101)])
+
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        mock_mail.get_message.assert_not_called()
+
+    def test_at_limit_is_allowed(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail.get_message.return_value = {"id": "x", "subject": "ok"}
+
+        result = get_messages(
+            [str(i) for i in range(100)], include_content=False
+        )
+
+        assert result["success"] is True
+        assert result["count"] == 100
 
     def test_selected_sentinel_expands_to_selection(
         self, mock_mail: MagicMock

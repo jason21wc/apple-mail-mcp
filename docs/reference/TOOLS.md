@@ -26,8 +26,8 @@ Search for messages matching specified criteria.
 | `date_from` | string | No | None | Inclusive lower bound on `date_received`. ISO 8601 YYYY-MM-DD. |
 | `date_to` | string | No | None | Inclusive upper bound on `date_received` (full day included). ISO 8601 YYYY-MM-DD. |
 | `has_attachment` | boolean | No | None | Filter messages with (true) or without (false) attachments |
-| `limit` | integer | No | 50 | Maximum number of results to return |
-| `source` | list[string] \| null | No | null | Optional list of message ids (with optional `"SELECTED"` sentinel) to scope the search to. `null` (default) searches the account/mailbox normally. |
+| `limit` | integer | No | 50 | Maximum number of results to return. Max 100 — values above 100 are rejected (`validation_error`) rather than silently truncated; narrow the query or page instead. |
+| `source` | list[string] \| null | No | null | Optional list of message ids (with optional `"SELECTED"` sentinel) to scope the search to. `null` (default) searches the account/mailbox normally. Capped at 100 ids per call (`validation_error` above that). |
 | `include_attachments` | boolean | No | false | When true, each row includes an `attachments` field with per-attachment metadata. Default off — opt-in because the AppleScript fallback path can be slow on cold caches (#142). Free on the IMAP fast path. |
 | `body_contains` | string | No | None | Substring match against message body content. IMAP: server-side `BODY` predicate (sub-second). AppleScript: per-message body read (very slow — see performance note). Case-insensitive. |
 | `text_contains` | string | No | None | Substring match against headers + body (RFC 3501 `TEXT`). IMAP: server-side `TEXT` predicate. AppleScript: matches `content + subject + sender` (recipients omitted). Same perf characteristics as `body_contains`. |
@@ -463,7 +463,8 @@ search_messages(
 
 # Bad: Retrieve everything then filter
 all_messages = search_messages(account="Gmail", limit=10000)
-# ... filter in Python
+# Rejected: limit is capped at 100 (validation_error). Page or narrow
+# the query instead of pulling everything and filtering in Python.
 ```
 
 ### Error Handling
