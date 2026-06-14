@@ -291,6 +291,58 @@ def _bracket_message_id(message_id: str) -> str:
     return f"<{message_id}>"
 
 
+# Max Message-IDs resolved per batched SEARCH. IMAP `OR` is binary, so an
+# N-id match is a right-nested chain N-1 deep — both command length and
+# paren-nesting depth grow with the chunk. 50 keeps each SEARCH well under
+# the ~8 KB command-line limit and the nesting shallow enough for every
+# server tested (iCloud, Gmail), while collapsing a 100-id bulk op from
+# 100 round-trips to 2. Callers cap bulk ops at 100 ids today, so the chunk
+# loop yields at most 2 batches — but the math is load-bearing, not
+# vestigial, if that cap is ever lifted.
+_SEARCH_OR_CHUNK: int = 50
+
+
+def _message_id_or_criteria(bracketed_ids: list[str]) -> list[Any]:
+    """IMAP SEARCH criteria matching ANY of the given bracketed Message-IDs.
+
+    Built as a right-nested binary ``OR`` chain (IMAP has no n-ary OR); a
+    single id needs no OR wrapper. IMAPClient 3.x parenthesises nested
+    lists, so ``["OR", ["HEADER", "Message-ID", a], ["HEADER", "Message-ID",
+    b]]`` renders on the wire as
+    ``OR (HEADER "Message-ID" "a") (HEADER "Message-ID" "b")``.
+
+    Caller must pass a non-empty list (callers chunk and guard for empty).
+    """
+    criteria: list[Any] = ["HEADER", "Message-ID", bracketed_ids[-1]]
+    for bid in reversed(bracketed_ids[:-1]):
+        criteria = ["OR", ["HEADER", "Message-ID", bid], criteria]
+    return criteria
+
+
+def _resolve_message_id_uids(
+    client: IMAPClient, bracketed_ids: list[str]
+) -> list[int]:
+    """Resolve bracketed Message-IDs to UIDs in the SELECTED mailbox via
+    batched OR-chained SEARCH — one round-trip per ``_SEARCH_OR_CHUNK`` ids
+    instead of one SEARCH per id.
+
+    Returns the matched UIDs, de-duplicated and first-seen-ordered.
+    Message-IDs that don't resolve are simply absent (best-effort partial
+    success, matching the prior per-id loop). De-duping also means a
+    repeated input id can no longer inflate the returned count — a
+    deliberate correctness improvement over the prior ``uids.extend`` loop.
+    """
+    seen: set[int] = set()
+    uids: list[int] = []
+    for start in range(0, len(bracketed_ids), _SEARCH_OR_CHUNK):
+        chunk = bracketed_ids[start : start + _SEARCH_OR_CHUNK]
+        for uid in client.search(_message_id_or_criteria(chunk)):
+            if uid not in seen:
+                seen.add(uid)
+                uids.append(uid)
+    return uids
+
+
 def _build_search_criteria(
     sender_contains: str | None,
     subject_contains: str | None,
@@ -1512,10 +1564,7 @@ class ImapConnector:
                     f"safe scoped move"
                 )
 
-            uids: list[int] = []
-            for bracketed in bracketed_ids:
-                found = client.search(["HEADER", "Message-ID", bracketed])
-                uids.extend(found)
+            uids = _resolve_message_id_uids(client, bracketed_ids)
             if not uids:
                 return 0
 
@@ -1605,10 +1654,7 @@ class ImapConnector:
 
             client.select_folder(source_mailbox, readonly=False)
 
-            uids: list[int] = []
-            for bracketed in bracketed_ids:
-                found = client.search(["HEADER", "Message-ID", bracketed])
-                uids.extend(found)
+            uids = _resolve_message_id_uids(client, bracketed_ids)
             if not uids:
                 return 0
 
@@ -1656,10 +1702,7 @@ class ImapConnector:
         with self._session() as client:
             client.select_folder(source_mailbox, readonly=False)
 
-            uids: list[int] = []
-            for bracketed in bracketed_ids:
-                found = client.search(["HEADER", "Message-ID", bracketed])
-                uids.extend(found)
+            uids = _resolve_message_id_uids(client, bracketed_ids)
             if not uids:
                 return 0
 
@@ -1713,10 +1756,7 @@ class ImapConnector:
         with self._session() as client:
             client.select_folder(source_mailbox, readonly=False)
 
-            uids: list[int] = []
-            for bracketed in bracketed_ids:
-                found = client.search(["HEADER", "Message-ID", bracketed])
-                uids.extend(found)
+            uids = _resolve_message_id_uids(client, bracketed_ids)
             if not uids:
                 return 0
 
