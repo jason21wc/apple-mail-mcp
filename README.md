@@ -8,12 +8,12 @@ An MCP server that provides programmatic access to Apple Mail, enabling AI assis
 
 > ⚠️ **Pre-1.0 — expect breaking changes.** The MCP tool surface (tool names, parameters, return shapes) is still evolving as the project matures. Pin to a specific version (for example, `apple-mail-mcp==0.8.2`) and review the [CHANGELOG](CHANGELOG.md) before upgrading.
 
-## Tools (23)
+## Tools (24)
 
 **Core:** list_mailboxes, search_messages, get_messages, update_message
 **Drafts lifecycle:** create_draft, update_draft, delete_draft
 **Mailbox CRUD:** create_mailbox, update_mailbox, delete_mailbox
-**Attachments & Management:** save_attachments, delete_messages
+**Attachments & Management:** get_attachment_content, save_attachments, delete_messages
 **Discovery & Rules:** list_accounts, list_rules, get_thread, create_rule, update_rule, delete_rule
 **Templates:** list_templates, get_template, save_template, delete_template, render_template
 
@@ -49,6 +49,27 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
   }
 }
 ```
+
+### Optional: split read / write servers
+
+Claude Desktop prompts per-tool for permission. If you want to **batch-approve the 10 read tools** (list / search / get) and still gate the 14 mutating tools per call, run the connector twice — once with `--read-only`, once without — under two separate `mcpServers` entries:
+
+```json
+{
+  "mcpServers": {
+    "apple-mail-read": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/apple-mail-mcp", "run", "python", "-m", "apple_mail_mcp.server", "--read-only"]
+    },
+    "apple-mail-write": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/apple-mail-mcp", "run", "python", "-m", "apple_mail_mcp.server"]
+    }
+  }
+}
+```
+
+The `--read-only` server exposes only the 10 read tools, so Claude Desktop's per-server permission UI naturally groups them. The full server still gates writes individually. Trade-off: 2× connector processes. See [`docs/reference/TOOLS.md`](docs/reference/TOOLS.md) for the per-tool classification and a note on MCP annotation hints (`readOnlyHint` / `destructiveHint` / `idempotentHint`) which forward-compatible hosts may use to provide the same UX without the split.
 
 ## Permissions
 
