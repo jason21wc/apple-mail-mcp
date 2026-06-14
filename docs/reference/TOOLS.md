@@ -397,30 +397,6 @@ update_message(
 
 ---
 
-## Coming Soon (Phase 2 - v0.2.0)
-
-
-### create_mailbox
-
-Create a new mailbox/folder.
-
-**Parameters:**
-- `account`: string - Account name
-- `name`: string - Mailbox name
-- `parent_mailbox`: string (optional) - Parent for nested mailboxes
-
-### delete_messages
-
-Delete messages (move to trash).
-
-**Parameters:**
-- `message_ids`: array[string] - Messages to delete
-- `confirm`: boolean - Require confirmation
-
-If message IDs are supplied but none can be located, returns `success: false` with `error_type: "no_messages_resolved"` rather than `success: true` with `count: 0`.
-
----
-
 ## Error Handling
 
 All tools return a consistent error format:
