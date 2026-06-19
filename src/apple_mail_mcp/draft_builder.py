@@ -41,6 +41,35 @@ def _sanitize_header(value: str) -> str:
     return value.replace("\x00", "").replace("\r", "").replace("\n", "")
 
 
+def _attach_forwarded(
+    msg: EmailMessage,
+    filename: str,
+    maintype: str,
+    subtype: str,
+    payload: bytes,
+) -> None:
+    """Attach one carried-over original attachment to a draft being built.
+
+    A forwarded email (``message/rfc822``) is attached as a parsed
+    sub-Message so the part is encoded idiomatically (7bit/8bit per RFC 2046
+    §5.2.1) and re-parses cleanly. Attaching the raw bytes would base64-encode
+    them — non-conformant for ``message/*``, and the parser then reads that
+    back as corrupt content. Everything else attaches as raw bytes.
+    (rfc822 empty-bytes fix)
+    """
+    safe_name = _sanitize_header(filename) or "attachment"
+    if (maintype, subtype) == ("message", "rfc822"):
+        sub_msg = email.message_from_bytes(payload, policy=_default_policy)
+        msg.add_attachment(sub_msg, filename=safe_name)
+    else:
+        msg.add_attachment(
+            payload,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=safe_name,
+        )
+
+
 def build_draft_mime(
     *,
     sender: str,
@@ -114,12 +143,7 @@ def build_draft_mime(
         )
 
     for filename, maintype, subtype, payload in forwarded_attachments or []:
-        msg.add_attachment(
-            payload,
-            maintype=maintype or "application",
-            subtype=subtype or "octet-stream",
-            filename=_sanitize_header(filename) or "attachment",
-        )
+        _attach_forwarded(msg, filename, maintype, subtype, payload)
 
     return message_id, msg.as_bytes()
 
@@ -269,7 +293,37 @@ def parse_original_message(raw: bytes) -> OriginalMessage:
     attachments: list[ForwardedAttachment] = []
     for part in msg.iter_attachments():
         decoded = part.get_payload(decode=True)
-        payload = bytes(decoded) if isinstance(decoded, (bytes, bytearray)) else b""
+        if isinstance(decoded, (bytes, bytearray)):
+            payload = bytes(decoded)
+        elif part.get_content_maintype() == "message":
+            # message/rfc822 (a forwarded email) and other message/* parts
+            # carry a sub-Message as payload, not a transfer-encoded string,
+            # so get_payload(decode=True) returns None. Serialize the
+            # sub-message so the forwarded mail travels as real .eml bytes —
+            # otherwise get_attachment_content / save_attachments returned a
+            # success-shaped 0-byte attachment. (A message/* payload is a
+            # single-element [sub_Message] list under the stdlib parser.)
+            #
+            # Trust that parse only for the transfer encodings RFC 2046
+            # §5.2.1 permits for message/* (7bit/8bit/binary/none). A
+            # non-conformant base64/quoted-printable message part is parsed
+            # from its *still-encoded* text (the stdlib doesn't decode
+            # message/* before sub-parsing), so as_bytes() would emit corrupt
+            # bytes — degrade to b"" rather than return wrong-but-non-empty
+            # data masquerading as the forwarded message.
+            cte = (part.get("Content-Transfer-Encoding") or "").strip().lower()
+            sub = part.get_payload()
+            if (
+                cte in ("", "7bit", "8bit", "binary")
+                and isinstance(sub, list)
+                and sub
+                and hasattr(sub[0], "as_bytes")
+            ):
+                payload = sub[0].as_bytes()
+            else:
+                payload = b""
+        else:
+            payload = b""
         maintype, _, subtype = part.get_content_type().partition("/")
         attachments.append(
             (part.get_filename() or "attachment", maintype, subtype, payload)
