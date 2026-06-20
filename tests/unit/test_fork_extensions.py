@@ -21,9 +21,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from apple_mail_mcp.server import (
+    _UNTRUSTED_CONTENT_NOTICE,
+    _mark_untrusted,
     get_attachment_content,
     get_messages,
+    get_thread,
     save_attachments,
+    search_messages,
 )
 
 
@@ -139,6 +143,17 @@ class TestSaveAttachmentsOutputFilename:
 
 
 class TestUntrustedContentMarking:
+    def test_mark_untrusted_helper_contract(self) -> None:
+        # Single source for the marking — pin the exact verbatim-contract
+        # fields so a future edit to the constant/helper can't silently drift.
+        marked = _mark_untrusted({"success": True}, True)
+        assert marked["content_is_untrusted"] is True
+        assert marked["security_notice"] == _UNTRUSTED_CONTENT_NOTICE
+        # No content -> nothing to distrust -> no marker.
+        bare = _mark_untrusted({"success": True}, False)
+        assert "content_is_untrusted" not in bare
+        assert "security_notice" not in bare
+
     def test_get_messages_marks_nonempty_and_keeps_content_verbatim(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
@@ -188,3 +203,75 @@ class TestUntrustedContentMarking:
         assert result["content_is_untrusted"] is True
         assert result["security_notice"]
         assert result["content"] == "raw-bytes"
+
+    # --- coverage extended to search_messages + get_thread ---------------
+    # Their rows carry attacker-controlled sender/subject/snippet, so an LLM
+    # consuming them needs the same untrusted signal get_messages already
+    # gives (prompt-injection defense; coding-quality-workflow-integrity).
+
+    def test_search_messages_marks_results_and_keeps_rows(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail.search_messages.return_value = [
+            {"id": "1", "subject": "S", "sender": "x@y.com"}
+        ]
+        result = search_messages(account="Acct", mailbox="INBOX")
+
+        assert result["success"] is True
+        assert result["content_is_untrusted"] is True
+        assert result["security_notice"] == _UNTRUSTED_CONTENT_NOTICE
+        # Rows returned unchanged (non-breaking).
+        assert result["messages"][0]["sender"] == "x@y.com"
+
+    def test_search_messages_empty_has_no_marker(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail.search_messages.return_value = []
+        result = search_messages(account="Acct", mailbox="INBOX")
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert "content_is_untrusted" not in result
+        assert "security_notice" not in result
+
+    def test_search_messages_source_path_marks_results(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        # The source=[ids] branch builds a separate response; it must mark too.
+        with patch(
+            "apple_mail_mcp.server._resolve_id_list_to_messages",
+            return_value=[{"id": "1", "subject": "S", "sender": "x@y.com"}],
+        ), patch(
+            "apple_mail_mcp.server._apply_search_filters",
+            side_effect=lambda resolved, *a, **k: resolved,
+        ):
+            result = search_messages(source=["1"])
+
+        assert result["success"] is True
+        assert result["content_is_untrusted"] is True
+        assert result["security_notice"]
+
+    def test_get_thread_marks_results(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail.get_thread.return_value = [
+            {"id": "1", "subject": "S", "sender": "x@y.com"},
+            {"id": "2", "subject": "S", "sender": "z@y.com"},
+        ]
+        result = get_thread("1")
+
+        assert result["success"] is True
+        assert result["count"] == 2
+        assert result["content_is_untrusted"] is True
+        assert result["security_notice"] == _UNTRUSTED_CONTENT_NOTICE
+
+    def test_get_thread_empty_has_no_marker(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail.get_thread.return_value = []
+        result = get_thread("1")
+
+        assert result["success"] is True
+        assert result["count"] == 0
+        assert "content_is_untrusted" not in result
+        assert "security_notice" not in result
