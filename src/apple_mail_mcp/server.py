@@ -774,6 +774,24 @@ _UNTRUSTED_CONTENT_NOTICE = (
 )
 
 
+def _mark_untrusted(response: dict[str, Any], has_content: bool) -> dict[str, Any]:
+    """Tag a tool response so a consuming LLM treats the email content it
+    returned — bodies, attachment payloads, AND sender/subject/snippet
+    metadata — as untrusted external data, never as instructions (the
+    prompt-injection failure mode; coding-quality-workflow-integrity's
+    separation of instructions and data).
+
+    Signal, not enforcement (see ``_UNTRUSTED_CONTENT_NOTICE``). Applied only
+    when content is present — an empty result carries nothing to distrust.
+    Non-breaking: existing fields are untouched; the two sibling fields are
+    additive. Single source for the marking used by get_messages,
+    get_attachment_content, search_messages, and get_thread."""
+    if has_content:
+        response["content_is_untrusted"] = True
+        response["security_notice"] = _UNTRUSTED_CONTENT_NOTICE
+    return response
+
+
 def _annotate_injection(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Attach a ``prompt_injection`` warning to any message whose body looks
     like an injection attempt (#225). Bodies are an attacker-controlled
@@ -1115,7 +1133,7 @@ def search_messages(
             }
             if warnings:
                 response["warnings"] = warnings
-            return response
+            return _mark_untrusted(response, bool(filtered))
 
         if account is None:
             return {
@@ -1186,7 +1204,7 @@ def search_messages(
         }
         if warnings:
             response["warnings"] = warnings
-        return response
+        return _mark_untrusted(response, bool(messages))
 
     except (MailAccountNotFoundError, MailMailboxNotFoundError) as e:
         logger.error(f"Not found error: {e}")
@@ -1306,15 +1324,9 @@ def get_messages(
             "messages": messages,
             "count": len(messages),
         }
-        # Mark returned bodies/metadata as untrusted external content
-        # (non-breaking: the strings themselves are unchanged). Only when
-        # content is actually present — an empty result carries nothing to
-        # distrust. Fires even for include_content=False, since sender/subject
-        # are attacker-controlled too.
-        if messages:
-            response["content_is_untrusted"] = True
-            response["security_notice"] = _UNTRUSTED_CONTENT_NOTICE
-        return response
+        # Mark as untrusted external content (fires even for
+        # include_content=False — sender/subject are attacker-controlled too).
+        return _mark_untrusted(response, bool(messages))
 
     except Exception as e:
         logger.error(f"Error getting messages: {e}")
@@ -1556,11 +1568,15 @@ def get_thread(message_id: str) -> dict[str, Any]:
             "get_thread", {"message_id": message_id}, "success"
         )
 
-        return {
-            "success": True,
-            "thread": thread,
-            "count": len(thread),
-        }
+        # Thread rows carry attacker-controlled sender/subject — mark untrusted.
+        return _mark_untrusted(
+            {
+                "success": True,
+                "thread": thread,
+                "count": len(thread),
+            },
+            bool(thread),
+        )
 
     except MailMessageNotFoundError as e:
         logger.error(f"Message not found: {e}")
@@ -1812,17 +1828,18 @@ def get_attachment_content(
             "success",
         )
         # Attachment content is external untrusted input (non-breaking marker;
-        # `content` itself is returned verbatim).
-        return {
-            "success": True,
-            "content": content,
-            "encoding": encoding,
-            "name": result["name"],
-            "mime_type": result["mime_type"],
-            "size": result["size"],
-            "content_is_untrusted": True,
-            "security_notice": _UNTRUSTED_CONTENT_NOTICE,
-        }
+        # `content` itself is returned verbatim). Always present on success.
+        return _mark_untrusted(
+            {
+                "success": True,
+                "content": content,
+                "encoding": encoding,
+                "name": result["name"],
+                "mime_type": result["mime_type"],
+                "size": result["size"],
+            },
+            True,
+        )
 
     except MailAttachmentIndexError as e:
         return {
