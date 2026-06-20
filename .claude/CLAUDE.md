@@ -1,6 +1,6 @@
 # Apple Mail MCP Server
 
-> **CHMG Fork (jason21wc).** Re-baselined onto upstream s-morgan-jeffries/apple-mail-mcp **v0.10.2** (was pinned v0.8.2). Owner: Jason Collier (Collier Hotel Management Group). Primary use case: automated hotel property report extraction (see `.claude/skills/hotel-report-extraction/`). The re-baseline rationale + plan live in the `project-upstream-resync` memory file.
+> **CHMG Fork (jason21wc).** Re-baselined onto upstream s-morgan-jeffries/apple-mail-mcp **v0.10.2** (was pinned v0.8.2). Owner: Jason Collier (Collier Hotel Management Group). Primary use case: reliably grabbing recurring email attachments (e.g. weekly property reports) into local folders — incrementally and undoably (see `.claude/skills/attachment-retrieval/`). The re-baseline rationale + plan live in the `project-upstream-resync` memory file.
 >
 > **Governance:** This server runs ONLY behind ai-governance-proxy (hard mode) per claude_desktop_config.json. Never run it directly — always via the governance proxy.
 >
@@ -77,7 +77,7 @@ make coverage              # Coverage report
 ## User Data on Disk
 
 - All persistent user data lives under `~/.apple_mail_mcp/`. Override the location with `APPLE_MAIL_MCP_HOME=/some/path` (the subdirectory layout is appended automatically).
-- Current subdirs: `templates/` (one `<name>.md` file per email template, see `src/apple_mail_mcp/templates.py`).
+- Current subdirs: `templates/` (one `<name>.md` file per email template, see `src/apple_mail_mcp/templates.py`); `retrieval_runs/` (one `<recipe>.json` append-only undo log per attachment-retrieval recipe, see `.claude/skills/attachment-retrieval/undo_log.py` — skill-local tooling, not part of the package).
 - Names that get used as filename stems must be regex-validated **before** building any path — see `_validate_name` in `templates.py` for the path-traversal-safe pattern. Don't `Path(user_input)` directly.
 - Storage objects should resolve their root at use time, not import time, so env-var overrides and test-time monkeypatching are honored. Example: `_get_template_store()` in `server.py`.
 
