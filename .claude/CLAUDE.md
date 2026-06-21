@@ -5,16 +5,18 @@
 > **Governance:** This server runs ONLY behind ai-governance-proxy (hard mode) per claude_desktop_config.json. Never run it directly — always via the governance proxy.
 >
 > **Fork modifications kept on top of upstream** — everything else converged INTO upstream and was dropped (get_attachment_content, nested-mailbox resolution, attachment path-traversal hardening, and the save_attachments IMAP fast path are all upstream now):
-> 1. `save_attachments` `output_filename` — save a single attachment under a caller-chosen, sanitized name (used by the hotel-report skill).
-> 2. `content_is_untrusted` / `security_notice` marking on `get_messages` + `get_attachment_content`. Deliberately kept (not dropped for #225): upstream's #225 `prompt_injection` covers message *bodies*, not *attachment payloads* — and attachment payloads are this fork's primary threat surface (external-sender hotel PDFs). Convergence path: propose attachment-untrusted marking upstream, then drop ours.
-> 3. Fork infra: governance integration, the hotel-report extraction skill, and `tests/integration/test_fork_extensions_integration.py` — live coverage of the two mods above. Run: `MAIL_TEST_ACCOUNT=iCloud uv run pytest tests/integration/test_fork_extensions_integration.py --run-integration`. (The old heavyweight smoke suite + pre-push hook were intentionally NOT re-ported: they guarded fork *connector* changes, and the fork no longer modifies the connector — upstream owns and integration-tests it.)
+> 1. `save_attachments` `output_filename` — save a single attachment under a caller-chosen, sanitized name (used by the attachment-retrieval skill).
+> 2. `content_is_untrusted` / `security_notice` marking on all content-returning tools (`get_messages`, `get_attachment_content`, `search_messages`, `get_thread`), via a single-source `_mark_untrusted()` helper. Deliberately kept (not dropped for #225): upstream's #225 `prompt_injection` covers message *bodies*, not *attachment payloads* — and attachment payloads are this fork's primary threat surface (external-sender hotel PDFs). Convergence path: propose attachment-untrusted marking upstream, then drop ours.
+> 3. Fork infra: governance integration, the attachment-retrieval skill, and `tests/integration/test_fork_extensions_integration.py` — live coverage of the two mods above. Run: `MAIL_TEST_ACCOUNT=iCloud uv run pytest tests/integration/test_fork_extensions_integration.py --run-integration`. (The old heavyweight smoke suite + pre-push hook were intentionally NOT re-ported: they guarded fork *connector* changes, and the fork no longer modifies the connector — upstream owns and integration-tests it.)
 >
 > **Upstream sync posture (changed after the v0.10.2 re-baseline):** the fork is now THIN and current, so sync **small and often** — `git fetch upstream && git rev-list --left-right --count main...upstream/main`, then a normal `git merge upstream/main` (the conflict surface is tiny while the fork stays thin). The old "pinned at v0.8.2, do not auto-merge" posture is retired: letting the fork drift 68 commits behind in the same hot files upstream churns is exactly what made the last sync a 109-conflict ordeal. Don't let it drift far again. Keep net-new fork work minimal and prefer contributing upstream.
 
 An MCP server bridging Claude and Apple Mail via AppleScript on macOS.
 
 **Stack:** Python 3.10+, FastMCP, AppleScript (via `osascript`)
-**Version:** v0.10.2 | **Tests:** 1396 unit / 29 e2e / 62 integration | **Coverage:** 92%
+**Version:** v0.10.2 (source of truth: `pyproject.toml`, gated by `check_version_sync.sh`)
+
+> **Note — derivable metrics are not pinned here on purpose.** Test counts, coverage %, the tool count, and source-file line counts are derivable and drift every PR, so this always-loaded file points at the source of truth instead of duplicating it: run `make test` / `make coverage` for counts; see `docs/reference/TOOLS.md` for the tool list. (Pinning derivable state in an instruction file violates instruction/data separation and rots — that's how this file once read `1396 unit`. Convention tracked in ai-governance BACKLOG #164.)
 
 ## Commands
 
@@ -34,7 +36,7 @@ make coverage              # Coverage report
 
 **Running the server:** `uv run python -m apple_mail_mcp.server` or via Claude Desktop config.
 
-## API Surface (24 MCP tools)
+## API Surface (canonical list: `docs/reference/TOOLS.md`)
 
 **Core:** list_mailboxes, search_messages, get_messages, update_message
 **Drafts lifecycle (#134):** create_draft, update_draft, delete_draft
@@ -111,8 +113,8 @@ Load these skills when working in their domains:
 
 ## Key Files
 
-- `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client (~1120 lines)
-- `src/apple_mail_mcp/server.py` — FastMCP server wrapping the connector (~1120 lines)
+- `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client
+- `src/apple_mail_mcp/server.py` — FastMCP server wrapping the connector
 - `src/apple_mail_mcp/security.py` — Input validation, audit logging, confirmation flows
 - `src/apple_mail_mcp/utils.py` — Pure functions: escaping, parsing, validation
 - `src/apple_mail_mcp/exceptions.py` — Custom exception hierarchy
