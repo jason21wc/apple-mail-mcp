@@ -23,7 +23,7 @@ stdlib only. Invoke via::
 State lives at ``<root>/retrieval_runs/<recipe>.json`` where ``root`` is
 ``$APPLE_MAIL_MCP_HOME`` or ``~/.apple_mail_mcp`` — mirroring the server's
 storage conventions (``templates.default_root`` / ``_NAME_RE`` /
-``TemplateStore._path_for``) without importing ``apple_mail_mcp``, to keep the
+``TemplateStore._path_for``) without importing ``apple_mail_fast_mcp``, to keep the
 skill self-contained and the fork thin. Every write is atomic (temp +
 ``os.replace``) so the audit trail is never left half-written.
 
@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Recipe-name validation, mirrored from apple_mail_mcp.templates._NAME_RE
+# Recipe-name validation, mirrored from apple_mail_fast_mcp.templates._NAME_RE
 # (templates.py:41). Names are used as filename stems, so anything that could
 # escape the retrieval_runs directory must be rejected before building a path.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")

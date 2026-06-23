@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from apple_mail_mcp import server
+from apple_mail_fast_mcp import server
 
 pytestmark = pytest.mark.e2e
 
@@ -29,6 +29,7 @@ EXPECTED_TOOLS = {
     "search_messages",
     "get_messages",
     "get_thread",
+    "get_statistics",
     # Drafts lifecycle (#134)
     "create_draft",
     "update_draft",
@@ -157,6 +158,12 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
           "date_received": "Mon", "read_status": True, "flagged": False}],
     ),
     (
+        "get_statistics",
+        {"account": "TestAccount"},
+        "search_messages",
+        [{"sender": "a@example.com", "read_status": True, "flagged": False}],
+    ),
+    (
         "create_draft",
         {"to": ["a@example.com"], "subject": "s", "body": "b"},
         "create_draft",
@@ -224,7 +231,7 @@ class TestToolInvocation:
             return None  # None == user accepted
 
         monkeypatch.setattr(
-            "apple_mail_mcp.server._elicit_confirmation", _accept
+            "apple_mail_fast_mcp.server._elicit_confirmation", _accept
         )
 
     @pytest.mark.parametrize(
@@ -281,7 +288,7 @@ class TestStringifiedParamCoercion:
             return None
 
         monkeypatch.setattr(
-            "apple_mail_mcp.server._elicit_confirmation", _accept
+            "apple_mail_fast_mcp.server._elicit_confirmation", _accept
         )
 
     @staticmethod
@@ -408,7 +415,7 @@ class TestCreateDraftFallbackWarning:
             return None
 
         monkeypatch.setattr(
-            "apple_mail_mcp.server._elicit_confirmation", _accept
+            "apple_mail_fast_mcp.server._elicit_confirmation", _accept
         )
 
     async def test_warnings_surface_through_dispatch(

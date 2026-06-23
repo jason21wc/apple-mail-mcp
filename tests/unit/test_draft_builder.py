@@ -11,7 +11,7 @@ from __future__ import annotations
 import email
 from email import policy
 
-from apple_mail_mcp.draft_builder import build_draft_mime
+from apple_mail_fast_mcp.draft_builder import build_draft_mime
 
 
 def test_builds_plain_text_draft_without_quote_wrapper():
@@ -174,7 +174,7 @@ def test_body_html_with_attachment_nests_alternative_in_mixed(tmp_path):
 
 # --- Reply/forward extensions (issue #245 follow-up) ---------------------
 
-from apple_mail_mcp.draft_builder import (  # noqa: E402
+from apple_mail_fast_mcp.draft_builder import (  # noqa: E402
     build_forward_body,
     build_reply_body,
     derive_reply_recipients,
@@ -298,7 +298,7 @@ def test_build_forward_body_has_header_block():
 
 
 def test_parse_original_message_extracts_fields_and_attachment():
-    from apple_mail_mcp.draft_builder import build_draft_mime, parse_original_message
+    from apple_mail_fast_mcp.draft_builder import build_draft_mime, parse_original_message
     # Build a representative original (with an attachment) and round-trip it.
     _mid, raw = build_draft_mime(
         sender="Lazar <lazar@hadleigh.co.uk>",
@@ -323,7 +323,7 @@ def test_parse_original_message_extracts_fields_and_attachment():
 def test_parse_original_html_only_falls_back_to_text():
     from email.message import EmailMessage
 
-    from apple_mail_mcp.draft_builder import parse_original_message
+    from apple_mail_fast_mcp.draft_builder import parse_original_message
     m = EmailMessage()
     m["From"] = "x@y.com"
     m["Subject"] = "HTML only"
@@ -347,7 +347,7 @@ def test_parse_original_serializes_forwarded_rfc822_attachment():
     from email.message import EmailMessage
     from email.policy import default as _pol
 
-    from apple_mail_mcp.draft_builder import parse_original_message
+    from apple_mail_fast_mcp.draft_builder import parse_original_message
 
     inner = EmailMessage()
     inner["From"] = "alice@example.com"
@@ -394,7 +394,7 @@ def test_parse_original_rfc822_base64_degrades_to_empty_not_corrupt():
     import base64
     from email.message import EmailMessage
 
-    from apple_mail_mcp.draft_builder import parse_original_message
+    from apple_mail_fast_mcp.draft_builder import parse_original_message
 
     inner = EmailMessage()
     inner["From"] = "alice@example.com"
@@ -432,7 +432,7 @@ def test_forwarded_rfc822_attachment_round_trips_through_build():
     from email.message import EmailMessage
     from email.policy import default as _pol
 
-    from apple_mail_mcp.draft_builder import build_draft_mime, parse_original_message
+    from apple_mail_fast_mcp.draft_builder import build_draft_mime, parse_original_message
 
     inner = EmailMessage()
     inner["From"] = "alice@example.com"
@@ -487,7 +487,7 @@ def test_build_draft_with_empty_rfc822_forward_does_not_raise():
     import email
     from email.policy import default as _pol
 
-    from apple_mail_mcp.draft_builder import build_draft_mime
+    from apple_mail_fast_mcp.draft_builder import build_draft_mime
 
     _mid, raw = build_draft_mime(
         sender="me@example.invalid",
@@ -526,7 +526,7 @@ def test_extract_payloads_plain_attachment_is_unchanged():
     same as before (one attachment, real bytes)."""
     from email.message import EmailMessage
 
-    from apple_mail_mcp.draft_builder import extract_attachment_payloads
+    from apple_mail_fast_mcp.draft_builder import extract_attachment_payloads
 
     m = EmailMessage()
     m["Subject"] = "c1"
@@ -543,7 +543,7 @@ def test_extract_payloads_includes_inline_image_with_filename():
     savable attachment (metadata reports it; iter_attachments drops it)."""
     from email.message import EmailMessage
 
-    from apple_mail_mcp.draft_builder import extract_attachment_payloads
+    from apple_mail_fast_mcp.draft_builder import extract_attachment_payloads
 
     m = EmailMessage()
     m["Subject"] = "c2"
@@ -568,7 +568,7 @@ def test_extract_payloads_descends_under_multipart_alternative():
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
-    from apple_mail_mcp.draft_builder import extract_attachment_payloads
+    from apple_mail_fast_mcp.draft_builder import extract_attachment_payloads
 
     outer = MIMEMultipart("alternative")
     mixed = MIMEMultipart("mixed")
@@ -597,7 +597,7 @@ def test_extract_payloads_preserves_document_order():
     trailing attachment), so attachment_index lines up with the metadata."""
     from email.message import EmailMessage
 
-    from apple_mail_mcp.draft_builder import extract_attachment_payloads
+    from apple_mail_fast_mcp.draft_builder import extract_attachment_payloads
 
     m = EmailMessage()
     m["Subject"] = "c3"
@@ -619,7 +619,7 @@ def test_extract_payloads_rfc822_counted_once_not_descended():
     entries — matching the BODYSTRUCTURE leaf treatment."""
     from email.message import EmailMessage
 
-    from apple_mail_mcp.draft_builder import extract_attachment_payloads
+    from apple_mail_fast_mcp.draft_builder import extract_attachment_payloads
 
     inner = EmailMessage()
     inner["Subject"] = "orig"
