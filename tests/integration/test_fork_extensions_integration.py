@@ -30,7 +30,7 @@ from typing import Any
 
 import pytest
 
-from apple_mail_mcp.server import (
+from apple_mail_fast_mcp.server import (
     get_attachment_content,
     get_messages,
     save_attachments,

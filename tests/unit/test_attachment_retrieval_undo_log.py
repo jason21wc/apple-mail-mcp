@@ -1,7 +1,7 @@
 """Unit tests for the attachment-retrieval skill's undo_log.py helper.
 
 The helper is skill-local tooling (.claude/skills/attachment-retrieval/), not part
-of the apple_mail_mcp package, so it's loaded by file path. It is pure stdlib and
+of the apple_mail_fast_mcp package, so it's loaded by file path. It is pure stdlib and
 needs no Mail.app — all state lives under APPLE_MAIL_MCP_HOME, pointed at a tmp dir.
 """
 

@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from apple_mail_mcp.server import (
+from apple_mail_fast_mcp.server import (
     _UNTRUSTED_CONTENT_NOTICE,
     _mark_untrusted,
     get_attachment_content,
@@ -33,13 +33,13 @@ from apple_mail_mcp.server import (
 
 @pytest.fixture
 def mock_mail() -> Any:
-    with patch("apple_mail_mcp.server.mail") as m:
+    with patch("apple_mail_fast_mcp.server.mail") as m:
         yield m
 
 
 @pytest.fixture
 def mock_logger() -> Any:
-    with patch("apple_mail_mcp.server.operation_logger") as m:
+    with patch("apple_mail_fast_mcp.server.operation_logger") as m:
         yield m
 
 
@@ -178,7 +178,7 @@ class TestUntrustedContentMarking:
         # An empty result carries nothing to distrust -> no marker (the
         # `if messages:` guard). Patch the resolver to yield no messages.
         with patch(
-            "apple_mail_mcp.server._resolve_id_list_to_messages", return_value=[]
+            "apple_mail_fast_mcp.server._resolve_id_list_to_messages", return_value=[]
         ):
             result = get_messages(["1"])
 
@@ -239,10 +239,10 @@ class TestUntrustedContentMarking:
     ) -> None:
         # The source=[ids] branch builds a separate response; it must mark too.
         with patch(
-            "apple_mail_mcp.server._resolve_id_list_to_messages",
+            "apple_mail_fast_mcp.server._resolve_id_list_to_messages",
             return_value=[{"id": "1", "subject": "S", "sender": "x@y.com"}],
         ), patch(
-            "apple_mail_mcp.server._apply_search_filters",
+            "apple_mail_fast_mcp.server._apply_search_filters",
             side_effect=lambda resolved, *a, **k: resolved,
         ):
             result = search_messages(source=["1"])
