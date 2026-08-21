@@ -188,6 +188,7 @@ ids) to fetch bodies for specific messages.
 - `account` (string, optional): Mail.app account name. Together with ``mailbox``, activates the IMAP fast path for explicit ids: one round-trip lookup instead of an account×mailbox AppleScript scan (issue #72). Ignored for the ``"SELECTED"`` sentinel (selection is global).
 - `mailbox` (string, optional): Folder to look in for the IMAP fast path (e.g. "INBOX").
 - `include_attachments` (boolean, optional) (default: True): Include per-attachment metadata (name, mime_type, size, downloaded) on each message (default: True). Bounded cost — id-list cardinality is typically 1-10. Free on the IMAP fast path; cheap-enough on the AppleScript fallback for typical id counts.
+- `body_format` (string, optional) (default: 'text'): ``"text"`` (default) returns ``content`` as decoded, human-readable body text only — attachment bytes are stripped (their metadata still appears via ``include_attachments``). This keeps a message carrying a multi-MB attachment from inflating ``content`` into megabytes of inlined base64 that overflow the result. ``"raw"`` restores the legacy IMAP behavior (``content`` is the undecoded MIME body with attachments inlined) — an escape hatch you should rarely need. AppleScript-path content is already plain text and is unaffected by this flag.
 
 ### get_statistics
 

@@ -13,13 +13,17 @@ jobs:
       contents: write
       issues: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          # Node 22 (active LTS). 20 went EOL in April 2026 and this step is
+          # only exercised by a real `v*` tag, so a stale runtime here would
+          # surface during a release rather than in CI. Needed for
+          # `npx @anthropic-ai/mcpb` in scripts/build-mcpb.sh.
+          node-version: '22'
 
       - name: Extract version from tag
         id: version
@@ -80,7 +84,7 @@ jobs:
     permissions:
       id-token: write  # mint the short-lived OIDC token for PyPI
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v7
 

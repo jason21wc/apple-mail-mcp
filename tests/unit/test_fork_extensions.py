@@ -254,21 +254,45 @@ class TestUntrustedContentMarking:
     def test_get_thread_marks_results(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        mock_mail.get_thread.return_value = [
-            {"id": "1", "subject": "S", "sender": "x@y.com"},
-            {"id": "2", "subject": "S", "sender": "z@y.com"},
-        ]
+        # Upstream #420 moved the server onto _get_thread_with_status, which
+        # returns (rows, degraded_reason) rather than a bare list.
+        mock_mail._get_thread_with_status.return_value = (
+            [
+                {"id": "1", "subject": "S", "sender": "x@y.com"},
+                {"id": "2", "subject": "S", "sender": "z@y.com"},
+            ],
+            None,
+        )
         result = get_thread("1")
 
         assert result["success"] is True
         assert result["count"] == 2
+        assert result["partial"] is False
+        assert result["content_is_untrusted"] is True
+        assert result["security_notice"] == _UNTRUSTED_CONTENT_NOTICE
+
+    def test_get_thread_partial_keeps_untrusted_marker(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """A degraded thread must carry BOTH signals: upstream's partial
+        flag (#420) and the fork's untrusted marking. The two compose --
+        a truncated thread is still attacker-controlled content."""
+        mock_mail._get_thread_with_status.return_value = (
+            [{"id": "1", "subject": "S", "sender": "x@y.com"}],
+            "imap_timeout",
+        )
+        result = get_thread("1")
+
+        assert result["success"] is True
+        assert result["partial"] is True
+        assert result["partial_reason"] == "imap_timeout"
         assert result["content_is_untrusted"] is True
         assert result["security_notice"] == _UNTRUSTED_CONTENT_NOTICE
 
     def test_get_thread_empty_has_no_marker(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        mock_mail.get_thread.return_value = []
+        mock_mail._get_thread_with_status.return_value = ([], None)
         result = get_thread("1")
 
         assert result["success"] is True
