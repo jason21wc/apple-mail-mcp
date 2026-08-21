@@ -61,3 +61,9 @@ dmypy.json
 # Documentation builds
 docs/_build/
 site/
+
+# ai-governance memory files — LOCAL ONLY.
+# Read from disk by Claude, Codex, and Gemini; never committed. This repo is
+# public and these files carry CHMG business context. The loaders (AGENTS.md,
+# CLAUDE.md, GEMINI.md) ARE committed and point at this directory.
+_ai-context/
