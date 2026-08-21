@@ -18,6 +18,7 @@ from pydantic import BeforeValidator
 from .drafts import DraftStateStore, SeedRecord
 from .exceptions import (
     MailAccountNotFoundError,
+    MailAnchorLookupIncompleteError,
     MailAppleScriptError,
     MailAttachmentIndexError,
     MailAttachmentTooLargeError,
@@ -30,6 +31,7 @@ from .exceptions import (
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
     MailRuleNotFoundError,
+    MailSafetyError,
     MailTemplateError,
     MailTemplateInvalidFormatError,
     MailTemplateInvalidNameError,
@@ -820,6 +822,7 @@ def _resolve_id_list_to_messages(
     mailbox: str | None,
     headers_only: bool = False,
     include_attachments: bool = False,
+    body_format: str = "text",
 ) -> list[dict[str, Any]]:
     """Resolve a mixed list of ids and ``SELECTED`` tokens to message dicts.
 
@@ -853,6 +856,7 @@ def _resolve_id_list_to_messages(
                     account=account,
                     mailbox=mailbox,
                     include_attachments=include_attachments,
+                    body_format=body_format,
                 )
                 out.append(msg)
             except MailMessageNotFoundError:
@@ -1240,6 +1244,7 @@ def get_messages(
     account: str | None = None,
     mailbox: str | None = None,
     include_attachments: bool = True,
+    body_format: str = "text",
 ) -> dict[str, Any]:
     """
     Get full details of one or more messages, with bodies.
@@ -1269,10 +1274,20 @@ def get_messages(
             Bounded cost — id-list cardinality is typically 1-10. Free on
             the IMAP fast path; cheap-enough on the AppleScript fallback
             for typical id counts.
+        body_format: ``"text"`` (default) returns ``content`` as decoded,
+            human-readable body text only — attachment bytes are stripped
+            (their metadata still appears via ``include_attachments``). This
+            keeps a message carrying a multi-MB attachment from inflating
+            ``content`` into megabytes of inlined base64 that overflow the
+            result. ``"raw"`` restores the legacy IMAP behavior (``content``
+            is the undecoded MIME body with attachments inlined) — an escape
+            hatch you should rarely need. AppleScript-path content is already
+            plain text and is unaffected by this flag.
 
     Returns:
         Dictionary containing the list of messages and count. Each message
-        body is bounded to 1 MB of UTF-8 text (override via
+        includes ``to`` and ``cc`` (recipient strings) on the IMAP path.
+        Each message body is bounded to 1 MB of UTF-8 text (override via
         ``APPLE_MAIL_MCP_MAX_BODY_BYTES``) and scrubbed of transport-hostile
         characters so a large or malformed body can't crash the server
         (#365). When a body is truncated, the message carries
@@ -1312,6 +1327,7 @@ def get_messages(
             mailbox=mailbox,
             headers_only=headers_only,
             include_attachments=include_attachments,
+            body_format=body_format,
         )
 
         operation_logger.log_operation(
@@ -1552,9 +1568,20 @@ def get_thread(message_id: str) -> dict[str, Any]:
         Dictionary with the thread list. Rows are metadata-only —
         id, subject, sender, date_received, read_status, flagged.
 
+        ``partial`` is always present. When it is True the IMAP path could
+        not complete and the rows came from the subject-prefiltered
+        AppleScript fallback, which can return FEWER members than the full
+        thread; ``partial_reason`` then names the cause (``imap_timeout``,
+        ``imap_auth_failed``, ``imap_not_configured``, ``imap_breaker_open``,
+        ``imap_unavailable``). Treat a partial thread as a lower bound.
+
     Example:
         >>> get_thread("12345")
-        {"success": True, "thread": [{...}, {...}], "count": 2}
+        {"success": True, "thread": [{...}, {...}], "count": 2,
+         "partial": False}
+        >>> get_thread("67890")  # IMAP stalled; result may be truncated
+        {"success": True, "thread": [{...}], "count": 1,
+         "partial": True, "partial_reason": "imap_timeout"}
     """
     try:
         rate_err = check_rate_limit("get_thread", {"message_id": message_id})
@@ -1563,22 +1590,40 @@ def get_thread(message_id: str) -> dict[str, Any]:
 
         logger.info(f"Getting thread for message: {message_id}")
 
-        thread = mail.get_thread(message_id)
+        thread, degraded_reason = mail._get_thread_with_status(message_id)
 
         operation_logger.log_operation(
             "get_thread", {"message_id": message_id}, "success"
         )
 
+        result: dict[str, Any] = {
+            "success": True,
+            "thread": thread,
+            "count": len(thread),
+            # #420: the AppleScript fallback is subject-prefiltered and can
+            # return FEWER members than IMAP would. Say so rather than pass
+            # off a truncated conversation as the whole thread.
+            "partial": degraded_reason is not None,
+        }
+        if degraded_reason is not None:
+            result["partial_reason"] = degraded_reason
+            logger.warning(
+                f"get_thread returned a possibly-incomplete thread "
+                f"({degraded_reason}) for {message_id}"
+            )
         # Thread rows carry attacker-controlled sender/subject — mark untrusted.
-        return _mark_untrusted(
-            {
-                "success": True,
-                "thread": thread,
-                "count": len(thread),
-            },
-            bool(thread),
-        )
+        return _mark_untrusted(result, bool(thread))
 
+    except MailAnchorLookupIncompleteError as e:
+        # #425: distinct from message_not_found on purpose — the message may
+        # exist; we just could not check every account. Retryable.
+        logger.error(f"Thread anchor lookup incomplete: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "anchor_lookup_incomplete",
+            "retryable": True,
+        }
     except MailMessageNotFoundError as e:
         logger.error(f"Message not found: {e}")
         return {
@@ -2765,6 +2810,11 @@ def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
         return {"success": False, "error": str(e), "error_type": "message_not_found"}
     if isinstance(e, MailAccountNotFoundError):
         return {"success": False, "error": str(e), "error_type": "account_not_found"}
+    if isinstance(e, MailSafetyError):
+        # Test-mode reserved-domain violation raised by the clean SMTP send
+        # path's transport-boundary guard (#322/#175). Surface it as a
+        # safety violation rather than a generic "unknown" error.
+        return {"success": False, "error": str(e), "error_type": "safety_violation"}
     if isinstance(e, FileNotFoundError):
         return {"success": False, "error": str(e), "error_type": "file_not_found"}
     if isinstance(e, MailDraftError):
@@ -3550,6 +3600,19 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
+def _port_arg(value: str) -> int:
+    """argparse type for ``--port``: an integer in the valid TCP range."""
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid port {value!r}") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            f"port must be between 1 and 65535, got {port}"
+        )
+    return port
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apple-mail-fast-mcp",
@@ -3591,6 +3654,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     setup_imap.add_argument(
+        "--host",
+        default=None,
+        help=(
+            "Override the IMAP server host for this account. Escape hatch for "
+            "accounts whose host Mail.app reports incorrectly; persisted and "
+            "used at runtime."
+        ),
+    )
+    setup_imap.add_argument(
+        "--port",
+        type=_port_arg,
+        default=None,
+        help=(
+            "Override the IMAP server port (1-65535). Escape hatch for "
+            "accounts whose port Mail.app misreports (e.g. 143 for a server "
+            "actually on 993); persisted and used at runtime. Assumes implicit "
+            "TLS."
+        ),
+    )
+    setup_imap.add_argument(
         "--uninstall",
         action="store_true",
         help=(
@@ -3618,6 +3701,8 @@ def main(argv: list[str] | None = None) -> int:
             account_name=args.account,
             cli_email=args.email,
             uninstall=args.uninstall,
+            cli_host=args.host,
+            cli_port=args.port,
         )
 
     if _READ_ONLY:

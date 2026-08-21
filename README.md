@@ -41,6 +41,39 @@ and dependencies for you via `uv` — no manual venv, no config JSON to hand-edi
 To build the bundle yourself: `./scripts/build-mcpb.sh` → `dist/apple-mail-fast-mcp-<version>.mcpb`
 (requires Node for the `mcpb` packer).
 
+### Claude Code — install as a plugin
+
+One command in Claude Code, no config JSON:
+
+```
+/plugin marketplace add s-morgan-jeffries/apple-mail-fast-mcp
+/plugin install apple-mail-fast@apple-mail-fast-mcp
+```
+
+Claude Code launches the server via `uv run` from the plugin directory (resolves dependencies
+from the bundled `pyproject.toml`/`uv.lock` — no PyPI needed), so you only need `uv` installed.
+macOS only. See [`docs/reference/TOOLS.md`](docs/reference/TOOLS.md) for IMAP setup and the
+read/write split.
+
+### pip / uvx (any MCP client)
+
+Published on [PyPI](https://pypi.org/project/apple-mail-fast-mcp/):
+
+```bash
+uvx apple-mail-fast-mcp          # zero-install, run on demand
+pip install apple-mail-fast-mcp  # or install the console script
+```
+
+Then point your MCP client at it — the config is a one-liner (no absolute paths):
+
+```json
+{
+  "mcpServers": {
+    "apple-mail": { "command": "uvx", "args": ["apple-mail-fast-mcp"] }
+  }
+}
+```
+
 ### From source (development)
 
 ```bash
@@ -99,24 +132,23 @@ On first run, macOS will prompt for Automation access. Grant permission in:
 
 **How it works.** If credentials exist for an account, the server uses IMAP (fast, server-side SEARCH). Otherwise — or on any IMAP failure (offline, wrong password, timeout) — it silently falls back to AppleScript. You never lose functionality; you only gain speed when IMAP is configured and reachable. The normal opt-in is a Keychain entry (below); an environment-variable fallback ([further down](#environment-variable-fallback-uvx--headless--ci)) covers contexts where the Keychain isn't usable.
 
-**One-time setup per account.**
+**One-time setup per account — the `setup-imap` subcommand walks you through it:**
 
-1. Generate an app-specific password at your provider. The procedure varies:
-   - **iCloud:** [appleid.apple.com/account/manage](https://appleid.apple.com/account/manage) → App-Specific Passwords. Requires 2FA on your Apple ID (default).
-   - **Gmail:** [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Requires 2-Step Verification on your Google account.
-   - **Yahoo / Fastmail / AOL:** generate an app password in the provider's account-security settings.
+```bash
+apple-mail-fast-mcp setup-imap --account iCloud
+```
 
-2. Run the `setup-imap` subcommand. It prompts for the password (no echo), writes the Keychain entry, and verifies by connecting:
-   ```bash
-   apple-mail-fast-mcp setup-imap --account iCloud
-   ```
-   Substitute the Mail.app account name exactly — whatever it's labeled in Mail.app (e.g. `iCloud`, `Gmail`, `"Yahoo!"`). The CLI:
-   - looks up the account's primary email from Mail.app (override with `--email`, which is **persisted** so runtime uses the same login — see the iCloud quirk below),
-   - prompts via `getpass` so the password never lands in shell history,
-   - writes to Keychain at `apple-mail-fast-mcp.imap.<account>` (idempotent — re-running with a new password updates the existing entry; pre-rename `apple-mail-mcp.imap.` entries still resolve via a read-through fallback removed at 1.0.0),
-   - opens an IMAP connection and runs a real LOGIN to confirm the password works. On rejection it rolls back the Keychain entry so you can retry without leaving a broken item behind.
+Substitute the Mail.app account name exactly — whatever it's labeled in Mail.app (e.g. `iCloud`, `Gmail`, `"Yahoo!"`). The guided flow (#384):
 
-3. If you see a one-time "security wants to use the 'login' keychain" prompt on the next IMAP-backed call, click **Always Allow**.
+- **detects your provider** from the account's IMAP host and points you at the right app-password page — **iCloud** ([account.apple.com](https://account.apple.com/account/manage) → App-Specific Passwords), **Gmail** ([myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)), **Yahoo**, **Outlook**, **Fastmail** (generic guidance for anything else) — with the provider's 2FA steps, and **offers to open the page** in your browser;
+- explains that this is a **scoped, revocable app-specific password** — limited to that one account — unlike granting full disk access;
+- looks up the account's primary email from Mail.app (override with `--email`, which is **persisted** so runtime uses the same login — see the iCloud quirk below);
+- reads the IMAP **host and port** from Mail.app; if either is wrong — some institutional servers (e.g. Zimbra) scriptably misreport the port as `143` for a server actually on `993`, so the implicit-TLS handshake fails with `WRONG_VERSION_NUMBER` — override with `--host` / `--port <993>`, which are **persisted** so runtime connects to the same coordinates (#405);
+- prompts via `getpass` so the password never lands in shell history;
+- writes to Keychain at `apple-mail-fast-mcp.imap.<account>` (idempotent — re-running with a new password updates the entry; pre-rename `apple-mail-mcp.imap.` entries still resolve via a read-through fallback removed at 1.0.0);
+- opens an IMAP connection and runs a real LOGIN to confirm the password works. On rejection it **rolls back the Keychain entry and lets you paste again** (up to 3 tries) so a bad password never leaves a broken item behind.
+
+If you see a one-time "security wants to use the 'login' keychain" prompt on the next IMAP-backed call, click **Always Allow**.
 
 To remove the entry later: `apple-mail-fast-mcp setup-imap --account iCloud --uninstall`.
 
