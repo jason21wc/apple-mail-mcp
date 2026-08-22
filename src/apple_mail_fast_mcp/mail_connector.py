@@ -2823,7 +2823,12 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
-    def get_thread(self, message_id: str) -> list[dict[str, Any]]:
+    def get_thread(
+        self,
+        message_id: str,
+        account: str | None = None,
+        mailbox: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return all messages in the thread containing ``message_id``.
 
         Tries the IMAP path first (server-side header search, no subject-
@@ -2852,11 +2857,24 @@ class AppleMailConnector:
             MailMessageNotFoundError: If no message with the given id exists.
             MailAnchorLookupIncompleteError: If an account could not be
                 checked, so absence was never established (#425).
+
+        Args:
+            message_id: RFC 5322 Message-ID or Mail.app numeric id.
+            account: Optional account the message lives in. Skips the
+                probe across every configured account. Accepts a
+                display name or a UUID.
+            mailbox: Optional folder the message lives in. Probed
+                before folder discovery. Applies to RFC Message-ID
+                (IMAP) resolution only — numeric Mail.app ids still
+                use the legacy AppleScript resolver.
         """
-        return self._get_thread_with_status(message_id)[0]
+        return self._get_thread_with_status(message_id, account, mailbox)[0]
 
     def _get_thread_with_status(
-        self, message_id: str,
+        self,
+        message_id: str,
+        account: str | None = None,
+        mailbox: str | None = None,
     ) -> tuple[list[dict[str, Any]], str | None]:
         """:meth:`get_thread` plus whether the result is complete.
 
@@ -2874,7 +2892,7 @@ class AppleMailConnector:
         if "@" in message_id:
             # An RFC 5322 Message-ID (the id the IMAP read path returns).
             # Resolve it server-side via indexed SEARCH HEADER Message-ID.
-            anchor = self._resolve_anchor_via_imap(message_id)
+            anchor = self._resolve_anchor_via_imap(message_id, account, mailbox)
             if anchor is None:
                 raise MailMessageNotFoundError(
                     f"No message with Message-ID {message_id!r} found via "
@@ -2882,7 +2900,9 @@ class AppleMailConnector:
                     "ensure the account has IMAP configured (`setup-imap`). "
                     "The AppleScript fallback is intentionally not used for "
                     "Message-IDs because it scans every message and can hang "
-                    "Mail on large accounts. (#415)"
+                    "Mail on large accounts. (#415) If the message is filed "
+                    "outside INBOX/Sent, pass account= and mailbox= — only "
+                    "those folders are probed without a hint."
                 )
         else:
             # Mail.app numeric internal id → bounded probe of the unified
@@ -2942,7 +2962,10 @@ class AppleMailConnector:
         )
 
     def _resolve_anchor_via_imap(
-        self, message_id: str,
+        self,
+        message_id: str,
+        account: str | None = None,
+        mailbox: str | None = None,
     ) -> dict[str, Any] | None:
         """Resolve an RFC 5322 Message-ID to a get_thread anchor via IMAP,
         across configured accounts (#415).
@@ -2966,35 +2989,46 @@ class AppleMailConnector:
         # separate from a clean empty SEARCH result, which genuinely does
         # rule an account out. (#425)
         indeterminate: list[str] = []
-        for acct in self.list_accounts():
-            account = cast(str, acct.get("name") or "")
-            if not account or self._imap_breaker_open(account):
+        # An account hint skips the fan-out entirely: probe the one account the
+        # caller named instead of every configured account in turn.
+        candidates = (
+            [{"name": account}] if account else self.list_accounts()
+        )
+        for acct in candidates:
+            account_name = cast(str, acct.get("name") or "")
+            if not account_name:
+                continue
+            if self._imap_breaker_open(account_name):
+                # An open breaker means we did not ask this account, so it
+                # cannot contribute to a claim of absence. Skipping it silently
+                # is the #425 bug in another guise.
+                indeterminate.append(account_name)
                 continue
             try:
-                host, port, email = self._resolve_imap_config(account)
+                host, port, email = self._resolve_imap_config(account_name)
                 if not host:
                     continue
                 password = self._get_imap_password_with_fallback(
-                    account, email
+                    account_name, email
                 )
                 imap = ImapConnector(
                     host, port, email, password, pool=self._imap_pool
                 )
-                anchor = imap.resolve_anchor(message_id)
+                anchor = imap.resolve_anchor(message_id, mailbox)
             except MailKeychainEntryNotFoundError as exc:
                 # Benign opt-out: the user has not configured IMAP for this
                 # account. Stable, not transient — not indeterminate.
-                self._log_imap_fallback(account, exc)
+                self._log_imap_fallback(account_name, exc)
                 continue
             except _IMAP_FALLBACK_EXCS as exc:
                 # Timeout / connect failure / rejected credentials. This
                 # account was NOT checked; remember that before moving on.
-                self._log_imap_fallback(account, exc)
-                indeterminate.append(account)
+                self._log_imap_fallback(account_name, exc)
+                indeterminate.append(account_name)
                 continue
             if anchor is not None:
-                self._imap_clear_breaker(account)
-                anchor["account"] = account
+                self._imap_clear_breaker(account_name)
+                anchor["account"] = account_name
                 # Hand the live connector to member collection so it does not
                 # redo config + Keychain + connect for this same account
                 # (#420). Consumed by _imap_get_thread.
@@ -3580,12 +3614,16 @@ class AppleMailConnector:
 
         account_name = cast(str, anchor["account"])
         base_subject = normalize_subject(cast(str, anchor["subject"]))
-        account_safe = escape_applescript_string(sanitize_input(account_name))
+        # An account HINT is forwarded verbatim, so anchor["account"] can now
+        # be a UUID — before the hints existed it always came from
+        # list_accounts() and was therefore a display name. account "<uuid>"
+        # matches nothing; the helper emits account id "<uuid>" for that form.
+        account_clause = applescript_account_clause(account_name)
         subject_safe = escape_applescript_string(sanitize_input(base_subject))
 
         candidates_body = f'''
         tell application "Mail"
-            set acctRef to account "{account_safe}"
+            set acctRef to {account_clause}
             set resultData to {{}}
             repeat with mbRef in mailboxes of acctRef
                 try
