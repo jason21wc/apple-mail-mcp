@@ -49,6 +49,8 @@ DESTRUCTIVE_TOOLS: set[str] = {
     "delete_messages",
     "delete_rule",
     "delete_template",
+    # overwrite=True can replace a file the caller did not create.
+    "save_attachments",
 }
 
 ADDITIVE_TOOLS: set[str] = {
@@ -56,7 +58,6 @@ ADDITIVE_TOOLS: set[str] = {
     "create_draft",
     "create_rule",
     "save_template",
-    "save_attachments",
 }
 
 MUTATING_TOOLS = DESTRUCTIVE_TOOLS | ADDITIVE_TOOLS

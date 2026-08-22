@@ -5,6 +5,7 @@ FastMCP server for Apple Mail integration.
 import argparse
 import atexit
 import logging
+import os
 import sys
 import tempfile
 from collections.abc import Callable
@@ -43,6 +44,7 @@ from .exceptions import (
 from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
 from .security import (
+    SEND_OPERATIONS,
     _injection_scan_enabled,
     check_rate_limit,
     check_test_mode_safety,
@@ -1750,7 +1752,11 @@ def get_statistics(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    # destructiveHint=True: overwrite=True replaces an existing file, so this
+    # tool can destroy data the caller did not create. The default path is
+    # no-clobber, but the annotation describes the tool's capability, not its
+    # default.
+    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
     mutating=True,
 )
 def save_attachments(
@@ -1758,9 +1764,9 @@ def save_attachments(
     save_directory: str,
     attachment_indices: IntList | None = None,
     output_filename: str | None = None,
-    overwrite: bool = False,
     account: str | None = None,
     mailbox: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """
     Save attachments from a message to a directory.
@@ -1802,7 +1808,6 @@ def save_attachments(
         {"success": True, "saved": 1, "directory": "/Users/me/Reports",
          "rejected": [], "filename": "daily.txt"}
     """
-    import shutil
     from pathlib import Path
 
     from .utils import sanitize_filename
@@ -1851,7 +1856,10 @@ def save_attachments(
         if output_filename is not None:
             # Save to a temp dir first (TOCTOU-safe), then move into the
             # destination under the requested name.
-            with tempfile.TemporaryDirectory() as tmp_dir:
+            # Stage INSIDE the destination directory so the final commit is
+            # a same-filesystem atomic operation (os.link/os.replace fail with
+            # EXDEV across filesystems, which a system temp dir invites).
+            with tempfile.TemporaryDirectory(dir=save_path) as tmp_dir:
                 tmp_path = Path(tmp_dir)
                 result = mail.save_attachments(
                     message_id=message_id,
@@ -1869,12 +1877,32 @@ def save_attachments(
                             "error_type": "unknown",
                         }
                     destination = save_path.resolve() / output_filename
-                    # No-clobber by default. ADR-5 makes incremental retrieval
-                    # depend on deterministic names plus an existence check;
-                    # enforcing that here rather than in caller instructions is
-                    # what makes a re-run safe. The staged temp file is
-                    # discarded with the TemporaryDirectory.
-                    if destination.exists() and not overwrite:
+                    # A directory at the destination is never a valid target:
+                    # shutil.move would nest the file INSIDE it and report
+                    # success, and os.replace cannot replace a directory.
+                    if destination.is_dir():
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Destination exists and is a directory: "
+                                f"{destination}"
+                            ),
+                            "error_type": "invalid_destination",
+                            "filename": output_filename,
+                            "directory": str(save_path),
+                        }
+                    # ADR-5 makes incremental retrieval depend on deterministic
+                    # names plus an existence check, so the check has to be the
+                    # commit itself — a separate exists() test leaves a TOCTOU
+                    # window a concurrent save can land in. os.link is atomic
+                    # and fails with FileExistsError if the name is taken; the
+                    # staged file is discarded with the TemporaryDirectory.
+                    try:
+                        if overwrite:
+                            os.replace(str(saved_files[0]), str(destination))
+                        else:
+                            os.link(str(saved_files[0]), str(destination))
+                    except FileExistsError:
                         return {
                             "success": False,
                             "error": (
@@ -1886,7 +1914,6 @@ def save_attachments(
                             "filename": output_filename,
                             "directory": str(save_path),
                         }
-                    shutil.move(str(saved_files[0]), str(destination))
                     final_filename = output_filename
         else:
             result = mail.save_attachments(
@@ -3080,6 +3107,18 @@ async def _run_send_now_gates(
     (#192) can adopt this helper — its send path inherits recipients
     from existing draft state and doesn't need the shape check.
     """
+    # `operation` reaches check_test_mode_safety as a variable, so the static
+    # call-site audit in TestAccountGatedOperationCoverage cannot see it. Assert
+    # the registration here instead: an operation absent from SEND_OPERATIONS
+    # makes the safety gate below a silent no-op, which is precisely the class
+    # of defect that let delete_mailbox through.
+    if operation not in SEND_OPERATIONS:
+        raise ValueError(
+            f"_run_send_now_gates called with unregistered operation "
+            f"{operation!r}; add it to SEND_OPERATIONS in security.py or the "
+            f"send-safety gate is a no-op for it."
+        )
+
     safety_err = check_test_mode_safety(operation, recipients=recipients)
     if safety_err:
         return safety_err
@@ -3646,7 +3685,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--read-only",
         action="store_true",
         help=(
-            "Start the server with only the 9 read-only tools registered "
+            "Start the server with only the read-only tools registered "
             "(skips the 14 mutating tools). Pair with a second non-read-only "
             "server entry in your MCP client to batch-approve reads while "
             "still gating writes per call. See docs/reference/TOOLS.md."
@@ -3729,7 +3768,7 @@ def main(argv: list[str] | None = None) -> int:
     if _READ_ONLY:
         logger.info(
             "Read-only mode: 14 mutating tools skipped (--read-only). "
-            "Only the 9 read tools are registered."
+            "Only the read-only tools are registered."
         )
     logger.info("Starting Apple Mail MCP server")
     mcp.run()
