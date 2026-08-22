@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import re
+import ast
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -716,28 +716,97 @@ class TestAccountGatedOperationCoverage:
         assert err["success"] is False
         assert err["error_type"] == "safety_violation"
 
-    def test_every_server_call_site_names_a_registered_operation(self) -> None:
+    def test_every_server_call_site_is_gated_by_the_matching_registry(
+        self,
+    ) -> None:
         """Structural guard: the gap was an omission, not a logic error.
 
-        Adding three names fixes today's bug; this test stops the next one.
-        Every operation name passed to `check_test_mode_safety` from the server
-        must appear in a gated set, or the call site is decorative. Mirrors the
-        philosophy of `check_client_server_parity.sh`.
+        Adding three names fixes today's bug; this stops the next one. Parsed
+        with AST rather than a regex, for two reasons a regex got wrong:
+
+        1. A regex only sees string literals, so it silently skipped the
+           non-literal call in ``_run_send_now_gates`` (that one is covered by
+           a runtime check instead, asserted below).
+        2. Checking against the UNION of the registries would accept an
+           operation registered in the wrong category — e.g. a send operation
+           listed under ACCOUNT_GATED_OPERATIONS, where the account branch
+           never fires for it. Each call is validated against the registry
+           matching the safety argument it actually supplies.
+
+        Calls that supply no safety argument are intentionally ungated and are
+        not rejected.
         """
-        source = (
-            Path(__file__).resolve().parents[2] / "src" / "apple_mail_fast_mcp" / "server.py"
-        ).read_text()
-
-        called = set(re.findall(r'check_test_mode_safety\(\s*["\']([a-z_]+)["\']', source))
-        assert called, "no call sites parsed — the regex has rotted"
-
-        registered = (
-            security.ACCOUNT_GATED_OPERATIONS
-            | security.SEND_OPERATIONS
-            | security.RULE_GATED_OPERATIONS
+        server_path = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "apple_mail_fast_mcp"
+            / "server.py"
         )
-        assert called <= registered, (
-            "server.py calls check_test_mode_safety with unregistered "
-            f"operation(s) {sorted(called - registered)} — the gate is a "
-            "no-op for them. Add them to the appropriate set in security.py."
+        tree = ast.parse(server_path.read_text())
+
+        registry_for_kwarg = {
+            "account": ("ACCOUNT_GATED_OPERATIONS", security.ACCOUNT_GATED_OPERATIONS),
+            "recipients": ("SEND_OPERATIONS", security.SEND_OPERATIONS),
+            "rule_name": ("RULE_GATED_OPERATIONS", security.RULE_GATED_OPERATIONS),
+        }
+
+        literal_calls = 0
+        non_literal_calls: list[int] = []
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name != "check_test_mode_safety":
+                continue
+
+            operation_node = node.args[0] if node.args else next(
+                (kw.value for kw in node.keywords if kw.arg == "operation"), None
+            )
+            supplied = {kw.arg for kw in node.keywords} & registry_for_kwarg.keys()
+
+            if not isinstance(operation_node, ast.Constant) or not isinstance(
+                operation_node.value, str
+            ):
+                non_literal_calls.append(node.lineno)
+                continue
+
+            literal_calls += 1
+            operation = operation_node.value
+            for kwarg in sorted(supplied):
+                registry_name, registry = registry_for_kwarg[kwarg]
+                assert operation in registry, (
+                    f"server.py:{node.lineno} calls check_test_mode_safety"
+                    f"({operation!r}, {kwarg}=...) but {operation!r} is not in "
+                    f"{registry_name}. The gate is a no-op for it — add it "
+                    f"there, not to a different registry."
+                )
+
+        assert literal_calls, "no literal call sites parsed — the AST walk has rotted"
+
+        # Non-literal call sites cannot be checked statically, so each one must
+        # carry its own runtime assertion. Exactly one exists today, inside
+        # _run_send_now_gates. A NEW one fails here until it gets the same
+        # treatment.
+        assert len(non_literal_calls) == 1, (
+            f"expected exactly 1 non-literal check_test_mode_safety call "
+            f"(_run_send_now_gates), found {len(non_literal_calls)} at lines "
+            f"{non_literal_calls}. A non-literal call is invisible to this "
+            f"audit — give it a runtime guard like _run_send_now_gates has."
         )
+
+    @pytest.mark.asyncio
+    async def test_send_now_gates_reject_unregistered_operation(self) -> None:
+        """The runtime half of the guard above, covering the non-literal call."""
+        from apple_mail_fast_mcp.server import _run_send_now_gates
+
+        with pytest.raises(ValueError, match="unregistered operation"):
+            await _run_send_now_gates(
+                "not_a_send_operation",
+                None,
+                ["someone@example.com"],
+                {},
+                "summary",
+                {},
+            )

@@ -356,3 +356,83 @@ class TestOutputFilenameNoClobber:
 
         assert result["success"] is True
         assert target.read_bytes() == b"NEW CONTENT"
+
+
+class TestOutputFilenameAtomicity:
+    """#FORK — the no-clobber guarantee must survive concurrency and odd targets.
+
+    A check-then-act `exists()` guard leaves a TOCTOU window: a file created
+    between the test and the move is silently overwritten. The commit itself
+    has to be the exclusive operation.
+    """
+
+    @staticmethod
+    def _fake_save(payload: bytes) -> Any:
+        def _inner(**kwargs: Any) -> dict[str, Any]:
+            Path(kwargs["save_directory"], "raw.pdf").write_bytes(payload)
+            return {"saved": 1, "rejected": []}
+
+        return _inner
+
+    def test_directory_at_destination_is_rejected_not_nested(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
+    ) -> None:
+        """shutil.move would place the file INSIDE the directory and call it
+        success, producing report.pdf/raw.pdf."""
+        (tmp_path / "report.pdf").mkdir()
+        mock_mail.save_attachments.side_effect = self._fake_save(b"NEW")
+
+        result = save_attachments(
+            message_id="1",
+            save_directory=str(tmp_path),
+            attachment_indices=[0],
+            output_filename="report.pdf",
+            overwrite=True,
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_destination"
+        assert (tmp_path / "report.pdf").is_dir()
+        assert list((tmp_path / "report.pdf").iterdir()) == []
+
+    def test_concurrent_default_saves_exactly_one_wins(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
+    ) -> None:
+        """Two concurrent no-clobber saves to the same name: exactly one
+        succeeds, the other reports already_exists. Never two successes."""
+        import threading
+
+        barrier = threading.Barrier(2)
+
+        def _racing_save(**kwargs: Any) -> dict[str, Any]:
+            Path(kwargs["save_directory"], "raw.pdf").write_bytes(b"NEW")
+            # Both threads finish staging before either commits, so the
+            # commit is the only thing separating them.
+            barrier.wait(timeout=5)
+            return {"saved": 1, "rejected": []}
+
+        mock_mail.save_attachments.side_effect = _racing_save
+        results: list[dict[str, Any]] = []
+        lock = threading.Lock()
+
+        def _run() -> None:
+            r = save_attachments(
+                message_id="1",
+                save_directory=str(tmp_path),
+                attachment_indices=[0],
+                output_filename="report.pdf",
+            )
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=_run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(results) == 2
+        successes = [r for r in results if r.get("success")]
+        refusals = [r for r in results if r.get("error_type") == "already_exists"]
+        assert len(successes) == 1, f"expected exactly one winner, got {results}"
+        assert len(refusals) == 1, f"expected one already_exists, got {results}"
