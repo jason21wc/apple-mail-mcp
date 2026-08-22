@@ -3962,3 +3962,59 @@ class TestResolveAnchor:
         client.search.return_value = []
         conn = ImapConnector("h", 993, "e@x", "pw")
         assert conn.resolve_anchor("nope@x") is None
+
+
+class TestAnchorProbeMailboxHint:
+    """#415's bounded probe set makes get_thread unusable on a filed mailbox.
+
+    resolve_anchor probes Gmail's \\All if present, else INBOX + Sent. On an
+    account with no All-Mail folder whose mail is filed into project folders by
+    rules, the anchor is in none of those, the SEARCH comes back clean-empty,
+    and absence is indistinguishable from "not here" — get_thread reports
+    message_not_found for a message the caller just listed.
+
+    Live-reproduced on a real iCloud account: two messages returned by
+    search_messages from a named mailbox were both unresolvable by get_thread.
+    """
+
+    def _client(self, folders: list[str]) -> MagicMock:
+        client = MagicMock()
+        client.list_folders.return_value = [((), b"/", f) for f in folders]
+        return client
+
+    def test_hinted_mailbox_is_probed_first(self) -> None:
+        conn = ImapConnector("imap.mail.me.com", 993, "u@e.com", "pw")
+        client = self._client(["INBOX", "Sent", "Investments/CHMG"])
+
+        folders = conn._anchor_probe_folders(client, "Investments/CHMG")
+
+        assert folders[0] == "Investments/CHMG", (
+            "the caller's hint must be probed before the bounded set"
+        )
+
+    def test_bounded_set_still_probed_after_the_hint(self) -> None:
+        """The hint ADDS a folder; it does not narrow the search."""
+        conn = ImapConnector("imap.mail.me.com", 993, "u@e.com", "pw")
+        client = self._client(["INBOX", "Sent", "Investments/CHMG"])
+
+        folders = conn._anchor_probe_folders(client, "Investments/CHMG")
+
+        assert "INBOX" in folders
+
+    def test_hint_naming_inbox_does_not_duplicate_it(self) -> None:
+        conn = ImapConnector("imap.mail.me.com", 993, "u@e.com", "pw")
+        client = self._client(["INBOX", "Sent"])
+
+        folders = conn._anchor_probe_folders(client, "INBOX")
+
+        assert folders.count("INBOX") == 1
+
+    def test_no_hint_preserves_the_bounded_set_exactly(self) -> None:
+        """Regression guard: the #415 cost profile is unchanged without a hint."""
+        conn = ImapConnector("imap.mail.me.com", 993, "u@e.com", "pw")
+        client = self._client(["INBOX", "Sent", "Investments/CHMG"])
+
+        assert conn._anchor_probe_folders(client) == conn._anchor_probe_folders(
+            client, None
+        )
+        assert "Investments/CHMG" not in conn._anchor_probe_folders(client)

@@ -1343,7 +1343,9 @@ class ImapConnector:
                 }
         return None
 
-    def resolve_anchor(self, message_id: str) -> dict[str, Any] | None:
+    def resolve_anchor(
+        self, message_id: str, mailbox: str | None = None
+    ) -> dict[str, Any] | None:
         """Resolve an RFC 5322 Message-ID to a get_thread anchor via
         server-side, INDEXED ``SEARCH HEADER Message-ID`` (#415).
 
@@ -1359,13 +1361,18 @@ class ImapConnector:
         probed folder that contains the Message-ID, or ``None`` if not found.
         The caller supplies ``account``.
 
+        ``mailbox`` optionally names the folder the caller already knows the
+        message is in (e.g. the mailbox a prior ``search_messages`` returned
+        it from). It is probed first. Without it, a message filed outside
+        INBOX/Sent resolves to ``None`` and surfaces as "not found".
+
         Raises:
             IMAPClientError / OSError / LoginError: connection/auth failures,
                 so the caller can fall through to the next account.
         """
         bracketed = _bracket_message_id(message_id)
         with self._session() as client:
-            for folder in self._anchor_probe_folders(client):
+            for folder in self._anchor_probe_folders(client, mailbox):
                 try:
                     client.select_folder(folder, readonly=True)
                     uids = client.search(["HEADER", "Message-ID", bracketed])
@@ -1392,14 +1399,31 @@ class ImapConnector:
                     return _anchor_from_fetch(entry)
         return None
 
-    def _anchor_probe_folders(self, client: IMAPClient) -> list[str]:
+    def _anchor_probe_folders(
+        self, client: IMAPClient, mailbox: str | None = None
+    ) -> list[str]:
         """Bounded folder set for #415 anchor resolution: Gmail All Mail
         (mirrors every message) if present, else INBOX + Sent. Never lists
-        all folders — that's the cost we're removing."""
+        all folders — that's the cost we're removing.
+
+        ``mailbox`` is an optional caller-supplied hint, probed FIRST. Without
+        it an anchor that lives outside the bounded set is reported as "not
+        found" — a clean empty SEARCH is indistinguishable from absence — which
+        makes get_thread unusable on accounts that file mail out of INBOX
+        (rules, smart folders, a many-project hierarchy). The hint keeps the
+        cost profile identical: one extra INDEXED SEARCH in a named folder,
+        never the unindexed all-mailbox scan #415 removed.
+        """
+        folders: list[str] = []
+        if mailbox:
+            folders.append(mailbox)
         all_mail = self._find_all_mail_folder(client)
         if all_mail:
-            return [all_mail]
-        return list(self._anchor_lookup_folders(client))
+            folders.append(all_mail)
+        else:
+            folders.extend(self._anchor_lookup_folders(client))
+        # Preserve order, drop duplicates (the hint may name INBOX).
+        return list(dict.fromkeys(folders))
 
     def find_thread_members(
         self,

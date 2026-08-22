@@ -436,3 +436,58 @@ class TestOutputFilenameAtomicity:
         refusals = [r for r in results if r.get("error_type") == "already_exists"]
         assert len(successes) == 1, f"expected exactly one winner, got {results}"
         assert len(refusals) == 1, f"expected one already_exists, got {results}"
+
+
+class TestGetThreadMailboxHints:
+    """get_thread must be able to reach a message filed outside INBOX.
+
+    Live-reproduced 2026-08-22 on a real iCloud account: messages returned by
+    search_messages from `Investments Current/CHMG` were reported
+    message_not_found by get_thread, because anchor resolution only probes
+    INBOX + Sent (no Gmail All-Mail on iCloud). The hints close that gap
+    without reintroducing the unindexed all-mailbox scan #415 removed.
+    """
+
+    def test_hints_are_forwarded_to_the_connector(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail._get_thread_with_status.return_value = (
+            [{"id": "1", "subject": "S", "sender": "dave@example.com"}],
+            None,
+        )
+
+        result = get_thread(
+            "abc@example.com",
+            account="iCloud",
+            mailbox="Investments Current/CHMG",
+        )
+
+        assert result["success"] is True
+        mock_mail._get_thread_with_status.assert_called_once_with(
+            "abc@example.com", "iCloud", "Investments Current/CHMG"
+        )
+
+    def test_hints_are_optional(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """Existing single-argument callers keep working unchanged."""
+        mock_mail._get_thread_with_status.return_value = ([], None)
+
+        result = get_thread("1")
+
+        assert result["success"] is True
+        mock_mail._get_thread_with_status.assert_called_once_with("1", None, None)
+
+    def test_untrusted_marking_survives_the_new_signature(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """Fork mod #2 must still apply on the hinted path."""
+        mock_mail._get_thread_with_status.return_value = (
+            [{"id": "1", "subject": "S", "sender": "x@y.com"}],
+            None,
+        )
+
+        result = get_thread("1", account="iCloud", mailbox="INBOX")
+
+        assert result["content_is_untrusted"] is True
+        assert result["security_notice"] == _UNTRUSTED_CONTENT_NOTICE

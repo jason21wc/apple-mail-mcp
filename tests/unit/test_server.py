@@ -1950,7 +1950,7 @@ class TestGetThread:
         # #420: a complete result must say so explicitly, not by omission.
         assert result["partial"] is False
         assert "partial_reason" not in result
-        mock_mail._get_thread_with_status.assert_called_once_with("1")
+        mock_mail._get_thread_with_status.assert_called_once_with("1", None, None)
         mock_logger.log_operation.assert_called_once_with(
             "get_thread", {"message_id": "1"}, "success"
         )

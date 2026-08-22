@@ -300,6 +300,10 @@ full = get_messages(ids)
 
 ---
 
+
+**Parameters:** `message_id` (required) · `account` (optional) · `mailbox` (optional).
+
+Pass `account` and `mailbox` when you already know where the message lives — e.g. the mailbox `search_messages` returned it from. Anchor resolution otherwise probes only Gmail All-Mail (if present) or INBOX + Sent, so a message filed into another folder by a rule resolves as `message_not_found`. The hint is probed first and adds one indexed SEARCH; it never triggers the unindexed all-mailbox scan.
 ### get_statistics
 
 Aggregate inbox statistics over a mailbox and time window — message volume, read/unread/flagged counts, read ratio, and top senders (by address or domain). A read-only roll-up computed from a single `search_messages` pass; per-folder unread counts live on `list_mailboxes` and are not duplicated here.
