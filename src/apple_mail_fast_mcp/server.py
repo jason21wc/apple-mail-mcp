@@ -1596,7 +1596,10 @@ def get_thread(
          "partial": True, "partial_reason": "imap_timeout"}
     """
     try:
-        rate_err = check_rate_limit("get_thread", {"message_id": message_id})
+        rate_err = check_rate_limit(
+            "get_thread",
+            {"message_id": message_id, "account": account, "mailbox": mailbox},
+        )
         if rate_err:
             return rate_err
 
@@ -1607,7 +1610,9 @@ def get_thread(
         )
 
         operation_logger.log_operation(
-            "get_thread", {"message_id": message_id}, "success"
+            "get_thread",
+            {"message_id": message_id, "account": account, "mailbox": mailbox},
+            "success",
         )
 
         result: dict[str, Any] = {
@@ -1628,6 +1633,24 @@ def get_thread(
         # Thread rows carry attacker-controlled sender/subject — mark untrusted.
         return _mark_untrusted(result, bool(thread))
 
+    except MailAccountNotFoundError as e:
+        # B11: with an account hint we skip list_accounts() by design (that is
+        # the shortcut), so a bad name surfaces here rather than as an empty
+        # candidate list. Stable caller error — deliberately NOT added to
+        # _IMAP_FALLBACK_EXCS, which is for transient/indeterminate failures.
+        logger.error(f"Account not found in get_thread: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "account_not_found",
+        }
+    except ValueError as e:
+        # Control characters in the mailbox hint (connector invariant).
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "validation_error",
+        }
     except MailAnchorLookupIncompleteError as e:
         # #425: distinct from message_not_found on purpose — the message may
         # exist; we just could not check every account. Retryable.

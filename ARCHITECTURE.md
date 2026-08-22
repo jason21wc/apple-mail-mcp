@@ -62,6 +62,8 @@ dropped. Fork infrastructure that is not a behavior change: governance
 integration, the attachment-retrieval skill, and
 `tests/integration/test_fork_extensions_integration.py`.
 
+**Temporary exception (2026-08-22).** PR #54 modifies `imap_connector.py` and `mail_connector.py` to give `get_thread` `account`/`mailbox` hints — a deliberate, owner-approved departure from the connectors-untouched rule, taken because the bug blocked the fork's primary use case. It is upstream-bound; until it lands there the fork carries divergence in two hot files, which raises the cost of every sync. Do not treat it as licence for more connector work.
+
 **Why thin matters:** the fork and upstream churn the same hot files. Drift is
 paid for at merge time, superlinearly — one past sync cost 109 conflicts.
 Sync small and often; prefer contributing upstream over accumulating fork code.

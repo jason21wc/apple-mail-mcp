@@ -95,7 +95,8 @@ docs/reference/        Canonical API + architecture docs
 ## Upstream
 
 Fork of `s-morgan-jeffries/apple-mail-fast-mcp`. The fork is deliberately
-**thin** — two behavioral modifications, both in `server.py`. Sync **small and
+**thin** — two behavioral modifications in `server.py`, plus one
+temporary, upstream-bound connector exception (PR #54; see `ARCHITECTURE.md`). Sync **small and
 often**; letting it drift is what turned one past sync into a 109-conflict
 ordeal. See `ARCHITECTURE.md` for the fork boundary and `_ai-context/OPERATIONS.md`
 for the sync cadence.

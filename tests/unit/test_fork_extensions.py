@@ -491,3 +491,58 @@ class TestGetThreadMailboxHints:
 
         assert result["content_is_untrusted"] is True
         assert result["security_notice"] == _UNTRUSTED_CONTENT_NOTICE
+
+
+class TestGetThreadHintFailurePaths:
+    """#FORK — hint-specific failure paths the original PR #54 did not cover."""
+
+    def test_uuid_account_hint_reaches_applescript_fallback(self) -> None:
+        """An account hint is forwarded verbatim, so anchor["account"] can be a
+        UUID. `account "<uuid>"` matches nothing in AppleScript — it must be
+        emitted as `account id "<uuid>"`."""
+        from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+
+        conn = AppleMailConnector()
+        scripts: list[str] = []
+        uuid = "1A2B3C4D-5E6F-7081-9A2B-3C4D5E6F7081"
+
+        with patch.object(
+            conn, "_run_applescript", side_effect=lambda s: scripts.append(s) or "[]"
+        ):
+            conn._collect_thread_applescript(
+                {"account": uuid, "subject": "S", "rfc_message_id": "a@b.com"}
+            )
+
+        assert scripts, "no AppleScript was generated"
+        assert f'account id "{uuid}"' in scripts[0], (
+            "a UUID account hint must produce `account id`, not `account`"
+        )
+
+    def test_bad_account_hint_reports_account_not_found(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """B11: the account hint skips list_accounts() by design, so a bad name
+        surfaces from _resolve_imap_config rather than as an empty candidate
+        list. It must not land in the generic handler as "unknown"."""
+        from apple_mail_fast_mcp.exceptions import MailAccountNotFoundError
+
+        mock_mail._get_thread_with_status.side_effect = MailAccountNotFoundError(
+            "Account 'iClod' not found"
+        )
+
+        result = get_thread("a@b.com", account="iClod", mailbox="INBOX")
+
+        assert result["success"] is False
+        assert result["error_type"] == "account_not_found"
+
+    def test_control_chars_in_mailbox_hint_report_validation_error(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail._get_thread_with_status.side_effect = ValueError(
+            "mailbox contains control characters"
+        )
+
+        result = get_thread("a@b.com", account="iCloud", mailbox="bad\r\nname")
+
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
