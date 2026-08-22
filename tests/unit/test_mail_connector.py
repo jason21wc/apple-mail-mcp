@@ -9266,7 +9266,7 @@ class TestResolveAnchorIndeterminate:
         name. `behavior` returns an anchor dict, None, or raises."""
         def _factory(host, port, email, password, pool=None):
             m = MagicMock()
-            m.resolve_anchor.side_effect = lambda mid: behavior(host)
+            m.resolve_anchor.side_effect = lambda mid, *a, **k: behavior(host)
             return m
         return _factory
 
@@ -9493,7 +9493,7 @@ class TestGetThreadDegradedStatus:
     def _anchor(self, connector, monkeypatch) -> None:
         monkeypatch.setattr(
             connector, "_resolve_anchor_via_imap",
-            lambda mid: {"account": "Gmail", "rfc_message_id": "abc@x",
+            lambda mid, *a, **k: {"account": "Gmail", "rfc_message_id": "abc@x",
                          "references": [], "subject": "Hi"},
         )
         monkeypatch.setattr(connector, "_imap_breaker_open", lambda a: False)
@@ -9593,7 +9593,7 @@ class TestGetThreadNeverScansForRfcId:
         )
         monkeypatch.setattr(
             connector, "_resolve_anchor_via_imap",
-            lambda mid: {"account": "Gmail", "rfc_message_id": "abc@x",
+            lambda mid, *a, **k: {"account": "Gmail", "rfc_message_id": "abc@x",
                          "references": [], "subject": "Hi"},
         )
         monkeypatch.setattr(connector, "_imap_breaker_open", lambda a: False)
@@ -9615,7 +9615,7 @@ class TestGetThreadNeverScansForRfcId:
             lambda s: scripts.append(s) or "",
         )
         monkeypatch.setattr(
-            connector, "_resolve_anchor_via_imap", lambda mid: None
+            connector, "_resolve_anchor_via_imap", lambda mid, *a, **k: None
         )
         with pytest.raises(MailMessageNotFoundError):
             connector.get_thread("missing@x")
@@ -9634,7 +9634,7 @@ class TestGetThreadNeverScansForRfcId:
             lambda s: scripts.append(s) or "",
         )
 
-        def _raise(mid: str) -> None:
+        def _raise(mid: str, *a: object, **k: object) -> None:
             raise MailAnchorLookupIncompleteError("Gmail could not be checked")
 
         monkeypatch.setattr(connector, "_resolve_anchor_via_imap", _raise)

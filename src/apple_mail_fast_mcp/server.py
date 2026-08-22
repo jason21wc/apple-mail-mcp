@@ -1545,7 +1545,11 @@ def update_message(
 @_tool(
     {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
 )
-def get_thread(message_id: str) -> dict[str, Any]:
+def get_thread(
+    message_id: str,
+    account: str | None = None,
+    mailbox: str | None = None,
+) -> dict[str, Any]:
     """
     Return all messages in the thread containing the given message.
 
@@ -1565,6 +1569,12 @@ def get_thread(message_id: str) -> dict[str, Any]:
     Args:
         message_id: Internal id of any message in the thread
             (from ``search_messages`` or ``get_messages`` results).
+        account: Optional account the message lives in. Skips probing
+            every configured account during anchor resolution.
+        mailbox: Optional folder the message lives in — pass the one
+            ``search_messages`` returned it from. Without it only
+            INBOX and Sent are probed, so a message filed elsewhere
+            by a rule resolves as ``message_not_found``.
 
     Returns:
         Dictionary with the thread list. Rows are metadata-only —
@@ -1592,7 +1602,9 @@ def get_thread(message_id: str) -> dict[str, Any]:
 
         logger.info(f"Getting thread for message: {message_id}")
 
-        thread, degraded_reason = mail._get_thread_with_status(message_id)
+        thread, degraded_reason = mail._get_thread_with_status(
+            message_id, account, mailbox
+        )
 
         operation_logger.log_operation(
             "get_thread", {"message_id": message_id}, "success"
