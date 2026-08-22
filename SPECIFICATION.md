@@ -44,6 +44,7 @@ injection channel into a tool that can delete mail.
 **Out of scope:**
 - **Becoming a general mail client.** Upstream owns the mail feature surface.
 - **Modifying `mail_connector.py`.** Fork behavior lives at the server layer.
+  One live exception: PR #54's `get_thread` hints, upstream-bound (see `ARCHITECTURE.md`).
 - **Gmail-specific workarounds.** Gmail is being migrated to Apple Business
   Enterprise; its AppleScript `-10000` quirks are explicitly not being fixed.
 - **A dedup ledger for retrieval.** The filesystem is already the state (ADR-5).

@@ -2857,6 +2857,16 @@ class AppleMailConnector:
             MailMessageNotFoundError: If no message with the given id exists.
             MailAnchorLookupIncompleteError: If an account could not be
                 checked, so absence was never established (#425).
+
+        Args:
+            message_id: RFC 5322 Message-ID or Mail.app numeric id.
+            account: Optional account the message lives in. Skips the
+                probe across every configured account. Accepts a
+                display name or a UUID.
+            mailbox: Optional folder the message lives in. Probed
+                before folder discovery. Applies to RFC Message-ID
+                (IMAP) resolution only — numeric Mail.app ids still
+                use the legacy AppleScript resolver.
         """
         return self._get_thread_with_status(message_id, account, mailbox)[0]
 
@@ -2986,7 +2996,13 @@ class AppleMailConnector:
         )
         for acct in candidates:
             account_name = cast(str, acct.get("name") or "")
-            if not account_name or self._imap_breaker_open(account_name):
+            if not account_name:
+                continue
+            if self._imap_breaker_open(account_name):
+                # An open breaker means we did not ask this account, so it
+                # cannot contribute to a claim of absence. Skipping it silently
+                # is the #425 bug in another guise.
+                indeterminate.append(account_name)
                 continue
             try:
                 host, port, email = self._resolve_imap_config(account_name)
@@ -3598,12 +3614,16 @@ class AppleMailConnector:
 
         account_name = cast(str, anchor["account"])
         base_subject = normalize_subject(cast(str, anchor["subject"]))
-        account_safe = escape_applescript_string(sanitize_input(account_name))
+        # An account HINT is forwarded verbatim, so anchor["account"] can now
+        # be a UUID — before the hints existed it always came from
+        # list_accounts() and was therefore a display name. account "<uuid>"
+        # matches nothing; the helper emits account id "<uuid>" for that form.
+        account_clause = applescript_account_clause(account_name)
         subject_safe = escape_applescript_string(sanitize_input(base_subject))
 
         candidates_body = f'''
         tell application "Mail"
-            set acctRef to account "{account_safe}"
+            set acctRef to {account_clause}
             set resultData to {{}}
             repeat with mbRef in mailboxes of acctRef
                 try
