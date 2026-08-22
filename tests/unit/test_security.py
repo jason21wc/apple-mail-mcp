@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from apple_mail_fast_mcp import security
 from apple_mail_fast_mcp.security import (
     OPERATION_TIERS,
     TIER_LIMITS,
@@ -684,3 +687,57 @@ class TestTestModeRecipientViolation:
         msg = send_recipients_test_violation([])
         assert msg is not None
         assert "explicit recipients" in msg
+
+
+class TestAccountGatedOperationCoverage:
+    """#FORK — regression tests for a test-mode safety gap.
+
+    `check_test_mode_safety` silently returns None for any operation name not
+    present in one of the gated sets. Three server tools called it with names
+    that were never registered (`update_mailbox`, `delete_mailbox`,
+    `get_statistics`), so the call site LOOKED protected while the helper was a
+    no-op. `delete_mailbox` is destructive and IMAP-only.
+    """
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["update_mailbox", "delete_mailbox", "get_statistics"],
+    )
+    def test_previously_ungated_account_operations_are_blocked(
+        self, operation: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        monkeypatch.setattr(security, "_get_test_account_identifiers", lambda a: {a})
+
+        err = security.check_test_mode_safety(operation, account="RealAccount")
+
+        assert err is not None, f"{operation} passed the safety gate against a non-test account"
+        assert err["success"] is False
+        assert err["error_type"] == "safety_violation"
+
+    def test_every_server_call_site_names_a_registered_operation(self) -> None:
+        """Structural guard: the gap was an omission, not a logic error.
+
+        Adding three names fixes today's bug; this test stops the next one.
+        Every operation name passed to `check_test_mode_safety` from the server
+        must appear in a gated set, or the call site is decorative. Mirrors the
+        philosophy of `check_client_server_parity.sh`.
+        """
+        source = (
+            Path(__file__).resolve().parents[2] / "src" / "apple_mail_fast_mcp" / "server.py"
+        ).read_text()
+
+        called = set(re.findall(r'check_test_mode_safety\(\s*["\']([a-z_]+)["\']', source))
+        assert called, "no call sites parsed — the regex has rotted"
+
+        registered = (
+            security.ACCOUNT_GATED_OPERATIONS
+            | security.SEND_OPERATIONS
+            | security.RULE_GATED_OPERATIONS
+        )
+        assert called <= registered, (
+            "server.py calls check_test_mode_safety with unregistered "
+            f"operation(s) {sorted(called - registered)} — the gate is a "
+            "no-op for them. Add them to the appropriate set in security.py."
+        )

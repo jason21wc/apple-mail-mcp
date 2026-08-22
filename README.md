@@ -103,7 +103,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 ### Optional: split read / write servers
 
-Claude Desktop prompts per-tool for permission. If you want to **batch-approve the 9 read tools** (list / search / get) and still gate the 14 mutating tools per call, run the connector twice — once with `--read-only`, once without — under two separate `mcpServers` entries:
+Claude Desktop prompts per-tool for permission. If you want to **batch-approve the read-only tools** (list / search / get) and still gate the mutating tools per call, run the connector twice — once with `--read-only`, once without — under two separate `mcpServers` entries:
 
 ```json
 {
@@ -119,7 +119,7 @@ Claude Desktop prompts per-tool for permission. If you want to **batch-approve t
 }
 ```
 
-The `--read-only` server exposes only the 9 read tools, so Claude Desktop's per-server permission UI naturally groups them. The full server still gates writes individually. Trade-off: 2× connector processes. See [`docs/reference/TOOLS.md`](docs/reference/TOOLS.md) for the per-tool classification and a note on MCP annotation hints (`readOnlyHint` / `destructiveHint` / `idempotentHint`) which forward-compatible hosts may use to provide the same UX without the split.
+The `--read-only` server exposes only the read-only tools, so Claude Desktop's per-server permission UI naturally groups them. The full server still gates writes individually. Trade-off: 2× connector processes. See [`docs/reference/TOOLS.md`](docs/reference/TOOLS.md) for the per-tool classification and a note on MCP annotation hints (`readOnlyHint` / `destructiveHint` / `idempotentHint`) which forward-compatible hosts may use to provide the same UX without the split.
 
 ## Permissions
 

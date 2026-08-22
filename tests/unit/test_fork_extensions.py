@@ -299,3 +299,60 @@ class TestUntrustedContentMarking:
         assert result["count"] == 0
         assert "content_is_untrusted" not in result
         assert "security_notice" not in result
+
+
+class TestOutputFilenameNoClobber:
+    """#FORK — `output_filename` must not silently destroy an existing file.
+
+    ADR-5 makes incremental retrieval depend on deterministic filenames plus an
+    existence check, but the check lived only in the attachment-retrieval
+    skill's instructions. Caller guidance is not an enforcement boundary: a
+    direct MCP call could overwrite a previously-saved report, and the
+    post-write size prune could then delete the replacement, losing both.
+    """
+
+    def test_existing_destination_is_not_overwritten(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "weekly-report.pdf"
+        target.write_bytes(b"ORIGINAL CONTENT")
+
+        def _fake_save(**kwargs: Any) -> dict[str, Any]:
+            Path(kwargs["save_directory"], "raw.pdf").write_bytes(b"NEW CONTENT")
+            return {"saved": 1, "rejected": []}
+
+        mock_mail.save_attachments.side_effect = _fake_save
+
+        result = save_attachments(
+            message_id="1",
+            save_directory=str(tmp_path),
+            attachment_indices=[0],
+            output_filename="weekly-report.pdf",
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "already_exists"
+        assert target.read_bytes() == b"ORIGINAL CONTENT"
+
+    def test_overwrite_true_replaces_the_file(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "weekly-report.pdf"
+        target.write_bytes(b"ORIGINAL CONTENT")
+
+        def _fake_save(**kwargs: Any) -> dict[str, Any]:
+            Path(kwargs["save_directory"], "raw.pdf").write_bytes(b"NEW CONTENT")
+            return {"saved": 1, "rejected": []}
+
+        mock_mail.save_attachments.side_effect = _fake_save
+
+        result = save_attachments(
+            message_id="1",
+            save_directory=str(tmp_path),
+            attachment_indices=[0],
+            output_filename="weekly-report.pdf",
+            overwrite=True,
+        )
+
+        assert result["success"] is True
+        assert target.read_bytes() == b"NEW CONTENT"

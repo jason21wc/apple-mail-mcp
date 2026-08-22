@@ -1758,6 +1758,7 @@ def save_attachments(
     save_directory: str,
     attachment_indices: IntList | None = None,
     output_filename: str | None = None,
+    overwrite: bool = False,
     account: str | None = None,
     mailbox: str | None = None,
 ) -> dict[str, Any]:
@@ -1771,6 +1772,11 @@ def save_attachments(
         output_filename: Custom filename for the saved attachment (fork mod #2).
             Only valid when saving exactly one attachment (one entry in
             ``attachment_indices``). The name is sanitized for path safety.
+        overwrite: If False (default) and the destination file
+            already exists, the save is refused with
+            error_type='already_exists' and the existing file is
+            left untouched. Only meaningful alongside
+            output_filename.
         account: Mail.app account name or UUID. Supply it (with ``mailbox``)
             to take the faster IMAP path — one fetch instead of an
             account×mailbox AppleScript scan. Pass the same values you read
@@ -1862,10 +1868,25 @@ def save_attachments(
                             "error": "Attachment reported saved but file not found",
                             "error_type": "unknown",
                         }
-                    shutil.move(
-                        str(saved_files[0]),
-                        str(save_path.resolve() / output_filename),
-                    )
+                    destination = save_path.resolve() / output_filename
+                    # No-clobber by default. ADR-5 makes incremental retrieval
+                    # depend on deterministic names plus an existence check;
+                    # enforcing that here rather than in caller instructions is
+                    # what makes a re-run safe. The staged temp file is
+                    # discarded with the TemporaryDirectory.
+                    if destination.exists() and not overwrite:
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Refusing to overwrite existing file: "
+                                f"{destination}. Pass overwrite=True to "
+                                f"replace it."
+                            ),
+                            "error_type": "already_exists",
+                            "filename": output_filename,
+                            "directory": str(save_path),
+                        }
+                    shutil.move(str(saved_files[0]), str(destination))
                     final_filename = output_filename
         else:
             result = mail.save_attachments(

@@ -401,6 +401,15 @@ ACCOUNT_GATED_OPERATIONS = {
     "update_message",
     "create_mailbox",
     "delete_messages",
+    # An operation absent from this set makes check_test_mode_safety a silent
+    # no-op, so a call site can LOOK guarded while being wide open. These three
+    # were exactly that: server.py passed them in, the helper never matched,
+    # and delete_mailbox -- destructive and IMAP-only -- was reachable against
+    # a real account under MAIL_TEST_MODE. TestAccountGatedOperationCoverage
+    # guards against the next omission.
+    "update_mailbox",
+    "delete_mailbox",
+    "get_statistics",
 }
 
 SEND_OPERATIONS = {
