@@ -442,7 +442,7 @@ class TestGetThreadMailboxHints:
     """get_thread must be able to reach a message filed outside INBOX.
 
     Live-reproduced 2026-08-22 on a real iCloud account: messages returned by
-    search_messages from `Investments Current/CHMG` were reported
+    search_messages from `Projects/Filed` were reported
     message_not_found by get_thread, because anchor resolution only probes
     INBOX + Sent (no Gmail All-Mail on iCloud). The hints close that gap
     without reintroducing the unindexed all-mailbox scan #415 removed.
@@ -452,19 +452,19 @@ class TestGetThreadMailboxHints:
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
         mock_mail._get_thread_with_status.return_value = (
-            [{"id": "1", "subject": "S", "sender": "dave@example.com"}],
+            [{"id": "1", "subject": "S", "sender": "sender@example.com"}],
             None,
         )
 
         result = get_thread(
             "abc@example.com",
             account="iCloud",
-            mailbox="Investments Current/CHMG",
+            mailbox="Projects/Filed",
         )
 
         assert result["success"] is True
         mock_mail._get_thread_with_status.assert_called_once_with(
-            "abc@example.com", "iCloud", "Investments Current/CHMG"
+            "abc@example.com", "iCloud", "Projects/Filed"
         )
 
     def test_hints_are_optional(
@@ -579,3 +579,14 @@ class TestSaveDirectoryTildeExpansion:
         mock_mail.save_attachments.return_value = {"saved": 1, "rejected": []}
         result = save_attachments(message_id="1", save_directory=str(tmp_path))
         assert result["success"] is True
+
+    def test_unresolvable_tilde_user_is_a_validation_error(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """`~nosuchuser/x` makes expanduser raise RuntimeError, which used to
+        surface as error_type "unknown"."""
+        result = save_attachments(
+            message_id="1", save_directory="~nosuchuser-zz/whatever"
+        )
+        assert result["success"] is False
+        assert result["error_type"] in ("validation_error", "directory_not_found")

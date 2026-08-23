@@ -32,6 +32,7 @@ from .drafts import _validate_draft_id
 from .exceptions import (
     MailAccountNotFoundError,
     MailAnchorLookupIncompleteError,
+    MailAnchorProbeIncompleteError,
     MailAppleScriptError,
     MailAttachmentIndexError,
     MailAttachmentTooLargeError,
@@ -3020,9 +3021,19 @@ class AppleMailConnector:
                 # account. Stable, not transient — not indeterminate.
                 self._log_imap_fallback(account_name, exc)
                 continue
+            except MailAnchorProbeIncompleteError as exc:
+                # A folder did not answer, but the SESSION is healthy. Record
+                # the account as indeterminate WITHOUT _log_imap_fallback,
+                # which would open the account-wide breaker and let one bad
+                # mailbox hint degrade every later IMAP call on this account.
+                logger.debug(
+                    "anchor probe incomplete on %s: %s", account_name, exc
+                )
+                indeterminate.append(account_name)
+                continue
             except _IMAP_FALLBACK_EXCS as exc:
-                # Timeout / connect failure / rejected credentials. This
-                # account was NOT checked; remember that before moving on.
+                # Timeout / connect failure / rejected credentials. The session
+                # really is unhealthy — open the breaker.
                 self._log_imap_fallback(account_name, exc)
                 indeterminate.append(account_name)
                 continue

@@ -24,6 +24,8 @@ weekly property reports — into local folders, incrementally and undoably.
     ai-governance-proxy  (HARD MODE — the only supported entry point)
               |
     apple_mail_fast_mcp.server   FastMCP tool surface  <-- both fork mods live here
+              |                          (plus a TEMPORARY connector exception,
+              |                           upstream PR #439 — see ADR-3)
               |
       +-------+-------+
       |               |
@@ -41,7 +43,7 @@ weekly property reports — into local folders, incrementally and undoably.
 | `mail_connector.py` | AppleScript generation and execution. | Tool contracts. **Upstream-owned — the fork does not modify it.** |
 | `imap_connector.py` / `smtp_sender.py` | Direct IMAP reads and SMTP submission. | Fallback policy (the connector decides). |
 | `security.py` | Input sanitization, AppleScript escaping, path-traversal-safe name validation, audit logging, test-mode safety gate. | Business rules. |
-| ai-governance-proxy | Enforcement. Runs *outside* this repo. | Anything in the mail domain. |
+| ai-governance-proxy | **Call-ORDER gating only.** Blocks a tool until `evaluate_governance` has been called within 300s, then forwards. Runs *outside* this repo. | Verdicts. It never reads PROCEED/REVIEW/ESCALATE — it is NOT an approval gate. Measured 2026-08-22. |
 | `.claude/skills/attachment-retrieval/` | Recipe-based attachment grabs + append-only undo log. **Fork-only.** | Any server behavior — it is a caller, not a component. |
 
 ## The Fork Boundary
@@ -93,8 +95,7 @@ externally-sent hotel PDFs — which is why fork modification #2 exists: upstrea
 `prompt_injection` flag covers message *bodies*, not attachment *payloads*.
 The marking is a signal to the consuming model, not enforcement.
 
-**Input handling.** All user input is sanitized twice — `sanitize_input()` then
-`escape_applescript_string()` — before reaching AppleScript. Any name used as a
+**Input handling.** Input bound for AppleScript is sanitized twice — `sanitize_input()` then `escape_applescript_string()`. That pairing is specific to the AppleScript boundary and is not a blanket guarantee: other boundaries have their own rules (an IMAP mailbox name is checked for control characters only, because `/`, quotes and Unicode are legitimate folder syntax there). Any name used as a
 filename stem is regex-validated *before* a path is built; never `Path(user_input)`.
 
 **Credentials.** IMAP/SMTP share one per-account app password, supplied by env
@@ -110,8 +111,14 @@ from disk; git never sees it.
 ## Architecture Decisions
 
 **ADR-1 — Run only behind ai-governance-proxy, hard mode.** The server can read
-and delete real mail. Enforcement belongs outside the thing being enforced.
-*Consequence:* never launch the server directly, in any environment.
+and delete real mail. *Consequence:* never launch the server directly, in any
+environment. **But be precise about what it buys:** measured 2026-08-22, the
+proxy gates call ORDER, not outcomes — it blocks a tool until
+`evaluate_governance` has been called within 300s, then forwards, and never
+reads the verdict. One governance call clears every tool for the rest of that
+window (observed live: `save_attachments` gated, `update_message` ungated
+immediately after). The controls a model cannot reach are the `--read-only`
+launch flag and the server-side elicitation gates, which fail closed.
 
 **ADR-2 — Keep the fork thin; converge upstream.** *Rationale:* merge cost
 scales with divergence in shared hot files. *Consequence:* new capability is
@@ -127,10 +134,14 @@ where it is testable and merge-safe.
 threat surface. *Consequence:* a deliberate divergence, retired once upstream
 adopts payload marking.
 
-**ADR-5 — Incremental retrieval by deterministic filename + `exists()`, not a
-dedup ledger.** *Rationale:* a ledger is state that can desynchronize from the
-filesystem; the filesystem is already the state. *Consequence:* fork
-modification #1 exists to make filenames deterministic.
+**ADR-5 — Incremental retrieval by deterministic filename + an ATOMIC
+no-clobber commit, not a dedup ledger.** *Rationale:* a ledger is state that can
+desynchronize from the filesystem; the filesystem is already the state.
+*Consequence:* fork modification #1 exists to make filenames deterministic. The
+guard is `os.link` (and `os.replace` for an explicit overwrite), NOT a
+check-then-act `exists()` test — a separate existence check leaves a window in
+which two concurrent saves both write, which is what the original
+implementation did.
 
 **ADR-6 — `_ai-context/` is gitignored, deviating from the framework default.**
 *Rationale:* public repo, private business content. *Consequence:* no team
