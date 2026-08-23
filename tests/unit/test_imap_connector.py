@@ -8,7 +8,10 @@ import pytest
 from imapclient.exceptions import IMAPClientError
 from imapclient.response_types import Address, Envelope
 
-from apple_mail_fast_mcp.exceptions import MailMessageNotFoundError
+from apple_mail_fast_mcp.exceptions import (
+    MailAnchorProbeIncompleteError,
+    MailMessageNotFoundError,
+)
 from apple_mail_fast_mcp.imap_connector import (
     _MSGID_SEARCH_CHUNK,
     CONNECT_TIMEOUT_S,
@@ -3984,20 +3987,20 @@ class TestAnchorProbeMailboxHint:
 
     def test_hinted_mailbox_is_probed_first(self) -> None:
         conn = ImapConnector("imap.mail.me.com", 993, "u@e.com", "pw")
-        client = self._client(["INBOX", "Sent", "Investments/CHMG"])
+        client = self._client(["INBOX", "Sent", "Projects/Filed"])
 
-        folders = list(conn._anchor_probe_folders(client, "Investments/CHMG"))
+        folders = list(conn._anchor_probe_folders(client, "Projects/Filed"))
 
-        assert folders[0] == "Investments/CHMG", (
+        assert folders[0] == "Projects/Filed", (
             "the caller's hint must be probed before the bounded set"
         )
 
     def test_bounded_set_still_probed_after_the_hint(self) -> None:
         """The hint ADDS a folder; it does not narrow the search."""
         conn = ImapConnector("imap.mail.me.com", 993, "u@e.com", "pw")
-        client = self._client(["INBOX", "Sent", "Investments/CHMG"])
+        client = self._client(["INBOX", "Sent", "Projects/Filed"])
 
-        folders = list(conn._anchor_probe_folders(client, "Investments/CHMG"))
+        folders = list(conn._anchor_probe_folders(client, "Projects/Filed"))
 
         assert "INBOX" in folders
 
@@ -4012,12 +4015,12 @@ class TestAnchorProbeMailboxHint:
     def test_no_hint_preserves_the_bounded_set_exactly(self) -> None:
         """Regression guard: the #415 cost profile is unchanged without a hint."""
         conn = ImapConnector("imap.mail.me.com", 993, "u@e.com", "pw")
-        client = self._client(["INBOX", "Sent", "Investments/CHMG"])
+        client = self._client(["INBOX", "Sent", "Projects/Filed"])
 
         assert list(conn._anchor_probe_folders(client)) == list(
             conn._anchor_probe_folders(client, None)
         )
-        assert "Investments/CHMG" not in list(conn._anchor_probe_folders(client))
+        assert "Projects/Filed" not in list(conn._anchor_probe_folders(client))
 
 
 class TestAnchorProbeEvidenceOfAbsence:
@@ -4045,7 +4048,7 @@ class TestAnchorProbeEvidenceOfAbsence:
 
         with patch.object(conn, "_session") as sess:
             sess.return_value.__enter__.return_value = client
-            with pytest.raises(IMAPClientError, match="absence was not"):
+            with pytest.raises(MailAnchorProbeIncompleteError, match="absence was not"):
                 conn.resolve_anchor("abc@example.com", "Filed/Somewhere")
 
     def test_search_failure_does_not_become_absence(self) -> None:
@@ -4055,7 +4058,7 @@ class TestAnchorProbeEvidenceOfAbsence:
 
         with patch.object(conn, "_session") as sess:
             sess.return_value.__enter__.return_value = client
-            with pytest.raises(IMAPClientError, match="absence was not"):
+            with pytest.raises(MailAnchorProbeIncompleteError, match="absence was not"):
                 conn.resolve_anchor("abc@example.com")
 
     def test_fetch_failure_does_not_become_absence(self) -> None:
@@ -4067,7 +4070,7 @@ class TestAnchorProbeEvidenceOfAbsence:
 
         with patch.object(conn, "_session") as sess:
             sess.return_value.__enter__.return_value = client
-            with pytest.raises(IMAPClientError, match="absence was not"):
+            with pytest.raises(MailAnchorProbeIncompleteError, match="absence was not"):
                 conn.resolve_anchor("abc@example.com")
 
     def test_clean_empty_search_still_returns_none(self) -> None:
@@ -4094,7 +4097,7 @@ class TestAnchorProbeEvidenceOfAbsence:
         with patch.object(conn, "_session") as sess:
             sess.return_value.__enter__.return_value = client
             # Hierarchy separators, spaces and Unicode are all valid.
-            assert conn.resolve_anchor("a@b.com", "Investments/CHMG 한글") is None
+            assert conn.resolve_anchor("a@b.com", "Projects/Filed 한글") is None
 
     def test_hinted_folder_resolving_immediately_costs_no_list(self) -> None:
         """The hint is probed before discovery, not merely ordered first."""

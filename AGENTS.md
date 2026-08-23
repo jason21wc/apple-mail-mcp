@@ -81,8 +81,9 @@ you touched AppleScript, integration tests must cover it before merge.
 
 ```
 src/apple_mail_fast_mcp/
-  mail_connector.py    AppleScript client (upstream-owned; the fork does not modify it)
-  imap_connector.py    Direct-IMAP fast path
+  mail_connector.py    AppleScript client (upstream-owned; ONE temporary fork
+                       exception — get_thread hints, upstream PR #439)
+  imap_connector.py    Direct-IMAP fast path (same temporary exception)
   smtp_sender.py       SMTP submission for send_now
   server.py            FastMCP server — where BOTH fork modifications live
   security.py          Input validation, audit logging, test-mode safety gate

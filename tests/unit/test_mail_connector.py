@@ -15,6 +15,7 @@ from imapclient.exceptions import LoginError
 from apple_mail_fast_mcp.exceptions import (
     MailAccountNotFoundError,
     MailAnchorLookupIncompleteError,
+    MailAnchorProbeIncompleteError,
     MailAppleScriptError,
     MailDraftInvalidIdError,
     MailDraftNotFoundError,
@@ -9596,7 +9597,8 @@ class TestGetThreadNeverScansForRfcId:
         )
         monkeypatch.setattr(
             connector, "_resolve_anchor_via_imap",
-            lambda mid, *a, **k: {"account": "Gmail", "rfc_message_id": "abc@x",
+            lambda mid, account=None, mailbox=None: {
+                "account": "Gmail", "rfc_message_id": "abc@x",
                          "references": [], "subject": "Hi"},
         )
         monkeypatch.setattr(connector, "_imap_breaker_open", lambda a: False)
@@ -9823,3 +9825,60 @@ class TestNumericAnchorBoundedProbe:
         monkeypatch.setattr(connector, "_imap_get_thread", lambda a: [])
 
         connector.get_thread("12345")
+
+
+class TestBadMailboxHintDoesNotOpenBreaker:
+    """A failed folder probe must not degrade the whole account.
+
+    resolve_anchor signals an incomplete probe so #425 can mark the account
+    indeterminate. Signalling that with IMAPClientError routed it through
+    _log_imap_fallback, which OPENS the account-wide circuit breaker — so one
+    bad mailbox hint made every later IMAP call on a healthy account fall back
+    to AppleScript. The session was never unhealthy; one folder just failed.
+    """
+
+    def _conn(self, monkeypatch: pytest.MonkeyPatch, raises: Exception) -> Any:
+        from apple_mail_fast_mcp.imap_connector import ImapConnector
+
+        conn = AppleMailConnector()
+        monkeypatch.setattr(conn, "list_accounts", lambda: [{"name": "iCloud"}])
+        monkeypatch.setattr(
+            conn, "_resolve_imap_config", lambda a: ("h", 993, "e@x.com")
+        )
+        monkeypatch.setattr(
+            conn, "_get_imap_password_with_fallback", lambda a, e: "pw"
+        )
+
+        def _raise(self: Any, mid: str, mailbox: str | None = None) -> None:
+            raise raises
+
+        monkeypatch.setattr(ImapConnector, "resolve_anchor", _raise)
+        return conn
+
+    def test_incomplete_probe_leaves_breaker_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = self._conn(
+            monkeypatch,
+            MailAnchorProbeIncompleteError("folder did not answer"),
+        )
+
+        with pytest.raises(MailAnchorLookupIncompleteError):
+            conn._resolve_anchor_via_imap("a@b.com", "iCloud", "Bad/Hint")
+
+        assert not conn._imap_breaker_open("iCloud"), (
+            "a bad mailbox hint opened the account-wide IMAP breaker — later "
+            "valid calls on this healthy account would be degraded"
+        )
+
+    def test_real_transport_failure_still_opens_breaker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The distinction must cut both ways: a genuinely unhealthy session
+        still trips the breaker."""
+        conn = self._conn(monkeypatch, OSError("connection reset"))
+
+        with pytest.raises(MailAnchorLookupIncompleteError):
+            conn._resolve_anchor_via_imap("a@b.com", "iCloud", "INBOX")
+
+        assert conn._imap_breaker_open("iCloud")

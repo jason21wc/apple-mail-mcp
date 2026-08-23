@@ -1857,7 +1857,16 @@ def save_attachments(
         # valid "~/Desktop/mcp-test" is used literally and reported as
         # directory_not_found, which reads as "your folder is missing" when
         # the real answer is "this tool wanted an absolute path".
-        save_path = Path(save_directory).expanduser()
+        try:
+            save_path = Path(save_directory).expanduser()
+        except RuntimeError as e:
+            # `~nosuchuser/...` — expanduser cannot resolve the home dir.
+            # Without this it surfaced as error_type "unknown".
+            return {
+                "success": False,
+                "error": f"Cannot expand path {save_directory!r}: {e}",
+                "error_type": "validation_error",
+            }
 
         # Validate directory
         if not save_path.exists():
