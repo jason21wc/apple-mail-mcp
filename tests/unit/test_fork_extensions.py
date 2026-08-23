@@ -546,3 +546,36 @@ class TestGetThreadHintFailurePaths:
 
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
+
+
+class TestSaveDirectoryTildeExpansion:
+    """`~` must expand. Live-hit 2026-08-22: `~/Desktop/mcp-test/` returned
+    directory_not_found on a machine where the folder existed, because the
+    path was used literally. Every caller had to know to pass an absolute
+    path, and nothing said so."""
+
+    def test_tilde_path_is_expanded(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        target = tmp_path / "Desktop" / "mcp-test"
+        target.mkdir(parents=True)
+        mock_mail.save_attachments.return_value = {"saved": 1, "rejected": []}
+
+        result = save_attachments(
+            message_id="1", save_directory="~/Desktop/mcp-test"
+        )
+
+        assert result["success"] is True, result
+        # The connector must receive the EXPANDED path, not the literal tilde.
+        passed = mock_mail.save_attachments.call_args.kwargs["save_directory"]
+        assert "~" not in str(passed)
+        assert Path(passed) == target
+
+    def test_absolute_paths_still_work(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_mail.save_attachments.return_value = {"saved": 1, "rejected": []}
+        result = save_attachments(message_id="1", save_directory=str(tmp_path))
+        assert result["success"] is True

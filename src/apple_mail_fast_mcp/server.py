@@ -1808,7 +1808,8 @@ def save_attachments(
 
     Args:
         message_id: Message ID from search results
-        save_directory: Directory path to save attachments to
+        save_directory: Directory path to save attachments. ``~`` is
+            expanded. The directory must already exist — it is not created to
         attachment_indices: Specific attachment indices to save (0-based), None for all
         output_filename: Custom filename for the saved attachment (fork mod #2).
             Only valid when saving exactly one attachment (one entry in
@@ -1852,7 +1853,11 @@ def save_attachments(
         if rate_err:
             return rate_err
 
-        save_path = Path(save_directory)
+        # Expand `~` before any existence check. Without this a perfectly
+        # valid "~/Desktop/mcp-test" is used literally and reported as
+        # directory_not_found, which reads as "your folder is missing" when
+        # the real answer is "this tool wanted an absolute path".
+        save_path = Path(save_directory).expanduser()
 
         # Validate directory
         if not save_path.exists():
