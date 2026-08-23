@@ -344,7 +344,7 @@ Save attachments from a message to a directory.
 **Parameters:**
 
 - `message_id` (string, required): Message ID from search results
-- `save_directory` (string, required): Directory path to save attachments to
+- `save_directory` (string, required): Directory path to save attachments. ``~`` is expanded. The directory must already exist — it is not created to
 - `attachment_indices` (list[integer], optional): Specific attachment indices to save (0-based), None for all
 - `output_filename` (string, optional): Custom filename for the saved attachment (fork mod #2). Only valid when saving exactly one attachment (one entry in ``attachment_indices``). The name is sanitized for path safety.
 - `account` (string, optional): Mail.app account name or UUID. Supply it (with ``mailbox``) to take the faster IMAP path — one fetch instead of an account×mailbox AppleScript scan. Pass the same values you read the message with so attachment ordering matches (#371). Strongly recommended on Gmail, where the AppleScript fallback's unindexed cross-scan can take minutes and time out.

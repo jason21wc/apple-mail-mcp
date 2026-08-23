@@ -641,7 +641,7 @@ Save attachments from a message to a directory.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `message_id` | string | Yes | - | Message ID to save attachments from |
-| `save_directory` | string | Yes | - | Directory path to save attachments |
+| `save_directory` | string | Yes | - | Directory path to save attachments. `~` is expanded. Must already exist — the tool does not create it (`directory_not_found` otherwise). |
 | `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
 | `output_filename` | string | No | None | **Fork extension.** Save under this exact (sanitized) name instead of the attachment's own. Requires exactly one entry in `attachment_indices`. |
 | `overwrite` | bool | No | `false` | Only meaningful with `output_filename`. Default is **no-clobber**: an existing destination is left untouched and the call returns `error_type: "already_exists"`. `true` replaces it atomically. |
