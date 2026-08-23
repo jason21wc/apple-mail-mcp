@@ -32,6 +32,7 @@ from .drafts import _validate_draft_id
 from .exceptions import (
     MailAccountNotFoundError,
     MailAnchorLookupIncompleteError,
+    MailAnchorProbeIncompleteError,
     MailAppleScriptError,
     MailAttachmentIndexError,
     MailAttachmentTooLargeError,
@@ -2839,9 +2840,16 @@ class AppleMailConnector:
         gets working threading via AppleScript.
 
         Args:
-            message_id: Internal Mail.app id of any message in the thread
-                (the anchor). Typically obtained from search_messages or
-                get_message results.
+            message_id: RFC 5322 Message-ID, or the internal Mail.app id of
+                any message in the thread (the anchor). Typically obtained
+                from search_messages or get_message results.
+            account: Optional account the message lives in. Narrows anchor
+                resolution to that one account instead of probing each in
+                turn. Accepts a display name or a UUID.
+            mailbox: Optional folder the message lives in — pass the one
+                search_messages returned it from. Probed before folder
+                discovery. Applies to RFC Message-ID (IMAP) resolution only;
+                numeric Mail.app ids still use the AppleScript resolver.
 
         Returns:
             List of message dicts sorted by date_received ascending. Each
@@ -2857,16 +2865,6 @@ class AppleMailConnector:
             MailMessageNotFoundError: If no message with the given id exists.
             MailAnchorLookupIncompleteError: If an account could not be
                 checked, so absence was never established (#425).
-
-        Args:
-            message_id: RFC 5322 Message-ID or Mail.app numeric id.
-            account: Optional account the message lives in. Skips the
-                probe across every configured account. Accepts a
-                display name or a UUID.
-            mailbox: Optional folder the message lives in. Probed
-                before folder discovery. Applies to RFC Message-ID
-                (IMAP) resolution only — numeric Mail.app ids still
-                use the legacy AppleScript resolver.
         """
         return self._get_thread_with_status(message_id, account, mailbox)[0]
 
@@ -3020,9 +3018,19 @@ class AppleMailConnector:
                 # account. Stable, not transient — not indeterminate.
                 self._log_imap_fallback(account_name, exc)
                 continue
+            except MailAnchorProbeIncompleteError as exc:
+                # A folder did not answer, but the SESSION is healthy. Record
+                # the account as indeterminate WITHOUT _log_imap_fallback,
+                # which would open the account-wide breaker and let one bad
+                # mailbox hint degrade every later IMAP call on this account.
+                logger.debug(
+                    "anchor probe incomplete on %s: %s", account_name, exc
+                )
+                indeterminate.append(account_name)
+                continue
             except _IMAP_FALLBACK_EXCS as exc:
-                # Timeout / connect failure / rejected credentials. This
-                # account was NOT checked; remember that before moving on.
+                # Timeout / connect failure / rejected credentials. The session
+                # really is unhealthy — open the breaker.
                 self._log_imap_fallback(account_name, exc)
                 indeterminate.append(account_name)
                 continue

@@ -42,6 +42,7 @@ from imapclient.response_types import Envelope
 
 from .draft_builder import ForwardedAttachment, extract_attachment_payloads
 from .exceptions import (
+    MailAnchorProbeIncompleteError,
     MailImapMoveUnsupportedError,
     MailImapTrashNotFoundError,
     MailMessageNotFoundError,
@@ -1420,7 +1421,11 @@ class ImapConnector:
             # Not found AND not ruled out. Raising (rather than returning None)
             # is what makes _resolve_anchor_via_imap mark this account
             # indeterminate instead of concluding absence. (#425)
-            raise IMAPClientError(
+            # NOT IMAPClientError: that type means the session is unhealthy
+            # and the caller opens the account-wide circuit breaker on it. The
+            # connection is fine here — one folder just did not answer, so a
+            # bad mailbox hint must not degrade later calls on this account.
+            raise MailAnchorProbeIncompleteError(
                 f"anchor probe for {message_id!r} did not complete: at least "
                 f"one folder failed to answer, so absence was not established"
             )
