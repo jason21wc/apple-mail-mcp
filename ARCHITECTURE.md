@@ -147,6 +147,26 @@ implementation did.
 *Rationale:* public repo, private business content. *Consequence:* no team
 memory sharing through git — acceptable for a solo fork; revisit if that changes.
 
+**ADR-8 — Gate on the EFFECT, never on the tool name.** *Rationale:* the
+approval policy is consequence-based, but each gate was written inside its own
+tool, so two tools reaching the same end state carried different gates —
+`update_message(destination_mailbox="Trash")` reached `delete_messages`' outcome
+with no confirmation. *Consequence:* a gate is chosen by what a call does, and
+the check must cover every name the effect goes by (Trash / Deleted Messages /
+Deleted Items). To audit this policy, enumerate reachable END STATES and ask
+which tools can produce each one — a per-tool walk cannot see an
+equivalent-outcome bypass. Upstream #440 tracks the structural fix: tools
+declaring their effect, with one enforcement point.
+
+**ADR-9 — Prefer the weakest gate that closes the hole.** *Rationale:* an
+explicit `overwrite=True` already IS the caller's consent; a confirmation
+prompt on top adds friction without protection, and forced `save_template`
+async at the cost of 13 unrelated test conversions. *Consequence:* no-clobber
+defaults with an explicit opt-out are the house pattern (`save_attachments`,
+`save_template`); reserve elicitation for effects the caller cannot undo and
+did not name. Check what the sibling tool already does before inventing a
+stronger gate.
+
 **ADR-7 — Derivable facts are never pinned in instruction files.** *Rationale:*
 test counts and tool counts drift every PR; a pinned number rots and then
 misleads. *Consequence:* instruction files point at `make test` and
