@@ -16,18 +16,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from apple_mail_fast_mcp.server import (
     _UNTRUSTED_CONTENT_NOTICE,
     _mark_untrusted,
+    delete_rule,
     get_attachment_content,
     get_messages,
     get_thread,
     save_attachments,
+    save_template,
     search_messages,
+    update_message,
 )
 
 
@@ -590,3 +593,116 @@ class TestSaveDirectoryTildeExpansion:
         )
         assert result["success"] is False
         assert result["error_type"] in ("validation_error", "directory_not_found")
+
+
+class TestConsequenceGating:
+    """#FORK — gate on what a call DOES, not which tool was called.
+
+    The policy is consequence-based, but each gate was written per tool, so two
+    tools reaching the same end state carried different gates. Upstream #440
+    tracks the structural fix; these close the verified instances.
+    """
+
+    @pytest.mark.asyncio
+    async def test_moving_to_trash_requires_confirmation(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """update_message(destination_mailbox="Trash") reaches delete_messages'
+        end state — up to 100 messages in Trash — and must confirm too."""
+        with patch(
+            "apple_mail_fast_mcp.server._elicit_confirmation",
+            new_callable=AsyncMock,
+        ) as elicit:
+            elicit.return_value = {"success": False, "error_type": "cancelled"}
+            result = await update_message(
+                ["1", "2"], destination_mailbox="Trash", ctx=None
+            )
+
+        assert elicit.called, "a bulk move to Trash was not confirmed"
+        assert result["error_type"] == "cancelled"
+        mock_mail.update_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mailbox", ["Trash", "trash", "Deleted Messages", "Deleted Items"]
+    )
+    async def test_trash_detection_covers_provider_names(
+        self, mailbox: str, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """iCloud says 'Deleted Messages', Outlook 'Deleted Items'. Gating on
+        the literal string 'Trash' would miss the ones that matter."""
+        with patch(
+            "apple_mail_fast_mcp.server._elicit_confirmation",
+            new_callable=AsyncMock,
+        ) as elicit:
+            elicit.return_value = {"success": False, "error_type": "cancelled"}
+            await update_message(["1"], destination_mailbox=mailbox, ctx=None)
+
+        assert elicit.called, f"move to {mailbox!r} was not treated as a delete"
+
+    @pytest.mark.asyncio
+    async def test_ordinary_move_still_unconfirmed(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """Reversible moves stay unprompted — that is the policy, not an
+        oversight."""
+        mock_mail.update_message.return_value = 1
+        with patch(
+            "apple_mail_fast_mcp.server._elicit_confirmation",
+            new_callable=AsyncMock,
+        ) as elicit:
+            result = await update_message(
+                ["1"], destination_mailbox="Archive", ctx=None
+            )
+
+        assert not elicit.called
+        assert result["success"] is True
+
+    def test_save_template_refuses_silent_overwrite(
+        self, mock_logger: MagicMock, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Its docstring opened 'Create or overwrite' — destroying an existing
+        template was indistinguishable from creating a new one."""
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        first = save_template(name="weekly", body="original")
+        assert first["success"] is True
+
+        second = save_template(name="weekly", body="replacement")
+        assert second["success"] is False
+        assert second["error_type"] == "already_exists"
+
+    def test_save_template_overwrite_true_replaces(
+        self, mock_logger: MagicMock, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        save_template(name="weekly", body="original")
+        result = save_template(
+            name="weekly", body="replacement", overwrite=True
+        )
+        assert result["success"] is True
+
+
+    @pytest.mark.asyncio
+    async def test_rule_index_revalidated_after_confirmation(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """The prompt names a rule by index, and rules can be reordered while
+        it is open. Without a re-check the user confirms one rule and a
+        different one is deleted — TOCTOU with a human-length window."""
+        names = iter(["Archive newsletters", "Forward to accountant"])
+
+        with patch(
+            "apple_mail_fast_mcp.server._resolve_rule_name",
+            side_effect=lambda idx: next(names),
+        ), patch(
+            "apple_mail_fast_mcp.server._elicit_confirmation",
+            new_callable=AsyncMock,
+        ) as elicit:
+            elicit.return_value = None  # user approves what they were shown
+            result = await delete_rule(rule_index=0, ctx=None)
+
+        assert result["success"] is False
+        assert result["error_type"] == "target_changed"
+        mock_mail.delete_rule.assert_not_called()

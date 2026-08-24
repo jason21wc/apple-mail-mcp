@@ -1670,29 +1670,32 @@ class TestGetMessages:
 class TestUpdateMessage:
     # ---- Validation -----------------------------------------------------
 
-    def test_no_fields_returns_validation_error(
+    @pytest.mark.asyncio
+    async def test_no_fields_returns_validation_error(
         self, mock_mail: MagicMock
     ) -> None:
         """At least one mutation field is required."""
-        result = update_message(["1"])
+        result = await update_message(["1"])
 
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
         mock_mail.update_message.assert_not_called()
 
-    def test_empty_message_ids_returns_validation_error(
+    @pytest.mark.asyncio
+    async def test_empty_message_ids_returns_validation_error(
         self, mock_mail: MagicMock
     ) -> None:
-        result = update_message([], read_status=True)
+        result = await update_message([], read_status=True)
 
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
         mock_mail.update_message.assert_not_called()
 
-    def test_over_limit_fails_validation(
+    @pytest.mark.asyncio
+    async def test_over_limit_fails_validation(
         self, mock_mail: MagicMock
     ) -> None:
-        result = update_message([str(i) for i in range(101)], read_status=True)
+        result = await update_message([str(i) for i in range(101)], read_status=True)
 
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
@@ -1700,12 +1703,13 @@ class TestUpdateMessage:
 
     # ---- Individual fields ----------------------------------------------
 
-    def test_read_status_only(
+    @pytest.mark.asyncio
+    async def test_read_status_only(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        result = update_message(["1"], read_status=True)
+        result = await update_message(["1"], read_status=True)
 
         assert result["success"] is True
         assert result["updated"] == 1
@@ -1715,33 +1719,36 @@ class TestUpdateMessage:
         assert kwargs["flag_color"] is None
         assert kwargs["destination_mailbox"] is None
 
-    def test_flagged_only(
+    @pytest.mark.asyncio
+    async def test_flagged_only(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        update_message(["1"], flagged=True)
+        await update_message(["1"], flagged=True)
 
         kwargs = mock_mail.update_message.call_args.kwargs
         assert kwargs["flagged"] is True
         assert kwargs["flag_color"] is None
 
-    def test_flag_color_only(
+    @pytest.mark.asyncio
+    async def test_flag_color_only(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        update_message(["1"], flag_color="red")
+        await update_message(["1"], flag_color="red")
 
         kwargs = mock_mail.update_message.call_args.kwargs
         assert kwargs["flag_color"] == "red"
 
-    def test_destination_mailbox_only(
+    @pytest.mark.asyncio
+    async def test_destination_mailbox_only(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        update_message(
+        await update_message(
             ["1"], destination_mailbox="Archive", account="Gmail"
         )
 
@@ -1751,12 +1758,13 @@ class TestUpdateMessage:
 
     # ---- Combinations (single-pass, AC #2) ------------------------------
 
-    def test_combined_read_and_move(
+    @pytest.mark.asyncio
+    async def test_combined_read_and_move(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        update_message(
+        await update_message(
             ["1"],
             read_status=True,
             destination_mailbox="Archive",
@@ -1772,12 +1780,13 @@ class TestUpdateMessage:
         # All passed in a single connector call — implies single AppleScript pass.
         assert mock_mail.update_message.call_count == 1
 
-    def test_combined_flag_and_move(
+    @pytest.mark.asyncio
+    async def test_combined_flag_and_move(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        update_message(
+        await update_message(
             ["1"],
             flag_color="red",
             destination_mailbox="Archive",
@@ -1788,14 +1797,15 @@ class TestUpdateMessage:
         assert kwargs["flag_color"] == "red"
         assert kwargs["destination_mailbox"] == "Archive"
 
-    def test_all_fields_combined_single_pass(
+    @pytest.mark.asyncio
+    async def test_all_fields_combined_single_pass(
         self, mock_mail: MagicMock
     ) -> None:
         """All mutation fields combine into one connector call (one
         AppleScript pass / one IMAP STORE+MOVE)."""
         mock_mail.update_message.return_value = 2
 
-        update_message(
+        await update_message(
             ["1", "2"],
             read_status=True,
             flag_color="orange",
@@ -1808,12 +1818,13 @@ class TestUpdateMessage:
 
     # ---- Narrow-path passthrough (AC #7) --------------------------------
 
-    def test_narrow_path_account_and_source_mailbox(
+    @pytest.mark.asyncio
+    async def test_narrow_path_account_and_source_mailbox(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        update_message(
+        await update_message(
             ["1"],
             read_status=True,
             account="Gmail",
@@ -1826,12 +1837,13 @@ class TestUpdateMessage:
 
     # ---- gmail_mode passthrough -----------------------------------------
 
-    def test_gmail_mode_passes_through(
+    @pytest.mark.asyncio
+    async def test_gmail_mode_passes_through(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.return_value = 1
 
-        update_message(
+        await update_message(
             ["1"],
             destination_mailbox="Archive",
             account="Gmail",
@@ -1843,13 +1855,14 @@ class TestUpdateMessage:
 
     # ---- Trash-restore semantics (AC #6) --------------------------------
 
-    def test_trash_restore_works(
+    @pytest.mark.asyncio
+    async def test_trash_restore_works(
         self, mock_mail: MagicMock
     ) -> None:
         """update_message can move messages out of Trash — no special verb."""
         mock_mail.update_message.return_value = 1
 
-        update_message(
+        await update_message(
             ["1"],
             destination_mailbox="INBOX",
             account="iCloud",
@@ -1862,41 +1875,45 @@ class TestUpdateMessage:
 
     # ---- Error mapping --------------------------------------------------
 
-    def test_account_not_found_maps_to_account_not_found(
+    @pytest.mark.asyncio
+    async def test_account_not_found_maps_to_account_not_found(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.side_effect = MailAccountNotFoundError("x")
 
-        result = update_message(
+        result = await update_message(
             ["1"], destination_mailbox="Archive", account="Bogus"
         )
 
         assert result["success"] is False
         assert result["error_type"] == "account_not_found"
 
-    def test_mailbox_not_found_maps_to_not_found(
+    @pytest.mark.asyncio
+    async def test_mailbox_not_found_maps_to_not_found(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.side_effect = MailMailboxNotFoundError("x")
 
-        result = update_message(
+        result = await update_message(
             ["1"], destination_mailbox="Bogus", account="Gmail"
         )
 
         assert result["success"] is False
         assert result["error_type"] == "not_found"
 
-    def test_value_error_maps_to_validation_error(
+    @pytest.mark.asyncio
+    async def test_value_error_maps_to_validation_error(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.side_effect = ValueError("invalid flag color")
 
-        result = update_message(["1"], flag_color="rainbow")
+        result = await update_message(["1"], flag_color="rainbow")
 
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
 
-    def test_imap_required_maps_to_imap_required(
+    @pytest.mark.asyncio
+    async def test_imap_required_maps_to_imap_required(
         self, mock_mail: MagicMock
     ) -> None:
         # #364: a Gmail move that couldn't be verified (needs IMAP) must fail
@@ -1907,7 +1924,7 @@ class TestUpdateMessage:
             "Gmail label moves require IMAP"
         )
 
-        result = update_message(
+        result = await update_message(
             ["1"],
             destination_mailbox="Newsletters",
             account="Gmail",
@@ -1917,12 +1934,13 @@ class TestUpdateMessage:
         assert result["success"] is False
         assert result["error_type"] == "imap_required"
 
-    def test_unexpected_exception_maps_to_unknown(
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_maps_to_unknown(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.side_effect = RuntimeError("boom")
 
-        result = update_message(["1"], read_status=True)
+        result = await update_message(["1"], read_status=True)
 
         assert result["success"] is False
         assert result["error_type"] == "unknown"
@@ -3024,8 +3042,15 @@ class TestSaveTemplate:
     def test_overwrite_returns_created_false(
         self, isolated_templates: Any, mock_logger: MagicMock
     ) -> None:
+        """Overwrite is now opt-in: without the flag the save is refused, and
+        with it the existing `created: False` contract is unchanged."""
         save_template(name="x", body="v1\n")
-        result = save_template(name="x", body="v2\n")
+
+        refused = save_template(name="x", body="v2\n")
+        assert refused["success"] is False
+        assert refused["error_type"] == "already_exists"
+
+        result = save_template(name="x", body="v2\n", overwrite=True)
         assert result == {"success": True, "name": "x", "created": False}
 
     def test_empty_body_rejected(

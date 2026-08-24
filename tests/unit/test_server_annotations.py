@@ -233,3 +233,56 @@ class TestReadOnlyFlag:
         parser = server._build_arg_parser()
         help_text = parser.format_help()
         assert "--read-only" in help_text
+
+
+class TestAnnotationCompleteness:
+    """#FORK — annotations are hand-authored per tool, so nothing catches
+    drift between what a tool declares and what it does (upstream #444)."""
+
+    @pytest.mark.asyncio
+    async def test_every_tool_declares_all_four_hints(self) -> None:
+        """openWorldHint was null on all 25 tools. The MCP spec defaults an
+        omitted value to True, so null was conservative and valid — but
+        explicit beats inherited, and a missing field cannot be parity-checked."""
+        from apple_mail_fast_mcp.server import mcp
+
+        tools = await mcp.list_tools()
+        missing: list[str] = []
+        for t in tools:
+            a = t.annotations
+            for field in (
+                "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"
+            ):
+                if a is None or getattr(a, field, None) is None:
+                    missing.append(f"{t.name}.{field}")
+
+        assert not missing, f"tools with unset annotations: {missing}"
+
+    @pytest.mark.asyncio
+    async def test_read_only_tools_are_never_destructive(self) -> None:
+        """A contradiction no reviewer should have to catch by eye."""
+        from apple_mail_fast_mcp.server import mcp
+
+        for t in await mcp.list_tools():
+            a = t.annotations
+            if a and a.readOnlyHint:
+                assert not a.destructiveHint, (
+                    f"{t.name} claims readOnlyHint AND destructiveHint"
+                )
+
+    @pytest.mark.asyncio
+    async def test_only_template_tools_are_closed_world(self) -> None:
+        """Everything else reaches Mail.app or a mail server. Template tools
+        operate purely on local disk, so they are the closed-domain set —
+        if that list changes, this test should be the thing that notices."""
+        from apple_mail_fast_mcp.server import mcp
+
+        expected_closed = {
+            "list_templates", "get_template", "save_template",
+            "delete_template", "render_template",
+        }
+        actual_closed = {
+            t.name for t in await mcp.list_tools()
+            if t.annotations and t.annotations.openWorldHint is False
+        }
+        assert actual_closed == expected_closed
