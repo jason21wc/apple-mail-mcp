@@ -545,6 +545,9 @@ All tools return a consistent error format:
 
 ## Best Practices
 
+
+**Moving to Trash requires confirmation.** `destination_mailbox` naming a trash mailbox — `Trash`, `Deleted Messages`, `Deleted Items` — reaches the same end state as `delete_messages` and is gated on the same terms. Ordinary moves stay unprompted because they are reversible.
+
 ### Search Performance
 
 ```python

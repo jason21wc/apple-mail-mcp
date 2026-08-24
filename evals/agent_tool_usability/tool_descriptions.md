@@ -87,11 +87,21 @@ appends new rules to the end of the rule list, so the returned
 
 Delete (move to Trash) an existing draft.
 
-Lifecycle endpoint for cancellation. Mail.app moves the message to
-the Deleted Messages mailbox; recovery is technically possible but
-Mail.app no longer treats trashed drafts as editable, so this is
-effectively a one-way discard. No elicitation (recoverable from
-Trash) and no rate limit (local operation).
+Lifecycle endpoint for cancellation. Mail.app moves the message to the
+Deleted Messages mailbox.
+
+Confirmation rationale, restated because the previous wording contradicted
+itself (#441): it claimed the exemption was justified by recoverability
+while also stating this is "effectively a one-way discard". Both cannot be
+true. The discard IS effectively one-way — Mail.app no longer treats a
+trashed draft as editable, so the content is not practically recoverable.
+
+The exemption stands on different ground: a draft is a single item the
+caller authored in this same session, and deleting it is the documented way
+to cancel composing. Prompting there is noise that trains people to click
+through prompts. It does NOT stand on recoverability. If drafts ever become
+bulk-deletable, or deletable by an id the caller did not create, re-derive
+this. No rate limit either (local operation).
 
 **Parameters:**
 
@@ -353,13 +363,18 @@ Save attachments from a message to a directory.
 
 ### save_template
 
-Create or overwrite a template.
+Create a template, or replace an existing one with ``overwrite=True``.
+
+No-clobber by default. Replacing a template destroys its previous content
+with no undo, and doing that silently made an overwrite indistinguishable
+from a create from the caller's side (upstream #441).
 
 **Parameters:**
 
 - `name` (string, required): Template name (alphanumerics, underscore, hyphen; 1-64 chars).
 - `body` (string, required): Template body text. May contain {placeholder} tokens.
 - `subject` (string, optional): Optional subject template. May also contain placeholders.
+- `overwrite` (boolean, optional) (default: False): ``False`` (default) refuses to replace an existing template, returning ``error_type="already_exists"``. ``True`` replaces it.
 
 ### search_messages
 

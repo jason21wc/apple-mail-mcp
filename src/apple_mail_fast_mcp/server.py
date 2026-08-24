@@ -261,7 +261,7 @@ async def _elicit_confirmation(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def list_accounts() -> dict[str, Any]:
     """
@@ -308,7 +308,7 @@ def list_accounts() -> dict[str, Any]:
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def list_rules() -> dict[str, Any]:
     """
@@ -380,7 +380,7 @@ def _rule_actions_require_confirmation(actions: dict[str, Any]) -> bool:
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 async def delete_rule(
@@ -434,6 +434,20 @@ async def delete_rule(
         if cancel_err:
             return cancel_err
 
+        # #441: the prompt named this rule by INDEX, and rules can be
+        # reordered or deleted while the dialog is open. Re-resolve and abort
+        # if the target moved — the user approved a name, not a position.
+        if _resolve_rule_name(rule_index) != rule_name:
+            return {
+                "success": False,
+                "error": (
+                    f"Rule list changed while awaiting confirmation: index "
+                    f"{rule_index} no longer names {rule_name!r}. Re-run "
+                    f"list_rules and retry."
+                ),
+                "error_type": "target_changed",
+            }
+
         deleted = mail.delete_rule(rule_index)
         operation_logger.log_operation(
             "delete_rule",
@@ -462,7 +476,7 @@ async def delete_rule(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True, "idempotentHint": False},
     mutating=True,
 )
 async def create_rule(
@@ -571,7 +585,7 @@ async def create_rule(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 async def update_rule(
@@ -658,6 +672,20 @@ async def update_rule(
             if cancel_err:
                 return cancel_err
 
+        # #441: the prompt named this rule by INDEX, and rules can be
+        # reordered or deleted while the dialog is open. Re-resolve and abort
+        # if the target moved — the user approved a name, not a position.
+        if _resolve_rule_name(rule_index) != rule_name:
+            return {
+                "success": False,
+                "error": (
+                    f"Rule list changed while awaiting confirmation: index "
+                    f"{rule_index} no longer names {rule_name!r}. Re-run "
+                    f"list_rules and retry."
+                ),
+                "error_type": "target_changed",
+            }
+
         mail.update_rule(
             rule_index=rule_index,
             name=name,
@@ -704,7 +732,7 @@ async def update_rule(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def list_mailboxes(account: str) -> dict[str, Any]:
     """
@@ -795,6 +823,29 @@ def _mark_untrusted(response: dict[str, Any], has_content: bool) -> dict[str, An
         response["content_is_untrusted"] = True
         response["security_notice"] = _UNTRUSTED_CONTENT_NOTICE
     return response
+
+
+# Mailbox names that MEAN "deleted" across the providers this server targets.
+# iCloud says "Deleted Messages", Outlook "Deleted Items", Gmail/generic IMAP
+# "Trash". Gating on the literal string "Trash" would miss the two that matter
+# most on real accounts.
+_TRASH_MAILBOX_NAMES = frozenset(
+    {"trash", "deleted messages", "deleted items", "deleted"}
+)
+
+
+def _is_trash_destination(mailbox: str | None) -> bool:
+    """True when moving to this mailbox is, in effect, a delete.
+
+    ``update_message(destination_mailbox=...)`` could reach the same end state
+    as ``delete_messages`` — up to 100 messages in Trash — without the
+    confirmation ``delete_messages`` requires. The gate belongs on the effect,
+    not on which tool produced it (upstream #441).
+    """
+    if not mailbox:
+        return False
+    leaf = mailbox.rsplit("/", 1)[-1].strip().lower()
+    return leaf in _TRASH_MAILBOX_NAMES
 
 
 def _annotate_injection(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -985,7 +1036,7 @@ def _apply_search_filters(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def search_messages(
     account: str | None = None,
@@ -1237,7 +1288,7 @@ def search_messages(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def get_messages(
     message_ids: StrList,
@@ -1357,11 +1408,12 @@ def get_messages(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
-def update_message(
+async def update_message(
     message_ids: StrList,
+    ctx: Context | None = None,
     read_status: bool | None = None,
     flagged: bool | None = None,
     flag_color: str | None = None,
@@ -1467,6 +1519,28 @@ def update_message(
                 "error_type": "validation_error",
             }
 
+        # A move to Trash IS a delete, whatever tool asked for it. Confirm on
+        # the same terms delete_messages does (upstream #441).
+        if _is_trash_destination(destination_mailbox):
+            summary = (
+                f"Move {len(message_ids)} message(s) to "
+                f"{destination_mailbox}?\n\n"
+                f"This is the same outcome as deleting them. Recoverable from "
+                f"that mailbox until it is emptied."
+            )
+            cancel_err = await _elicit_confirmation(
+                ctx,
+                summary,
+                "update_message",
+                {
+                    "count": len(message_ids),
+                    "destination_mailbox": destination_mailbox,
+                    "account": account,
+                },
+            )
+            if cancel_err:
+                return cancel_err
+
         logger.info(
             f"Updating {len(message_ids)} messages "
             f"(read={read_status}, flagged={flagged}, color={flag_color}, "
@@ -1543,7 +1617,7 @@ def update_message(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def get_thread(
     message_id: str,
@@ -1678,7 +1752,7 @@ def get_thread(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def get_statistics(
     account: str,
@@ -1791,7 +1865,7 @@ def get_statistics(
     # tool can destroy data the caller did not create. The default path is
     # no-clobber, but the annotation describes the tool's capability, not its
     # default.
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 def save_attachments(
@@ -2019,7 +2093,7 @@ def save_attachments(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def get_attachment_content(
     message_id: str,
@@ -2121,7 +2195,7 @@ def get_attachment_content(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 def create_mailbox(
@@ -2212,7 +2286,7 @@ def create_mailbox(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 def update_mailbox(
@@ -2359,7 +2433,7 @@ def update_mailbox(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 async def delete_mailbox(
@@ -2492,7 +2566,7 @@ async def delete_mailbox(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 async def delete_messages(
@@ -2655,7 +2729,7 @@ def _template_error_response(e: MailTemplateError) -> dict[str, Any]:
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False, "idempotentHint": True}
 )
 def list_templates() -> dict[str, Any]:
     """List all stored email templates.
@@ -2687,7 +2761,7 @@ def list_templates() -> dict[str, Any]:
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False, "idempotentHint": True}
 )
 def get_template(name: str) -> dict[str, Any]:
     """Read a single template by name.
@@ -2720,30 +2794,63 @@ def get_template(name: str) -> dict[str, Any]:
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False, "idempotentHint": True},
     mutating=True,
 )
 def save_template(
-    name: str, body: str, subject: str | None = None
+    name: str,
+    body: str,
+    subject: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Create or overwrite a template.
+    """Create a template, or replace an existing one with ``overwrite=True``.
+
+    No-clobber by default. Replacing a template destroys its previous content
+    with no undo, and doing that silently made an overwrite indistinguishable
+    from a create from the caller's side (upstream #441).
 
     Args:
         name: Template name (alphanumerics, underscore, hyphen; 1-64 chars).
         body: Template body text. May contain {placeholder} tokens.
         subject: Optional subject template. May also contain placeholders.
+        overwrite: ``False`` (default) refuses to replace an existing
+            template, returning ``error_type="already_exists"``. ``True``
+            replaces it.
 
     Returns:
         Dictionary with the template name and a `created` flag (true for
         new templates, false when an existing template was overwritten).
 
-    No confirmation prompt — additive (or self-overwrite, which is the
-    explicit user intent for an idempotent save).
+    No-clobber by default, matching ``save_attachments``: creating is
+    additive and unprompted, replacing requires an explicit ``overwrite=True``.
+    The explicit flag IS the consent — a prompt on top of it would add friction
+    without adding protection.
     """
     try:
         rate_err = check_rate_limit("save_template", {"name": name})
         if rate_err:
             return rate_err
+
+        # No-clobber by default. The store's own `created` flag reports an
+        # overwrite only AFTER it has happened, which is too late to refuse,
+        # and get() raises rather than returning None for a missing template.
+        try:
+            _get_template_store().get(name)
+            exists = True
+        except MailTemplateNotFoundError:
+            exists = False
+        if exists:
+            if not overwrite:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Template {name!r} already exists. Pass "
+                        f"overwrite=True to replace it."
+                    ),
+                    "error_type": "already_exists",
+                    "name": name,
+                }
+
         if not isinstance(body, str) or not body.strip():
             return {
                 "success": False,
@@ -2768,7 +2875,7 @@ def save_template(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False, "idempotentHint": True},
     mutating=True,
 )
 async def delete_template(
@@ -2816,7 +2923,7 @@ async def delete_template(
 
 
 @_tool(
-    {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False, "idempotentHint": True}
 )
 def render_template(
     name: str,
@@ -3269,7 +3376,7 @@ def _merge_draft_recipients(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True, "idempotentHint": False},
     mutating=True,
 )
 async def create_draft(
@@ -3482,7 +3589,7 @@ async def create_draft(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 async def update_draft(
@@ -3669,17 +3776,27 @@ async def update_draft(
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
     mutating=True,
 )
 def delete_draft(draft_id: str) -> dict[str, Any]:
     """Delete (move to Trash) an existing draft.
 
-    Lifecycle endpoint for cancellation. Mail.app moves the message to
-    the Deleted Messages mailbox; recovery is technically possible but
-    Mail.app no longer treats trashed drafts as editable, so this is
-    effectively a one-way discard. No elicitation (recoverable from
-    Trash) and no rate limit (local operation).
+    Lifecycle endpoint for cancellation. Mail.app moves the message to the
+    Deleted Messages mailbox.
+
+    Confirmation rationale, restated because the previous wording contradicted
+    itself (#441): it claimed the exemption was justified by recoverability
+    while also stating this is "effectively a one-way discard". Both cannot be
+    true. The discard IS effectively one-way — Mail.app no longer treats a
+    trashed draft as editable, so the content is not practically recoverable.
+
+    The exemption stands on different ground: a draft is a single item the
+    caller authored in this same session, and deleting it is the documented way
+    to cancel composing. Prompting there is noise that trains people to click
+    through prompts. It does NOT stand on recoverability. If drafts ever become
+    bulk-deletable, or deletable by an id the caller did not create, re-derive
+    this. No rate limit either (local operation).
 
     Args:
         draft_id: Mail.app id of the draft.
