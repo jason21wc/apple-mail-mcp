@@ -34,6 +34,7 @@ from .exceptions import (
     MailRuleNotFoundError,
     MailSafetyError,
     MailTemplateError,
+    MailTemplateExistsError,
     MailTemplateInvalidFormatError,
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
@@ -355,6 +356,29 @@ def list_rules() -> dict[str, Any]:
         }
 
 
+def _rule_target_snapshot(rule_index: int) -> tuple[str | None, list[tuple[int, str]], str | None]:
+    """Resolve a rule target and capture the list it was resolved against.
+
+    Returns ``(name, snapshot, error_kind)``. ``error_kind`` is
+    ``"ambiguous_target"`` when the name is shared by another rule.
+
+    Rule names are explicitly NOT unique (see docs/reference/TOOLS.md), so a
+    name alone cannot identify the rule the user approved: reorder two rules
+    that share a name and a name-only recheck still passes. The snapshot is
+    what gets compared after confirmation.
+    """
+    rules = mail.list_rules()
+    snapshot = [
+        (int(r.get("index", -1)), cast(str, r.get("name", ""))) for r in rules
+    ]
+    name = next((n for i, n in snapshot if i == rule_index), None)
+    if name is None:
+        return None, snapshot, None
+    if sum(1 for _i, n in snapshot if n == name) > 1:
+        return name, snapshot, "ambiguous_target"
+    return name, snapshot, None
+
+
 def _resolve_rule_name(rule_index: int) -> str | None:
     """Look up a rule's name from its 1-based index via list_rules.
 
@@ -410,7 +434,17 @@ async def delete_rule(
         if rate_err:
             return rate_err
 
-        rule_name = _resolve_rule_name(rule_index)
+        rule_name, rule_snapshot, ambiguity = _rule_target_snapshot(rule_index)
+        if ambiguity is not None:
+            return {
+                "success": False,
+                "error": (
+                    f"Rule name {rule_name!r} is shared by more than one rule, "
+                    f"so a confirmation cannot be bound to the one you meant. "
+                    f"Rename the duplicates, then retry."
+                ),
+                "error_type": ambiguity,
+            }
         if rule_name is None:
             return {
                 "success": False,
@@ -435,9 +469,16 @@ async def delete_rule(
             return cancel_err
 
         # #441: the prompt named this rule by INDEX, and rules can be
-        # reordered or deleted while the dialog is open. Re-resolve and abort
-        # if the target moved — the user approved a name, not a position.
-        if _resolve_rule_name(rule_index) != rule_name:
+        # reordered or deleted while the dialog is open. Compare the FULL list
+        # snapshot, not just the name at that index — names are not unique, so
+        # a name-only check passes when two same-named rules swap places.
+        #
+        # RESIDUAL: a window remains between this check and the connector's
+        # AppleScript call. Closing it needs an expected-target assertion
+        # inside that same script; raised upstream rather than reimplemented
+        # in the connector here (ADR-3).
+        _post_name, post_snapshot, _amb = _rule_target_snapshot(rule_index)
+        if post_snapshot != rule_snapshot:
             return {
                 "success": False,
                 "error": (
@@ -637,7 +678,17 @@ async def update_rule(
         if rate_err:
             return rate_err
 
-        rule_name = _resolve_rule_name(rule_index)
+        rule_name, rule_snapshot, ambiguity = _rule_target_snapshot(rule_index)
+        if ambiguity is not None:
+            return {
+                "success": False,
+                "error": (
+                    f"Rule name {rule_name!r} is shared by more than one rule, "
+                    f"so a confirmation cannot be bound to the one you meant. "
+                    f"Rename the duplicates, then retry."
+                ),
+                "error_type": ambiguity,
+            }
         if rule_name is None:
             return {
                 "success": False,
@@ -673,9 +724,16 @@ async def update_rule(
                 return cancel_err
 
         # #441: the prompt named this rule by INDEX, and rules can be
-        # reordered or deleted while the dialog is open. Re-resolve and abort
-        # if the target moved — the user approved a name, not a position.
-        if _resolve_rule_name(rule_index) != rule_name:
+        # reordered or deleted while the dialog is open. Compare the FULL list
+        # snapshot, not just the name at that index — names are not unique, so
+        # a name-only check passes when two same-named rules swap places.
+        #
+        # RESIDUAL: a window remains between this check and the connector's
+        # AppleScript call. Closing it needs an expected-target assertion
+        # inside that same script; raised upstream rather than reimplemented
+        # in the connector here (ADR-3).
+        _post_name, post_snapshot, _amb = _rule_target_snapshot(rule_index)
+        if post_snapshot != rule_snapshot:
             return {
                 "success": False,
                 "error": (
@@ -1413,7 +1471,6 @@ def get_messages(
 )
 async def update_message(
     message_ids: StrList,
-    ctx: Context | None = None,
     read_status: bool | None = None,
     flagged: bool | None = None,
     flag_color: str | None = None,
@@ -1421,6 +1478,7 @@ async def update_message(
     account: str | None = None,
     source_mailbox: str | None = None,
     gmail_mode: bool = False,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
     Update one or more messages: change read state, flag, and/or move,
@@ -1498,12 +1556,12 @@ async def update_message(
 
         # Test-mode safety: when account is provided (moves, or narrow-path),
         # gate against MAIL_TEST_ACCOUNT.
-        if account is not None:
-            safety_err = check_test_mode_safety(
-                "update_message", account=account
-            )
-            if safety_err:
-                return safety_err
+        # Called UNCONDITIONALLY: an omitted account is the broad path, which
+        # targets every configured account. Gating only when account is set
+        # let exactly that case through in test mode.
+        safety_err = check_test_mode_safety("update_message", account=account)
+        if safety_err:
+            return safety_err
 
         rate_err = check_rate_limit("update_message", {"count": len(message_ids)})
         if rate_err:
@@ -2620,12 +2678,12 @@ async def delete_messages(
         # Test-mode safety: when account is provided, gate the delete
         # against MAIL_TEST_ACCOUNT so an integration run can't delete
         # from a real account (delete_messages is account-gated).
-        if account is not None:
-            safety_err = check_test_mode_safety(
-                "delete_messages", account=account
-            )
-            if safety_err:
-                return safety_err
+        # Called UNCONDITIONALLY: an omitted account is the broad path, which
+        # targets every configured account. Gating only when account is set
+        # let exactly that case through in test mode.
+        safety_err = check_test_mode_safety("delete_messages", account=account)
+        if safety_err:
+            return safety_err
 
         rate_err = check_rate_limit("delete_messages", {"count": len(message_ids)})
         if rate_err:
@@ -2794,7 +2852,10 @@ def get_template(name: str) -> dict[str, Any]:
 
 
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False, "idempotentHint": True},
+    # destructiveHint=True: overwrite=True replaces an existing template's
+    # content irrecoverably. Same capability-based reasoning as
+    # save_attachments — the annotation describes what the tool CAN do.
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False, "idempotentHint": True},
     mutating=True,
 )
 def save_template(
@@ -2831,25 +2892,6 @@ def save_template(
         if rate_err:
             return rate_err
 
-        # No-clobber by default. The store's own `created` flag reports an
-        # overwrite only AFTER it has happened, which is too late to refuse,
-        # and get() raises rather than returning None for a missing template.
-        try:
-            _get_template_store().get(name)
-            exists = True
-        except MailTemplateNotFoundError:
-            exists = False
-        if exists:
-            if not overwrite:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Template {name!r} already exists. Pass "
-                        f"overwrite=True to replace it."
-                    ),
-                    "error_type": "already_exists",
-                    "name": name,
-                }
 
         if not isinstance(body, str) or not body.strip():
             return {
@@ -2862,7 +2904,20 @@ def save_template(
         template = Template(
             name=name, subject=subject, body=normalized_body
         )
-        created = _get_template_store().save(template)
+        # No-clobber is enforced INSIDE the store, as an atomic commit. A
+        # check here followed by a write there is check-then-act and races.
+        try:
+            created = _get_template_store().save(template, overwrite=overwrite)
+        except MailTemplateExistsError:
+            return {
+                "success": False,
+                "error": (
+                    f"Template {name!r} already exists. Pass overwrite=True "
+                    f"to replace it."
+                ),
+                "error_type": "already_exists",
+                "name": name,
+            }
         operation_logger.log_operation(
             "save_template", {"name": name, "created": created}, "success"
         )
@@ -3791,12 +3846,22 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
     true. The discard IS effectively one-way — Mail.app no longer treats a
     trashed draft as editable, so the content is not practically recoverable.
 
-    The exemption stands on different ground: a draft is a single item the
-    caller authored in this same session, and deleting it is the documented way
-    to cancel composing. Prompting there is noise that trains people to click
-    through prompts. It does NOT stand on recoverability. If drafts ever become
-    bulk-deletable, or deletable by an id the caller did not create, re-derive
-    this. No rate limit either (local operation).
+    The exemption stands on different ground: this deletes exactly ONE item,
+    named by id, and cancelling a compose is the ordinary reason to call it.
+    Prompting on every cancel is noise that trains people to click through
+    prompts. It does NOT stand on recoverability.
+
+    Stated precisely, because the API does not enforce what an earlier version
+    of this docstring implied: there is NO provenance check. Any syntactically
+    valid draft id is accepted, whoever created it, and there is no test-mode
+    gate on this path. The exemption is a judgement that single-item draft
+    deletion is low-consequence — not a guarantee that the caller authored the
+    draft. Re-derive it if drafts become bulk-deletable, or if a caller can
+    plausibly hold an id it did not create. See the stale-draft-id problem
+    (a create can return an id its own delete cannot use), which is an open
+    upstream defect, not something this wording resolves.
+
+    No rate limit either (local operation).
 
     Args:
         draft_id: Mail.app id of the draft.
