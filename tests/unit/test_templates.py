@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from apple_mail_fast_mcp.exceptions import (
+    MailTemplateExistsError,
     MailTemplateInvalidFormatError,
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
@@ -225,8 +226,12 @@ class TestTemplateStore:
 
         store = self._store(tmp_path)
         store.save(Template(name="foo", subject=None, body="v1\n"))
+        # Replacing now requires overwrite=True; `created is False` still
+        # reports that an existing template was replaced.
         assert (
-            store.save(Template(name="foo", subject=None, body="v2\n"))
+            store.save(
+                Template(name="foo", subject=None, body="v2\n"), overwrite=True
+            )
             is False
         )
         assert store.get("foo").body == "v2\n"
@@ -356,3 +361,58 @@ class TestTemplateStore:
         # save() creates the dir.
         store.save(Template(name="x", subject=None, body="ok\n"))
         assert nested.is_dir()
+
+
+class TestAtomicNoClobber:
+    """Check-then-write races. Two concurrent default saves both observed
+    "missing" and both wrote — the same defect already fixed for attachments,
+    recreated here because the guard lived in the server wrapper instead of
+    the store."""
+
+    def test_concurrent_creates_exactly_one_wins(self, tmp_path: Path) -> None:
+        import threading
+
+        from apple_mail_fast_mcp.templates import Template, TemplateStore
+
+        store = TemplateStore(root=tmp_path)
+        barrier = threading.Barrier(2)
+        created: list[bool] = []
+        refused: list[bool] = []
+        lock = threading.Lock()
+
+        def _save(n: int) -> None:
+            t = Template(name="weekly", subject=None, body=f"v{n}\n")
+            barrier.wait(timeout=5)
+            try:
+                store.save(t, overwrite=False)
+                with lock:
+                    created.append(True)
+            except MailTemplateExistsError:
+                with lock:
+                    refused.append(True)
+
+        threads = [threading.Thread(target=_save, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(created) == 1, f"expected one winner, got {len(created)}"
+        assert len(refused) == 1
+
+    def test_overwrite_true_replaces(self, tmp_path: Path) -> None:
+        from apple_mail_fast_mcp.templates import Template, TemplateStore
+
+        store = TemplateStore(root=tmp_path)
+        store.save(Template(name="x", subject=None, body="v1\n"))
+        store.save(Template(name="x", subject=None, body="v2\n"), overwrite=True)
+        assert store.get("x").body == "v2\n"
+
+    def test_default_refuses_existing(self, tmp_path: Path) -> None:
+        from apple_mail_fast_mcp.templates import Template, TemplateStore
+
+        store = TemplateStore(root=tmp_path)
+        store.save(Template(name="x", subject=None, body="v1\n"))
+        with pytest.raises(MailTemplateExistsError):
+            store.save(Template(name="x", subject=None, body="v2\n"))
+        assert store.get("x").body == "v1\n"

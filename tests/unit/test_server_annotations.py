@@ -49,15 +49,15 @@ DESTRUCTIVE_TOOLS: set[str] = {
     "delete_messages",
     "delete_rule",
     "delete_template",
-    # overwrite=True can replace a file the caller did not create.
+    # overwrite=True can replace state the caller did not create.
     "save_attachments",
+    "save_template",
 }
 
 ADDITIVE_TOOLS: set[str] = {
     "create_mailbox",
     "create_draft",
     "create_rule",
-    "save_template",
 }
 
 MUTATING_TOOLS = DESTRUCTIVE_TOOLS | ADDITIVE_TOOLS

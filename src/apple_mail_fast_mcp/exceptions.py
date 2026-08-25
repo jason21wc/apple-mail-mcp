@@ -244,6 +244,15 @@ class MailTemplateNotFoundError(MailTemplateError):
     pass
 
 
+class MailTemplateExistsError(MailTemplateError):
+    """A template with that name already exists and overwrite was not asked for.
+
+    Raised from inside the atomic commit, so it is evidence the name was taken
+    at the instant of writing — not the result of a separate existence check
+    that a concurrent writer could have invalidated.
+    """
+
+
 class MailTemplateInvalidNameError(MailTemplateError):
     """Template name fails validation (path traversal, invalid chars,
     too long, or empty). Names must match ^[a-zA-Z0-9_-]{1,64}$."""

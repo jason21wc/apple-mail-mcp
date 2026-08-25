@@ -15,13 +15,13 @@ Every tool ships with the per-tool annotations the MCP 2025-03 spec defines so h
 | `readOnlyHint` | `true` if the tool only reads state; `false` if it can mutate Mail.app, the filesystem, or remote IMAP state. | always set explicitly |
 | `destructiveHint` | `true` if the tool can remove or overwrite existing state (delete, move, rename, replace). `false` for purely additive tools (create / save-new). | always set explicitly |
 | `idempotentHint` | `true` if calling the tool a second time with the same arguments leaves end state unchanged. | always set explicitly |
-| `openWorldHint` | Out of scope for v0.9.0 — unset; defaults to `true` per the spec. | n/a |
+| `openWorldHint` | Set explicitly on every tool. `false` for the template tools (local disk only); `true` for everything else, which reaches Mail.app or a mail server. | all |
 
 **Classification:**
 
 - **Read-only:** `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
-- **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`. All have `destructiveHint=true`, `idempotentHint=true`. `save_attachments` is here because `overwrite=true` can replace a file the caller did not create — the annotation describes capability, not the default.
-- **Mutating additive:** `create_mailbox`, `create_draft`, `create_rule`, `save_template`. All have `destructiveHint=false`. Idempotent except `create_draft` and `create_rule` (each call may create a new entity).
+- **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`, `save_template`. All have `destructiveHint=true`, `idempotentHint=true`. `save_attachments` and `save_template` are here because `overwrite=true` can replace state the caller did not create — the annotation describes capability, not the default path, which refuses to clobber.
+- **Mutating additive:** `create_mailbox`, `create_draft`, `create_rule`. All have `destructiveHint=false`. Idempotent except `create_draft` and `create_rule` (each call may create a new entity).
 
 Counts are deliberately omitted — they are derivable and go stale. `make eval-descriptions` regenerates the authoritative list.
 
@@ -1459,7 +1459,7 @@ body, and the sorted list of placeholders found across subject + body.
 
 ### save_template
 
-Create or overwrite a template. Returns `created: true` for new
+Create a template, or replace one with `overwrite=true`. **No-clobber by default:** an existing name returns `error_type: "already_exists"` and is left untouched. The no-replace commit is atomic (`O_EXCL`), so two concurrent creates cannot both win. Returns `created: true` for new
 templates, `created: false` when an existing template was overwritten.
 
 ```python

@@ -691,18 +691,53 @@ class TestConsequenceGating:
         """The prompt names a rule by index, and rules can be reordered while
         it is open. Without a re-check the user confirms one rule and a
         different one is deleted — TOCTOU with a human-length window."""
-        names = iter(["Archive newsletters", "Forward to accountant"])
+        # The list is reordered while the dialog is open.
+        snapshots = iter([
+            [{"index": 1, "name": "Archive newsletters", "enabled": True},
+             {"index": 2, "name": "Forward to accountant", "enabled": True}],
+            [{"index": 1, "name": "Forward to accountant", "enabled": True},
+             {"index": 2, "name": "Archive newsletters", "enabled": True}],
+        ])
+        mock_mail.list_rules.side_effect = lambda: next(snapshots)
 
         with patch(
-            "apple_mail_fast_mcp.server._resolve_rule_name",
-            side_effect=lambda idx: next(names),
-        ), patch(
             "apple_mail_fast_mcp.server._elicit_confirmation",
             new_callable=AsyncMock,
         ) as elicit:
             elicit.return_value = None  # user approves what they were shown
-            result = await delete_rule(rule_index=0, ctx=None)
+            result = await delete_rule(rule_index=1, ctx=None)
 
         assert result["success"] is False
         assert result["error_type"] == "target_changed"
         mock_mail.delete_rule.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_message_positional_order_preserved(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """`ctx` was inserted as the SECOND parameter, so an existing call
+        `update_message(ids, True)` silently passed True as the context instead
+        of read_status. Context params belong at the end."""
+        mock_mail.update_message.return_value = 1
+
+        await update_message(["1"], True)  # positional read_status
+
+        kwargs = mock_mail.update_message.call_args.kwargs
+        assert kwargs.get("read_status") is True
+
+    @pytest.mark.asyncio
+    async def test_rule_revalidation_rejects_ambiguous_duplicate_names(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """Rule names are explicitly NOT unique (TOOLS.md). Comparing only the
+        name cannot identify the approved rule: swap two same-named rules and
+        a name check still passes."""
+        mock_mail.list_rules.return_value = [
+            {"index": 1, "name": "Filter", "enabled": True},
+            {"index": 2, "name": "Filter", "enabled": True},
+        ]
+
+        result = await delete_rule(rule_index=1, ctx=None)
+
+        assert result["success"] is False
+        assert result["error_type"] == "ambiguous_target"

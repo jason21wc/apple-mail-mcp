@@ -96,12 +96,22 @@ while also stating this is "effectively a one-way discard". Both cannot be
 true. The discard IS effectively one-way — Mail.app no longer treats a
 trashed draft as editable, so the content is not practically recoverable.
 
-The exemption stands on different ground: a draft is a single item the
-caller authored in this same session, and deleting it is the documented way
-to cancel composing. Prompting there is noise that trains people to click
-through prompts. It does NOT stand on recoverability. If drafts ever become
-bulk-deletable, or deletable by an id the caller did not create, re-derive
-this. No rate limit either (local operation).
+The exemption stands on different ground: this deletes exactly ONE item,
+named by id, and cancelling a compose is the ordinary reason to call it.
+Prompting on every cancel is noise that trains people to click through
+prompts. It does NOT stand on recoverability.
+
+Stated precisely, because the API does not enforce what an earlier version
+of this docstring implied: there is NO provenance check. Any syntactically
+valid draft id is accepted, whoever created it, and there is no test-mode
+gate on this path. The exemption is a judgement that single-item draft
+deletion is low-consequence — not a guarantee that the caller authored the
+draft. Re-derive it if drafts become bulk-deletable, or if a caller can
+plausibly hold an id it did not create. See the stale-draft-id problem
+(a create can return an id its own delete cannot use), which is an open
+upstream defect, not something this wording resolves.
+
+No rate limit either (local operation).
 
 **Parameters:**
 

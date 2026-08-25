@@ -23,11 +23,13 @@ from __future__ import annotations
 import os
 import re
 import string
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .exceptions import (
+    MailTemplateExistsError,
     MailTemplateInvalidFormatError,
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
@@ -230,14 +232,48 @@ class TemplateStore:
         text = path.read_text(encoding="utf-8")
         return parse_template_file(text, name=name)
 
-    def save(self, template: Template) -> bool:
-        """Write template to disk. Returns True if newly created,
-        False if it overwrote an existing template."""
+    def save(self, template: Template, overwrite: bool = False) -> bool:
+        """Write template to disk. Returns True if newly created, False if it
+        replaced an existing template.
+
+        No-clobber is enforced HERE, not by a caller checking first. An
+        exists() test followed by a write is check-then-act: two concurrent
+        saves can both observe "missing" and both write, and the loser's
+        content is gone. The commit itself has to be the exclusive operation.
+
+        Raises:
+            MailTemplateExistsError: the name was taken at the instant of
+                writing and ``overwrite`` was False.
+        """
         path = self._path_for(template.name)
-        existed = path.is_file()
         self.root.mkdir(parents=True, exist_ok=True)
-        path.write_text(serialize_template(template), encoding="utf-8")
-        return not existed
+        payload = serialize_template(template)
+
+        if overwrite:
+            # Atomic replace via a same-directory temp file, so a reader never
+            # observes a partially written template.
+            fd, tmp = tempfile.mkstemp(dir=self.root, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                existed = path.is_file()
+                os.replace(tmp, path)
+                return not existed
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+
+        # O_EXCL is the exclusive commit: the kernel refuses if the name is
+        # already taken, so exactly one concurrent creator can win.
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise MailTemplateExistsError(
+                f"template {template.name!r} already exists"
+            ) from exc
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        return True
 
     def delete(self, name: str) -> None:
         path = self._path_for(name)

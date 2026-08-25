@@ -551,11 +551,22 @@ class TestCheckTestModeSafety:
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
 
         # delete_messages isn't a send op — the new branch shouldn't fire.
-        assert (
-            check_test_mode_safety("delete_messages", recipients=None) is None
+        # Pass the test account so the ACCOUNT branch (which now fails closed
+        # on an omitted account) does not confound what this asserts.
+        monkeypatch.setattr(
+            security, "_get_test_account_identifiers", lambda a: {a}
         )
         assert (
-            check_test_mode_safety("delete_messages", recipients=[]) is None
+            check_test_mode_safety(
+                "delete_messages", account="TestAccount", recipients=None
+            )
+            is None
+        )
+        assert (
+            check_test_mode_safety(
+                "delete_messages", account="TestAccount", recipients=[]
+            )
+            is None
         )
 
     def test_non_gated_operation_returns_none(self, monkeypatch: Any) -> None:
@@ -810,3 +821,56 @@ class TestAccountGatedOperationCoverage:
                 "summary",
                 {},
             )
+
+
+class TestAccountGatedOperationsFailClosed:
+    """#FORK — an account-gated operation that omits `account` was waved through.
+
+    `check_test_mode_safety` only evaluated the account branch when
+    `account is not None`, and the broad paths of `delete_messages` /
+    `update_message` skipped the call entirely. So under MAIL_TEST_MODE a bulk
+    delete with no account argument reached REAL accounts — the exact thing
+    test mode exists to prevent.
+    """
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["delete_messages", "update_message", "delete_mailbox", "update_mailbox"],
+    )
+    def test_omitted_account_is_blocked_not_allowed(
+        self, operation: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        err = security.check_test_mode_safety(operation, account=None)
+
+        assert err is not None, (
+            f"{operation} with account=None passed the test-mode gate — it can "
+            f"reach every account, which is strictly worse than naming one"
+        )
+        assert err["error_type"] == "safety_violation"
+
+    def test_named_test_account_still_allowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        monkeypatch.setattr(
+            security, "_get_test_account_identifiers", lambda a: {a}
+        )
+        assert (
+            security.check_test_mode_safety(
+                "delete_messages", account="TestAccount"
+            )
+            is None
+        )
+
+    def test_no_test_mode_means_no_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        assert (
+            security.check_test_mode_safety("delete_messages", account=None)
+            is None
+        )

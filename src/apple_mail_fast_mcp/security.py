@@ -538,12 +538,23 @@ def check_test_mode_safety(
 
     # Account-gated operations: verify target account matches MAIL_TEST_ACCOUNT
     # by either name or UUID (per #61, account-gated tools accept both forms).
-    if operation in ACCOUNT_GATED_OPERATIONS and account is not None:
+    if operation in ACCOUNT_GATED_OPERATIONS:
         test_account = _get_test_account()
         if test_account is None:
             return _safety_error(
                 operation,
                 "MAIL_TEST_MODE is set but MAIL_TEST_ACCOUNT is not",
+            )
+        if account is None:
+            # Fail CLOSED. An omitted account is not "no account" — it is the
+            # broad path, which reaches every configured account at once. That
+            # is strictly worse than naming a wrong one, and it used to skip
+            # this gate entirely.
+            return _safety_error(
+                operation,
+                f"Test mode: {operation} requires an explicit account "
+                f"(MAIL_TEST_ACCOUNT='{test_account}'). Omitting it targets "
+                f"every account, which test mode must not allow.",
             )
         if account not in _get_test_account_identifiers(test_account):
             return _safety_error(

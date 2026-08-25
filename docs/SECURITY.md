@@ -39,8 +39,17 @@ checklist; the repo-root [`SECURITY.md`](../SECURITY.md) is the vulnerability-re
 
 **Destructive operations require confirmation.** These tools prompt the user via MCP elicitation
 before acting (fail-closed — no confirmation context means the operation is blocked):
-`delete_messages`, `delete_mailbox`, `delete_draft`, `delete_rule`, `delete_template`, `create_rule`
-when it has a move/forward/delete action, and `create_draft` with `send_now=true`.
+`delete_messages`, `delete_mailbox`, `delete_rule`, `delete_template`; `update_rule`;
+`update_message` when the destination is a trash mailbox (`Trash` / `Deleted Messages` /
+`Deleted Items`), which reaches the same end state as `delete_messages`; `create_rule` when it
+has a move/copy/forward/delete action; and `create_draft` / `update_draft` with `send_now=true`.
+
+`delete_draft` does **not** prompt — it deletes exactly one item named by id, and cancelling a
+compose is the ordinary reason to call it. Note there is no provenance check: any valid draft id
+is accepted.
+
+`save_attachments` and `save_template` do not prompt either. They refuse to overwrite by default
+(`already_exists`) and take an explicit `overwrite=true`; that flag is the consent.
 
 ---
 
