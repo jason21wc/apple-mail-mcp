@@ -520,6 +520,7 @@ def check_test_mode_safety(
     account: str | None = None,
     recipients: list[str] | None = None,
     rule_name: str | None = None,
+    source_mailbox: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Enforce test-mode safety checks. Returns None if allowed (or no test mode),
@@ -562,6 +563,13 @@ def check_test_mode_safety(
                 f"Test mode: account '{account}' does not match "
                 f"MAIL_TEST_ACCOUNT='{test_account}'",
             )
+
+    if operation == "update_message" and not (source_mailbox and source_mailbox.strip()):
+        return _safety_error(
+            operation,
+            "Test mode: update_message requires an explicit source_mailbox "
+            "as well as account to confine the connector's mutation scope.",
+        )
 
     # Rule-mutation operations: verify the target rule's name starts with
     # the test prefix. The caller (server tool wrapper) is responsible for

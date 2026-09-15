@@ -1103,14 +1103,15 @@ create_draft(
 
 ### update_draft
 
-Update an existing draft. Implemented as **delete-and-recreate** —
+Update an existing draft. Implemented as **create replacement, then remove original** —
 Mail.app forbids mutating saved drafts, so this tool reads the
-current state, deletes the draft, and creates a new one with the
-merged fields. Threading headers (for replies) and forward anchors
+current state, creates a new draft with merged fields, and only then
+removes the original. Threading headers (for replies) and forward anchors
 are preserved via persisted seed metadata.
 
 **⚠️ Returns a NEW `draft_id`** — the input id is no longer valid
-after this call. Callers caching the id must re-read the response.
+after a complete replacement. Partial outcomes can retain the original.
+Callers caching the id must re-read the response.
 
 **Parameters:**
 
@@ -1120,7 +1121,7 @@ after this call. Callers caching the id must re-read the response.
 | `to` / `cc` / `bcc` | array[string] | No | None | Override recipient groups: `None` keeps existing, `[]` clears, populated list replaces. |
 | `subject` | string | No | None | Override subject. `None` keeps existing. |
 | `body` | string | No | None | Override body. `None` keeps existing; non-None replaces (including `""`). |
-| `body_html` | string | No | None | Optional HTML body for the recreated draft (#251); see `create_draft`. Requires IMAP credentials; limited to fresh-seed drafts (not reply/forward) and `send_now=False`. **Not auto-preserved:** because update is delete-and-recreate and draft state captures only plain text, existing HTML is dropped unless `body_html` is passed again. |
+| `body_html` | string | No | None | Optional HTML body for the recreated draft (#251); see `create_draft`. Requires IMAP credentials; limited to fresh-seed drafts (not reply/forward) and `send_now=False`. Existing HTML or an unknown body format is refused when preserving the body. Pass `body_html` again, or `body` to explicitly replace it with plain text. |
 | `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached); `[]` clears; populated list replaces. |
 | `template_name` / `template_vars` | string / object | No | None | Optional template render. User-supplied `subject`/`body` override the rendered output. |
 | `from_account` | string | No | None | Override sender. |
@@ -1306,7 +1307,7 @@ Patch a rule's properties. Only the fields you pass are changed. Also serves as 
 - `match_logic` (str, optional): `"all"` or `"any"`.
 - `actions` (dict, optional): When provided, **replaces** the rule's actions wholesale (per the same schema as `create_rule`'s `actions`).
 
-**Conditional confirmation:** prompts the user via MCP elicitation only when the patch touches `conditions`, `actions`, or `match_logic` (irreversible replacements). Patches limited to `enabled` and/or `name` skip the prompt — both are trivially reversible.
+**Conditional confirmation:** changing conditions or match logic, installing dangerous actions (move, forward, delete, copy), or activating a disabled rule requires confirmation. Activation confirms conservatively because existing actions may have destructive effects. Disabling, renaming, or leaving an already enabled rule enabled skips the prompt.
 
 **Returns:**
 
@@ -1521,3 +1522,21 @@ User-supplied `vars` override auto-fills. Missing placeholders return
 - **Phase 5+**: Further enhancements, backward compatible
 
 Breaking changes will only occur in major versions (1.0.0, 2.0.0, etc.).
+
+## Reliability outcome notes
+
+- In test mode, `update_message` requires both the test account and an explicit,
+  nonempty `source_mailbox`; the account alone does not confine its fallback scan.
+- `update_draft` preserves the original until replacement creation succeeds.
+  Incomplete attachment extraction or unknown sender/body preservation fails
+  without deleting it. Cleanup failure returns `success: true`, `partial: true`,
+  both `draft_id` and `original_draft_id`, and recovery warnings. Inspect those
+  IDs rather than repeating the update or send.
+- `update_draft` is advertised as non-idempotent: repeating the same call can
+  create another draft or send again. A partial SMTP send retains the original
+  draft and names it in the result for recovery.
+- SMTP sends return `delivery.accepted_recipients`, `refused_recipients` (SMTP
+  code and message), and `partial`. Acceptance means the submission server
+  accepted the recipient, not proof of final inbox delivery. A partial result
+  must never be retried for the original full recipient list. SMTP teardown
+  errors do not discard an already accepted result.

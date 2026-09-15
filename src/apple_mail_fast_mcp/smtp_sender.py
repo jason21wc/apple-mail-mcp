@@ -86,7 +86,7 @@ class SmtpSender:
         recipients: list[str],
         *,
         envelope_from: str | None = None,
-    ) -> None:
+    ) -> dict[str, tuple[int, bytes]]:
         """Authenticate and submit ``raw_message`` to ``recipients``.
 
         The ``Bcc`` header is stripped from the transmitted message — blind
@@ -114,6 +114,11 @@ class SmtpSender:
         AppleScript fallback deliver a *second* copy (PR #404 review). Errors
         *before* acceptance (connect, AUTH, refused recipient, rejected DATA)
         still propagate so the caller can fall back safely.
+
+        Returns:
+            Refused recipients and SMTP status; an empty mapping means all
+            recipients were accepted. Partial acceptance must never be retried
+            for the full recipient list.
 
         Args:
             raw_message: A serialized RFC 822 message from
@@ -145,12 +150,13 @@ class SmtpSender:
 
         context = ssl.create_default_context()
         accepted = False
+        refused: dict[str, tuple[int, bytes]] = {}
         try:
             if self._port == _SMTP_SSL_PORT:
                 with smtplib.SMTP_SSL(
                     self._host, self._port, timeout=self._timeout, context=context
                 ) as client:
-                    self._authenticate_and_send(client, msg, recipients, env_from)
+                    refused = self._authenticate_and_send(client, msg, recipients, env_from)
                     accepted = True
             else:
                 with smtplib.SMTP(
@@ -159,7 +165,7 @@ class SmtpSender:
                     client.ehlo()
                     client.starttls(context=context)
                     client.ehlo()
-                    self._authenticate_and_send(client, msg, recipients, env_from)
+                    refused = self._authenticate_and_send(client, msg, recipients, env_from)
                     accepted = True
         except (smtplib.SMTPException, OSError):
             # Not yet accepted → a real send failure; propagate so the caller
@@ -175,6 +181,8 @@ class SmtpSender:
                 self._host,
                 exc_info=True,
             )
+
+        return refused
 
     def _resolve_envelope_from(self, msg: Message, override: str | None) -> str:
         """Resolve the envelope ``MAIL FROM`` address (issue #322 / PR #404).
@@ -213,7 +221,7 @@ class SmtpSender:
         msg: Message,
         recipients: list[str],
         envelope_from: str,
-    ) -> None:
+    ) -> dict[str, tuple[int, bytes]]:
         """Log in with the AUTH credential and submit the message.
 
         The SMTP AUTH login (``self._email``) and the envelope ``MAIL FROM``
@@ -222,7 +230,7 @@ class SmtpSender:
         caller-supplied recipient list.
         """
         client.login(self._email, self._password)
-        client.send_message(msg, from_addr=envelope_from, to_addrs=recipients)
+        refused = client.send_message(msg, from_addr=envelope_from, to_addrs=recipients)
         logger.debug(
             "SMTP send via %s:%d as %s to %d recipient(s)",
             self._host,
@@ -230,3 +238,4 @@ class SmtpSender:
             envelope_from,
             len(recipients),
         )
+        return refused

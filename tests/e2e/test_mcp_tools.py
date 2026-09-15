@@ -448,3 +448,33 @@ class TestCreateDraftFallbackWarning:
             "create_draft", {"to": ["a@example.com"], "subject": "s", "body": "b"}
         )
         assert "warnings" not in result.structured_content
+
+
+async def test_update_draft_partial_outcome_survives_mcp_serialization(mock_mail, monkeypatch, tmp_path):
+    """A cleanup failure after creation is recoverable data, not a retryable error."""
+    monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+    mock_mail.get_draft_state.return_value = {
+        "to": ["a@example.com"], "subject": "test", "body": "body",
+        "from_account": "TestAccount", "content_type": "text/plain",
+    }
+    mock_mail.create_draft.return_value = {"draft_id": "202"}
+    mock_mail.delete_draft.side_effect = OSError("busy")
+    result = await server.mcp.call_tool("update_draft", {"draft_id": "201", "subject": "updated"})
+    assert result.structured_content["success"] and result.structured_content["partial"]
+    assert result.structured_content["draft_id"] == "202"
+    assert result.structured_content["original_draft_id"] == "201"
+
+
+async def test_smtp_partial_recipients_survive_mcp_serialization(mock_mail, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(server, "_run_send_now_gates", AsyncMock(return_value=None))
+    delivery = {"accepted_recipients": ["a@example.com"], "partial": True,
+                "refused_recipients": {"b@example.com": {"code": 550, "message": "refused"}}}
+    mock_mail.create_draft.return_value = {"draft_id": "", "delivery": delivery}
+    result = await server.mcp.call_tool("create_draft", {
+        "to": ["a@example.com", "b@example.com"], "subject": "test", "body": "body",
+        "send_now": True, "from_account": "TestAccount",
+    })
+    assert result.structured_content["success"]
+    assert result.structured_content["delivery"] == delivery

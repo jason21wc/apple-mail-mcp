@@ -5160,11 +5160,13 @@ class AppleMailConnector:
 
                 set inReplyTo to ""
                 set refs to ""
+                set contentType to ""
                 try
                     repeat with h in headers of foundDraft
                         set hname to (name of h)
                         if hname is "In-Reply-To" then set inReplyTo to (content of h)
                         if hname is "References" then set refs to (content of h)
+                        if hname is "Content-Type" then set contentType to (content of h)
                     end repeat
                 end try
 
@@ -5177,6 +5179,15 @@ class AppleMailConnector:
                     end repeat
                 end try
 
+                set originalSender to ""
+                try
+                    set originalSender to (sender of foundDraft)
+                end try
+                set fromAccount to ""
+                try
+                    set fromAccount to (name of account of mailbox of foundDraft)
+                end try
+
                 set draftSubject to ""
                 try
                     set draftSubject to (subject of foundDraft)
@@ -5186,7 +5197,7 @@ class AppleMailConnector:
                     set draftBody to (content of foundDraft)
                 end try
 
-                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames}}
+                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames, |from_account|:fromAccount, |content_type|:contentType, |sender|:originalSender}}
             end if
         end tell
         """
@@ -5196,6 +5207,15 @@ class AppleMailConnector:
         data = parse_applescript_json(raw)
         if not isinstance(data, dict) or not data.get("found"):
             raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
+        # An account override selects its first sender identity. If this draft
+        # used another alias, do not silently switch identity during replacement.
+        from email.utils import parseaddr
+
+        if data.get("from_account"):
+            original_sender = parseaddr(data.pop("sender", ""))[1]
+            configured_sender = parseaddr(self._resolve_account_to_sender(data["from_account"]))[1]
+            if not original_sender or original_sender.lower() != configured_sender.lower():
+                data["from_account"] = ""
         # Drop the internal flag from the user-visible payload.
         data.pop("found", None)
         return cast(dict[str, Any], data)
@@ -5739,7 +5759,7 @@ class AppleMailConnector:
         recipients: list[str],
         *,
         smtp_config: tuple[str, int, str],
-    ) -> None:
+    ) -> dict[str, Any]:
         """Enforce the test-mode reserved-domain guard, then submit
         ``raw_message`` over SMTP (issue #322).
 
@@ -5762,9 +5782,17 @@ class AppleMailConnector:
             raise MailSafetyError(violation)
         host, port, login_email = smtp_config
         password = self._get_imap_password_with_fallback(from_account, login_email)
-        SmtpSender(host, port, login_email, password, timeout=self.timeout).send(
+        refused = SmtpSender(host, port, login_email, password, timeout=self.timeout).send(
             raw_message, recipients
         )
+        return {
+            "accepted_recipients": [r for r in recipients if r not in refused],
+            "refused_recipients": {
+                recipient: {"code": code, "message": reason.decode("utf-8", errors="replace")}
+                for recipient, (code, reason) in refused.items()
+            },
+            "partial": bool(refused),
+        }
 
     def _send_new_via_smtp(
         self,
@@ -5777,7 +5805,7 @@ class AppleMailConnector:
         body: str,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Build a clean fresh-compose RFC 822 message and SMTP-send it
         (issue #322 — the ``seed="new"`` send analog of the #246 draft path).
         """
@@ -5794,12 +5822,12 @@ class AppleMailConnector:
             ),
         )
         recipients = list(to) + list(cc or []) + list(bcc or [])
-        self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
+        delivery = self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
         self._save_sent_copy(
             from_account, raw, answered=False, smtp_config=smtp_config
         )
-        return {"draft_id": "", "sent_message_id": ""}
+        return {"draft_id": "", "sent_message_id": "", "delivery": delivery}
 
     def _send_reply_forward_via_smtp(
         self,
@@ -5816,7 +5844,7 @@ class AppleMailConnector:
         reply_all: bool,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Rebuild a clean reply/forward from the original (fetched over IMAP)
         and SMTP-send it (issue #322 — the send analog of the #292 draft
         path). Recipient derivation and the transport-boundary safety guard
@@ -5840,7 +5868,7 @@ class AppleMailConnector:
             reply_all=reply_all,
             attachment_paths=attachment_paths,
         )
-        self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
+        delivery = self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
         # Reuse the connector already built for the original fetch — a reply
         # carries \\Answered in Sent.
@@ -5851,7 +5879,7 @@ class AppleMailConnector:
             smtp_config=smtp_config,
             imap=imap,
         )
-        return {"draft_id": "", "sent_message_id": ""}
+        return {"draft_id": "", "sent_message_id": "", "delivery": delivery}
 
     def _save_sent_copy(
         self,
@@ -5954,7 +5982,7 @@ class AppleMailConnector:
         body_html: str | None,
         reply_all: bool,
         attachment_paths: list[Path] | None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         """Try the clean, wrapper-free paths in order and return the first
         that engages, or ``None`` to fall through to AppleScript.
 
@@ -6023,7 +6051,7 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         """Clean SMTP send path for ``send_now=True`` (issue #322).
 
         Submits a wrapper-free RFC 822 message over SMTP instead of Mail.app's
@@ -6107,7 +6135,7 @@ class AppleMailConnector:
         from_account: str | None = None,
         send_now: bool = False,
         on_warning: Callable[[str], None] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Create a draft (fresh, reply, or forward). Optionally send.
 
         For ``seed="new"`` save-as-draft (``send_now=False``) with a known

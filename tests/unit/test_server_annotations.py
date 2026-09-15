@@ -64,6 +64,7 @@ MUTATING_TOOLS = DESTRUCTIVE_TOOLS | ADDITIVE_TOOLS
 
 # Idempotent: same args → same end state.
 NON_IDEMPOTENT_TOOLS: set[str] = {
+    "update_draft",   # retries can create/send again when the original is retained
     "create_draft",   # each call may create a new draft
     "create_rule",    # rules may be appended on each call
 }

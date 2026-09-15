@@ -8750,6 +8750,7 @@ class TestSmtpSendPath:
             connector, "_run_applescript", lambda s: scripts.append(s) or ""
         )
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             result = connector.create_draft(
                 seed="new",
                 to=["a@example.com"],
@@ -8766,7 +8767,7 @@ class TestSmtpSendPath:
         assert b"Hello there" in raw
         assert b"blockquote" not in raw.lower()  # FB11734014 wrapper absent
         assert recipients == ["a@example.com"]
-        assert result == {
+        assert {k: v for k, v in result.items() if k != "delivery"} == {
             "draft_id": "",
             "sent_message_id": "",
             "from_account": "Gmail",
@@ -8778,6 +8779,7 @@ class TestSmtpSendPath:
         self._configure_smtp(connector, monkeypatch)
         monkeypatch.setattr(connector, "_run_applescript", lambda s: "")
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             connector.create_draft(
                 seed="new",
                 to=["a@example.com"],
@@ -8808,6 +8810,7 @@ class TestSmtpSendPath:
             connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
         )
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             connector.create_draft(
                 seed="new",
                 to=["a@example.com"],
@@ -8828,6 +8831,7 @@ class TestSmtpSendPath:
             connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
         )
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             sender_cls.return_value.send.side_effect = (
                 smtplib.SMTPAuthenticationError(535, b"bad creds")
             )
@@ -8860,6 +8864,7 @@ class TestSmtpSendPath:
             "apple_mail_fast_mcp.smtp_sender.smtplib.SMTP"
         ) as mock_smtp:
             client = mock_smtp.return_value.__enter__.return_value
+            client.send_message.return_value = {}
             # send_message succeeds (message accepted); QUIT on `with` exit
             # returns non-221, which SMTP.__exit__ raises.
             mock_smtp.return_value.__exit__.side_effect = (
@@ -8877,7 +8882,7 @@ class TestSmtpSendPath:
         # Exactly one real SMTP submission, and no AppleScript duplicate.
         client.send_message.assert_called_once()
         assert not any("tell theMessage to send" in s for s in scripts)
-        assert result == {
+        assert {k: v for k, v in result.items() if k != "delivery"} == {
             "draft_id": "",
             "sent_message_id": "",
             "from_account": "Gmail",
@@ -8899,6 +8904,7 @@ class TestSmtpSendPath:
             connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
         )
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             connector.create_draft(
                 seed="new",
                 to=["a@example.com"],
@@ -8962,6 +8968,7 @@ class TestSmtpSendPath:
             lambda **kw: ("<m@id>", b"rawreply", ["orig@example.net"]),
         )
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             result = connector._try_smtp_send(
                 seed="reply", seed_id="orig@id", seed_mailbox="INBOX",
                 send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
@@ -8970,7 +8977,7 @@ class TestSmtpSendPath:
         sender_cls.return_value.send.assert_called_once_with(
             b"rawreply", ["orig@example.net"]
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert {k: v for k, v in result.items() if k != "delivery"} == {"draft_id": "", "sent_message_id": ""}
 
     def test_reply_forward_folder_miss_falls_back(
         self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
@@ -8982,6 +8989,7 @@ class TestSmtpSendPath:
 
         monkeypatch.setattr(connector, "_build_reply_forward_mime", _miss)
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             result = connector._try_smtp_send(
                 seed="reply", seed_id="orig@id", seed_mailbox="Archive",
                 send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
@@ -9139,7 +9147,7 @@ class TestSmtpSendPath:
             )
         # The failure was swallowed: normal success dict, single SMTP send,
         # and crucially NO AppleScript fallback send.
-        assert result == {
+        assert {k: v for k, v in result.items() if k != "delivery"} == {
             "draft_id": "",
             "sent_message_id": "",
             "from_account": "Gmail",
@@ -9156,6 +9164,7 @@ class TestSmtpSendPath:
             connector, "_get_imap_password_with_fallback", lambda a, e: "pw"
         )
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             with pytest.raises(MailSafetyError):
                 connector._smtp_send(
                     "Gmail",
@@ -9174,6 +9183,7 @@ class TestSmtpSendPath:
         )
         monkeypatch.setattr(connector, "_imap_clear_breaker", lambda a: None)
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             connector._smtp_send(
                 "Gmail",
                 b"raw",
@@ -9202,6 +9212,7 @@ class TestSmtpSendPath:
             ),
         )
         with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.return_value = {}
             with pytest.raises(MailSafetyError):
                 connector._try_smtp_send(
                     seed="reply", seed_id="orig@id", seed_mailbox="INBOX",
@@ -10041,3 +10052,23 @@ class TestBadMailboxHintDoesNotOpenBreaker:
             conn._resolve_anchor_via_imap("a@b.com", "iCloud", "INBOX")
 
         assert conn._imap_breaker_open("iCloud")
+
+
+def test_smtp_partial_acceptance_does_not_fall_back_to_applescript(monkeypatch):
+    connector = AppleMailConnector()
+    TestSmtpSendPath()._configure_smtp(connector, monkeypatch)
+    with patch.object(connector, "_run_applescript") as applescript, \
+         patch("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP") as smtp:
+        client = smtp.return_value.__enter__.return_value
+        client.send_message.return_value = {"refused@example.com": (550, b"No mailbox")}
+        smtp.return_value.__exit__.side_effect = smtplib.SMTPResponseException(421, b"bye")
+        result = connector.create_draft(
+            to=["accepted@example.com", "refused@example.com"], subject="test", body="body",
+            from_account="TestAccount", send_now=True,
+        )
+    assert result["delivery"] == {
+        "accepted_recipients": ["accepted@example.com"], "partial": True,
+        "refused_recipients": {"refused@example.com": {"code": 550, "message": "No mailbox"}},
+    }
+    applescript.assert_not_called()
+    client.send_message.assert_called_once()

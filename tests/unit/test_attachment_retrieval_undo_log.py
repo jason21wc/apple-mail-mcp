@@ -216,3 +216,63 @@ class TestUndoLog:
         assert undo["missing"] == 1  # f_gone
         assert not f_ok.exists()  # deleted
         assert f_edit.exists() and f_edit.read_text() == "USER EDITED"  # preserved
+
+
+def test_undo_old_run_leaves_new_identical_save(capsys, tmp_path):
+    f = _saved_file(tmp_path)
+    _run(capsys, "record", "--recipe", "r", "--run-id", "A", "--dest-path", str(f))
+    f.rename(f.with_suffix(".old"))
+    f.write_text("hello")
+    _run(capsys, "record", "--recipe", "r", "--run-id", "B", "--dest-path", str(f))
+    _, result = _run(capsys, "undo", "--recipe", "r", "--run-id", "A")
+    assert result["deleted"] == 0 and f.read_text() == "hello"
+    _, result = _run(capsys, "undo", "--recipe", "r", "--run-id", "B")
+    assert result["deleted"] == 1 and not f.exists()
+
+
+def test_undo_refuses_external_byte_twin(capsys, tmp_path):
+    f = _saved_file(tmp_path)
+    _run(capsys, "record", "--recipe", "r", "--run-id", "A", "--dest-path", str(f))
+    f.rename(f.with_suffix(".old"))
+    f.write_text("hello")
+    _, result = _run(capsys, "undo", "--recipe", "r", "--run-id", "A")
+    assert result["modified_skipped"] == 1 and f.exists()
+
+
+def test_legacy_log_cannot_delete(capsys, tmp_path):
+    f = _saved_file(tmp_path)
+    _run(capsys, "record", "--recipe", "r", "--run-id", "A", "--dest-path", str(f))
+    log = tmp_path / "retrieval_runs/r.json"
+    data = json.loads(log.read_text())
+    del data["records"][0]["identity"]
+    log.write_text(json.dumps(data))
+    _, result = _run(capsys, "undo", "--recipe", "r", "--run-id", "A")
+    assert result["modified_skipped"] == 1 and f.exists()
+
+
+def test_concurrent_records_are_not_lost(tmp_path):
+    import subprocess
+    import sys
+
+    processes = []
+    for i in range(12):
+        f = _saved_file(tmp_path, f"{i}.txt")
+        processes.append(subprocess.Popen([
+            sys.executable, str(_HELPER), "record", "--recipe", "r", "--run-id", str(i),
+            "--dest-path", str(f),
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stderr
+        assert json.loads(stdout)["success"]
+    records = json.loads((tmp_path / "retrieval_runs/r.json").read_text())["records"]
+    assert {r["run_id"] for r in records} == {str(i) for i in range(12)}
+
+
+def test_stable_names_do_not_depend_on_search_order():
+    sources = [("one@example.com", "report.pdf", 0), ("two@example.com", "report.pdf", 0),
+               ("one@example.com", "report.pdf", 1)]
+    first = {source: undo_log.stable_filename(*source) for source in sources}
+    reordered = {source: undo_log.stable_filename(*source) for source in reversed(sources)}
+    assert first == reordered and len(set(first.values())) == 3
+    assert undo_log.stable_filename("<one@example.com>", "report.pdf", 0) == first[sources[0]]

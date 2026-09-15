@@ -317,7 +317,9 @@ def _validate_message_ids(message_ids: list[str]) -> None:
         _bracket_message_id(mid)
 
 
-def _or_message_id_criteria(message_ids: list[str]) -> list[Any]:
+def _or_message_id_criteria(
+    message_ids: list[str], headers: tuple[str, ...] = ("Message-ID",),
+) -> list[Any]:
     """Build an IMAP SEARCH criteria matching ANY of ``message_ids`` by
     ``HEADER "Message-ID"``, so a batch resolves in one round-trip. (#316)
 
@@ -327,8 +329,8 @@ def _or_message_id_criteria(message_ids: list[str]) -> list[Any]:
     ``["OR", a, ["OR", b, c]]``. Assumes ``message_ids`` is non-empty.
     """
     clauses = [
-        ["HEADER", "Message-ID", _bracket_message_id(mid)]
-        for mid in message_ids
+        ["HEADER", header, _bracket_message_id(mid)]
+        for mid in message_ids for header in headers
     ]
     criteria: list[Any] = clauses[-1]
     for clause in reversed(clauses[:-1]):
@@ -2322,7 +2324,7 @@ class ImapConnector:
         Returns ``None`` (not raise) when THREAD gets rejected
         mid-flight — dispatcher then falls through to Tier 3.
         """
-        bracketed = _bracket_message_id(anchor_rfc_message_id)
+        seed_ids = list(dict.fromkeys([anchor_rfc_message_id, *anchor_references]))
         # Pick the algorithm name the server actually advertises.
         if self._has_capability(client, b"THREAD=REFERENCES"):
             algo = "REFERENCES"
@@ -2349,15 +2351,18 @@ class ImapConnector:
                 continue
             # Narrow-search: anchor UID + sibling-replies in this mailbox.
             try:
-                anchor_uids = client.search(
-                    ["HEADER", "Message-ID", bracketed]
-                )
-                ref_uids = client.search(
-                    ["HEADER", "References", bracketed]
-                )
+                relevant_uids: set[int] = set()
+                headers = ("Message-ID", "References", "In-Reply-To")
+                bracketed = _bracket_message_id(seed_ids[0])
+                for header in headers:
+                    relevant_uids.update(client.search(["HEADER", header, bracketed]))
+                # Bound OR depth/command size and round trips for long chains.
+                for start in range(1, len(seed_ids), 25):
+                    relevant_uids.update(client.search(
+                        _or_message_id_criteria(seed_ids[start:start + 25], headers)
+                    ))
             except IMAPClientError:
                 continue
-            relevant_uids = set(anchor_uids) | set(ref_uids)
             if not relevant_uids:
                 continue
             # Run THREAD; walk tree for clusters intersecting relevant_uids.
