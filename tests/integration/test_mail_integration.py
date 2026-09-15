@@ -2751,11 +2751,13 @@ class TestBulkRfcIdDoesNotFreezeMail:
         numeric_id = None
         moved = False
         try:
+            TestDraftsLifecycleIntegration._wait_for_draft(connector, draft_id)
             numeric_id = connector._resolve_draft_lookup_id(draft_id)
             if "@" not in draft_id:
                 pytest.skip("RFC-ID regression requires the IMAP draft path")
             # The indexed RFC resolver searches INBOX/Sent. Move only this
-            # newly created fixture into INBOX, then test the original broad shape.
+            # newly created fixture into INBOX; keep all live mutations scoped.
+            # Unit tests cover the original unscoped input shape.
             moved_count = connector.update_message(
                 [numeric_id], destination_mailbox="INBOX", account=test_account,
                 source_mailbox="Drafts",
@@ -2763,13 +2765,17 @@ class TestBulkRfcIdDoesNotFreezeMail:
             assert moved_count == 1, "Disposable fixture was not moved; retain Drafts cleanup"
             moved = True
             started = time.monotonic()
-            count = connector.update_message([draft_id], flag_color="orange")
-            assert count >= 1
+            count = connector.update_message(
+                [draft_id], flag_color="orange", account=test_account, source_mailbox="INBOX"
+            )
+            assert count == 1
             assert time.monotonic() - started < 180
             assert connector.list_accounts()  # Mail still responds after the mutation.
         finally:
             if moved:
-                connector.delete_messages([draft_id], account=test_account, source_mailbox="INBOX")
+                assert connector.delete_messages(
+                    [draft_id], account=test_account, source_mailbox="INBOX"
+                ) == 1
             else:
                 connector.delete_draft(draft_id)
 
@@ -3146,6 +3152,13 @@ class TestDraftReplacementReliability:
             )
             assert replacement["from_account"] == test_account
             assert replacement["attachment_names"] == ["fixture.txt"]
+            extracted_dir = tmp_path / "recovered"
+            extracted_dir.mkdir()
+            recovered = connector.extract_draft_attachments(
+                result["draft_id"], replacement["attachment_names"], extracted_dir,
+            )
+            assert len(recovered) == 1
+            assert recovered[0].read_bytes() == attachment.read_bytes()
             assert "Updated disposable draft" in replacement["body"]
             with pytest.raises(MailDraftNotFoundError):
                 connector.get_draft_state(original)
