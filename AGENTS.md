@@ -1,104 +1,154 @@
-<!-- scaffold: code/standard template-v2.68.0 2026-08-21 -->
-# apple-mail
+# Apple Mail Fast MCP — shared agent instructions
 
-**Description:** CHMG fork of the Apple Mail MCP server — an MCP bridge between AI agents and Apple Mail via AppleScript + a direct-IMAP fast path, on macOS.
-**Framework:** AI Coding Methods (current version)
-**Mode:** Standard
+This is the canonical project guidance for Codex and Claude Code. Read it at the
+start of work, then load only the domain references needed for the task.
 
-This is the shared body, read natively by Codex and imported by `CLAUDE.md`
-and `GEMINI.md`. It is a **pointer file**, not a copy: the detailed project
-rules live in `.claude/CLAUDE.md` and the reference docs live in `docs/`.
-Nothing here restates them, because a copy drifts from what it copied.
+## CHMG fork overlay (takes precedence over upstream workflow below)
 
-## Read This First
+This public repository is a thin fork of `s-morgan-jeffries/apple-mail-fast-mcp`.
+Read root `ARCHITECTURE.md` and `SPECIFICATION.md` for fork boundaries; the
+reference architecture below describes server internals. Keep upstream syncs small.
+Use `codex/` branches for Codex work. User-authorized maintenance may proceed
+without opening an upstream issue. Never post to maintainers without authorization.
 
-- **`.claude/CLAUDE.md`** — the project rules: commands, API surface, core
-  principles, AppleScript gotchas, testing requirements, branch convention.
-  Upstream owns this file; the fork adds only the header block. **Read it
-  before making any change.**
-- **`ARCHITECTURE.md`** (root) — the *fork's* architecture: where the fork
-  boundary falls, the governance and memory layers, trust boundaries.
-- **`SPECIFICATION.md`** (root) — what the fork is for and what it is not for.
-- **`docs/reference/TOOLS.md`** — the canonical tool list.
-- **`docs/reference/ARCHITECTURE.md`** — the *server's* internals (upstream-owned).
+Project memory lives in gitignored `_ai-context/`: read `SESSION-STATE.md`,
+`PROJECT-MEMORY.md`, `LEARNING-LOG.md`, and `OPERATIONS.md` at session start,
+and update session state at closeout. It contains private business context and
+must not be committed to this public repository.
 
-Derivable facts — test counts, coverage, tool counts, line counts — are not
-pinned in any instruction file. Run `make test` / `make coverage` and read
-`docs/reference/TOOLS.md`. Pinning them is how they rot.
+Dogfood ai-governance: call `evaluate_governance` before non-read actions,
+`query_project` before changing code/content, and `search_references` before
+nontrivial implementation. Act on the assessment and cite influencing principles.
+The server runtime must run behind ai-governance-proxy in hard mode, never
+launch it directly. Mocked unit tests do not require a live server.
 
-## Memory Files
+The fork's standing behavior is documented in root `ARCHITECTURE.md`; keep
+additional reliability changes bounded and suitable for upstream adoption.
+The fork-only attachment workflow is `.claude/skills/attachment-retrieval/`.
+Establish a baseline with `make test` before implementation.
 
-Project memory lives in `_ai-context/`. **This project deviates from the
-framework default: `_ai-context/` is gitignored, not committed.** This
-repository is PUBLIC and the memory carries CHMG business context (senders,
-account structure, credential env-var patterns, migration plans). Every agent
-still reads these files from disk, so cross-agent memory works fully; only
-publication is withheld. The loaders below ARE committed.
+## Project map
 
-- `_ai-context/SESSION-STATE.md` — current position, quick reference, next actions
-- `_ai-context/PROJECT-MEMORY.md` — decisions, constraints, gotchas
-- `_ai-context/LEARNING-LOG.md` — active lessons
-- `_ai-context/BACKLOG.md` — deferred work that finishes
-- `_ai-context/OPERATIONS.md` — recurring commitments that never finish: cadences, tripwires, standing authorizations, metrics
+Python 3.10+, FastMCP, AppleScript via `osascript`, IMAP via `imapclient`, and
+SMTP. The server exposes structured MCP tools for Apple Mail on macOS.
 
-The host tool's own built-in memory is separate — leave it to the host.
+All modules below live in `src/apple_mail_fast_mcp/`:
 
-## Session Start
+- `server.py`: tool registration, validation, confirmation gates, responses.
+- `mail_connector.py`: domain logic and dispatch between AppleScript and network paths.
+- `imap_connector.py`: IMAP reads, mutations, connection pool, and tiered thread
+  lookup (Gmail X-GM-THRID, IMAP THREAD, header-search BFS).
+- `draft_builder.py`, `smtp_sender.py`: MIME construction and clean SMTP sends.
+  Drafts can use IMAP APPEND; compose/send is not exclusively AppleScript.
+  Credentials and account/seed information determine which path engages.
+- `security.py`, `utils.py`, `exceptions.py`: safety gates, sanitization, escaping,
+  parsing, and typed errors.
+- `drafts.py`, `templates.py`, `imap_overrides.py`, `keychain.py`: state and credentials.
 
-1. Read `_ai-context/SESSION-STATE.md` — current position, next actions
-2. Read `_ai-context/PROJECT-MEMORY.md` — decisions, constraints, gotchas
-3. Read `_ai-context/LEARNING-LOG.md` — active lessons
-4. If present, check `_ai-context/OPERATIONS.md` for cadences now due and tripwires whose condition has become true
-5. Run `make test` — establish a known-good baseline before changing anything
+AppleScript is the baseline for many operations, with optional IMAP fast paths.
+Some mailbox operations require IMAP. Fallback is not a guarantee of equivalent
+latency or completeness: preserve partial/incomplete-result reporting and never
+turn an indeterminate lookup into a definitive not-found result.
 
-## Governance
+Use [TOOLS.md](docs/reference/TOOLS.md) for the API and
+[ARCHITECTURE.md](docs/reference/ARCHITECTURE.md) for dispatch details. Read current
+code before changing a path. `pyproject.toml` is authoritative for version and
+dependencies; collect tests and run coverage for current counts. Do not add
+hand-maintained line counts, timings, or test totals to these instructions.
 
-Guidance for any host with the ai-governance MCP server connected (the
-*enforcement* mechanism, where one exists, lives in the platform overlay such as
-CLAUDE.md — not here):
-- `evaluate_governance(planned_action="...")` — before any non-read action
-- `query_project(query="...")` — before creating or modifying code/content
-- `search_references(query="...")` — before implementing a pattern, to reuse proven precedent from the shared Reference Library
-- `capture_reference(...)` — after solving a non-obvious, reusable problem, to bank the lesson in the shared, central Reference Library
+## Working a GitHub issue
 
-The MCP server itself runs ONLY behind ai-governance-proxy in hard mode, per
-`claude_desktop_config.json`. Never launch it directly.
+GitHub is the source of truth for planned work and status. Follow
+[CONTRIBUTING.md](CONTRIBUTING.md) and the repository PR template.
 
-## Key Commands
+1. Inspect the working tree, current branch, issue body/comments/assignees,
+   milestone, and open PRs before coding. Respect existing claims and contributor
+   work; do not duplicate an in-flight fix. Preserve unrelated local changes.
+2. Work from an issue. For new work, file one first; for an existing issue, record
+   the claim as described in CONTRIBUTING when authorized to post. A request to
+   review an issue alone is not a request to implement it.
+3. Start from current `origin/main` on `{type}/issue-{num}-{description}`
+   (`feature/`, `fix/`, or `docs/`). Do not commit directly to `main`.
+4. For code changes use RED/GREEN/REFACTOR. Keep connector behavior and MCP
+   exposure aligned when the API changes; internal or documentation work need
+   not modify both modules. Run the relevant checks below before pushing.
+5. Open a PR against `main`, using the PR template and `Closes #N` for completed
+   issues (or `Related to #N` for partial work). Explain behavior and validation,
+   including checks that could not run. Assign the issue's milestone to the PR.
+6. After pushing/opening a PR, inspect checks for that PR/current commit. Do not
+   report an unrelated latest repository run as this branch's CI result.
+7. When asked to merge, follow [MERGE_AND_STATUS.md](docs/guides/MERGE_AND_STATUS.md):
+   wait for CI, squash merge ordinary PRs, delete the branch, update local main,
+   surface contributor PRs and untriaged contributor issues with counts, then
+   report remaining milestone work. Never silently close outside contributions.
+
+`CHANGELOG.md` and version bumps belong on release branches. Use
+`./scripts/create_tag.sh` for tags. Release PRs use the release procedure's rebase
+merge, not the ordinary PR squash workflow. Read the release reference only when
+performing release work; setup or feature work does not execute a release.
+
+## Setup and validation
 
 ```bash
-make test                  # Unit tests (~5s, mocked AppleScript)
-make test-integration      # Real Mail.app tests (requires MAIL_TEST_ACCOUNT)
-make test-e2e              # End-to-end MCP tool tests
-make check-all             # Everything: lint, typecheck, test, complexity, version-sync, parity
-make lint / format / typecheck / coverage
+uv sync --dev
+./scripts/install-git-hooks.sh
+gh auth status
+make check-all
 ```
 
-Unit tests mock `_run_applescript()` and **cannot** catch AppleScript bugs. If
-you touched AppleScript, integration tests must cover it before merge.
+The Git hooks are shared by both agents. Claude's `.claude/settings.json` hooks
+are not this project's Codex automation: explicitly perform the session checks,
+branch/tag safeguards, and CI monitoring above. See the full mapping and a
+fresh-session smoke check in [CODEX.md](docs/guides/CODEX.md).
 
-## Project Structure
+| Change | Validation |
+|---|---|
+| All changes | `make check-all` (lint, mypy, unit tests, complexity, version sync, parity, doc drift) |
+| Coverage assessment | `make coverage` (90% minimum; CI enforces coverage separately from `make check-all`) |
+| AppleScript changes | Integration tests covering the changed operation, then `make test-integration` on a dedicated test account |
+| IMAP paths, AppleScript paths, or elicitation-gated tools | `make test-e2e` before pushing, per CONTRIBUTING |
+| New/modified MCP tools | E2E coverage and updated TOOLS.md; regenerate eval descriptions if needed |
+| Performance work | Profile the actual path/account first; use `make benchmark` and [BENCHMARKING.md](docs/guides/BENCHMARKING.md) |
 
-```
-src/apple_mail_fast_mcp/
-  mail_connector.py    AppleScript client (upstream-owned; ONE temporary fork
-                       exception — get_thread hints, upstream PR #439)
-  imap_connector.py    Direct-IMAP fast path (same temporary exception)
-  smtp_sender.py       SMTP submission for send_now
-  server.py            FastMCP server — where BOTH fork modifications live
-  security.py          Input validation, audit logging, test-mode safety gate
-  utils.py             Escaping, parsing, validation
-.claude/skills/        Project skills, incl. attachment-retrieval (fork-only)
-_ai-context/           Project memory (gitignored — see above)
-docs/reference/        Canonical API + architecture docs
-```
+Unit tests mock real I/O. Full integration/e2e/benchmark runs have additional
+prerequisites and are excluded from CI. Read [TESTING.md](docs/guides/TESTING.md)
+and relevant fixtures before running them. Use `MAIL_TEST_MODE=true` and an
+explicit dedicated `MAIL_TEST_ACCOUNT`; never assume a default account is safe.
+Test-mode gates are not universal isolation (see open #352); inspect the targeted
+operations and fixtures. Do not send real email as a setup smoke test.
 
-## Upstream
+## Implementation rules
 
-Fork of `s-morgan-jeffries/apple-mail-fast-mcp`. The fork is deliberately
-**thin** — two behavioral modifications in `server.py`, plus temporary,
-upstream-bound exceptions: connector `get_thread` hints (upstream PR #439)
-and consequence-gating fixes (upstream #441/#444). See `ARCHITECTURE.md`. Sync **small and
-often**; letting it drift is what turned one past sync into a 109-conflict
-ordeal. See `ARCHITECTURE.md` for the fork boundary and `_ai-context/OPERATIONS.md`
-for the sync cadence.
+- Return structured `{"success": bool, ...}` responses; errors include `error`
+  and `error_type`. Preserve typed failures and partial-result semantics.
+- Follow [SECURITY_CHECKLIST.md](docs/guides/SECURITY_CHECKLIST.md): sanitize inputs,
+  escape interpolated AppleScript strings, validate path-bearing names, apply
+  rate limits and audit logging, and consider confirmation for effects.
+- Use the existing AppleScript JSON wrapper/parser (`NSJSONSerialization`), quote
+  record key `|name|`, and coerce `missing value` before serialization. Let errors
+  that need typed routing reach `_run_applescript` via stderr.
+- Build AppleScript dates with `_construct_as_date_var`, never date-string literals.
+- Numeric Mail IDs and RFC Message-IDs are different. Preserve both ID forms;
+  avoid unindexed `whose message id is ...` scans that freeze Mail. Use existing
+  resolvers and account/mailbox hints. Profile property reads as well as subprocess
+  and network costs; batching is not automatically faster (see #450).
+- Gmail labels need provider-aware handling. `gmail_mode` is deprecated; do not
+  introduce it on new tools. Inspect current connector behavior before changing moves.
+- Persistent application data uses `~/.apple_mail_mcp/` or `APPLE_MAIL_MCP_HOME`.
+  Resolve storage roots at use time and validate filename stems before building
+  paths. Keep credentials out of source, issue bodies, and logs.
+
+## Domain references
+
+These remain single-source files under `.claude/skills/`. Codex should open them
+as task-specific references; no copied Codex skill installation is required.
+Their historical examples can lag current behavior. The current rules above and
+maintained API docs take precedence over stale tool counts, old timings, or
+examples claiming that rule mutation is unimplemented.
+
+- AppleScript work: [applescript-mail](.claude/skills/applescript-mail/SKILL.md)
+- API changes: [api-design](.claude/skills/api-design/SKILL.md)
+- Real-Mail testing: [integration-testing](.claude/skills/integration-testing/SKILL.md)
+- Performance work: [performance-patterns](.claude/skills/performance-patterns/SKILL.md)
+- Releases: [release](.claude/skills/release/SKILL.md). If a named reviewer plugin
+  is unavailable, use an available review workflow and report that substitution.
