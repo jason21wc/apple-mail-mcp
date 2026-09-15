@@ -1109,6 +1109,11 @@ current state, creates a new draft with merged fields, and only then
 removes the original. Threading headers (for replies) and forward anchors
 are preserved via persisted seed metadata.
 
+Saved replacements require working IMAP access: the generated RFC Message-ID
+identifies the saved replacement reliably. If that path is unavailable,
+`update_draft` returns `draft_error` and keeps the original; it does not create
+an AppleScript replacement whose numeric ID may change during synchronization.
+
 **⚠️ Returns a NEW `draft_id`** — the input id is no longer valid
 after a complete replacement. Partial outcomes can retain the original.
 Callers caching the id must re-read the response.

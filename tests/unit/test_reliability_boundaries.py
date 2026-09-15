@@ -100,6 +100,56 @@ async def test_replacement_created_before_cleanup_and_sender_preserved(draft_mai
     calls = [call[0] for call in draft_mail.mock_calls]
     assert calls.index("create_draft") < calls.index("delete_draft")
     assert draft_mail.create_draft.call_args.kwargs["from_account"] == "TestAccount"
+    assert draft_mail.create_draft.call_args.kwargs["require_stable_id"] is True
+
+
+async def test_rejected_imap_login_never_creates_fallback_or_deletes_original(
+    draft_mail, monkeypatch,
+):
+    from imapclient.exceptions import LoginError
+
+    connector = AppleMailConnector()
+    monkeypatch.setattr(server, "mail", connector)
+    monkeypatch.setattr(connector, "get_draft_state", draft_mail.get_draft_state)
+    store = DraftStateStore()
+    with patch.object(connector, "_create_draft_via_imap",
+                      side_effect=LoginError("rejected")) as append, \
+         patch.object(connector, "_run_applescript") as transport, \
+         patch.object(connector, "delete_draft") as delete:
+        result = await server.update_draft("101", body="replacement")
+    assert result["error_type"] == "draft_error"
+    assert "Original draft retained" in result["error"]
+    append.assert_called_once()
+    transport.assert_not_called()
+    delete.assert_not_called()
+    assert not store.root.exists()
+
+
+@pytest.mark.parametrize("seed,seed_id", [("new", None), ("reply", "seed@example.com"),
+                                         ("forward", "seed@example.com")])
+def test_stable_save_refuses_unavailable_clean_path(seed, seed_id):
+    connector = AppleMailConnector()
+    with patch.object(connector, "_try_clean_create_or_send", return_value=None), \
+         patch.object(connector, "_run_applescript") as transport:
+        with pytest.raises(MailDraftError, match="requires working IMAP"):
+            connector.create_draft(
+                seed=seed, seed_id=seed_id, to=["a@example.com"], subject="test",
+                from_account="TestAccount", require_stable_id=True,
+            )
+    transport.assert_not_called()
+
+
+def test_stable_save_accepts_imap_identity():
+    connector = AppleMailConnector()
+    expected = {"draft_id": "generated@example.com"}
+    with patch.object(connector, "_try_clean_create_or_send", return_value=expected), \
+         patch.object(connector, "_run_applescript") as transport:
+        result = connector.create_draft(
+            to=["a@example.com"], subject="test", from_account="TestAccount",
+            require_stable_id=True,
+        )
+    assert result == expected
+    transport.assert_not_called()
 
 
 async def test_cleanup_failure_reports_both_ids(draft_mail):
@@ -139,6 +189,7 @@ async def test_send_partial_result_survives_cleanup_failure(draft_mail, monkeypa
     result = await server.update_draft("101", send_now=True)
     assert result["success"] and result["delivery"] == delivery
     draft_mail.create_draft.assert_called_once()
+    assert draft_mail.create_draft.call_args.kwargs["require_stable_id"] is False
 
 
 @pytest.mark.parametrize("sender,expected", [("Test <test@example.com>", "TestAccount"),

@@ -3735,6 +3735,8 @@ async def update_draft(
     **Returns a NEW draft_id** — Mail.app forbids mutating saved drafts,
     so update is implemented by reading the draft's current state,
     creating a replacement with merged fields, then removing the original.
+    Saving a replacement requires working IMAP access for a stable identity;
+    if unavailable, the operation fails and retains the original draft.
     Threading headers (for reply seeds) and forward anchor are preserved
     via persisted seed metadata.
 
@@ -3859,6 +3861,7 @@ async def update_draft(
             reply_all=reply_all,
             from_account=from_account,
             send_now=send_now,
+            require_stable_id=not send_now,
         )
         return _finish_draft_replacement(
             result, draft_id, store, seed_kind, seed_id, reply_all, send_now,

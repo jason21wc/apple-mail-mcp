@@ -2746,6 +2746,7 @@ class TestBulkRfcIdDoesNotFreezeMail:
         draft = connector.create_draft(
             to=["fixture@example.invalid"], subject=f"MCP TEST {uuid.uuid4()}",
             body="Disposable bulk mutation fixture", from_account=test_account,
+            require_stable_id=True,
         )
         draft_id = draft["draft_id"]
         numeric_id = None
@@ -3127,9 +3128,12 @@ class TestDraftReplacementReliability:
         import uuid
 
         from apple_mail_fast_mcp import server
+        from apple_mail_fast_mcp.drafts import DraftStateStore
         from apple_mail_fast_mcp.exceptions import MailDraftNotFoundError
 
-        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path / "state"))
+        # Isolate seed metadata without hiding the account's IMAP overrides.
+        store = DraftStateStore(tmp_path / "state")
+        monkeypatch.setattr(server, "_get_draft_state_store", lambda: store)
         monkeypatch.setattr(server, "mail", connector)
         attachment = tmp_path / "fixture.txt"
         attachment.write_text("Disposable attachment fixture")
@@ -3137,12 +3141,23 @@ class TestDraftReplacementReliability:
             to=["fixture@example.invalid"], subject=f"MCP TEST {uuid.uuid4()}",
             body="Disposable draft", from_account=test_account,
             attachment_paths=[attachment],
+            require_stable_id=True,
         )["draft_id"]
         cleanup_ids = [original]
         try:
             state = TestDraftsLifecycleIntegration._wait_for_draft(connector, original)
             assert state["from_account"] == test_account
             assert state["content_type"]
+            # Even with a working account, exercise unavailable IMAP against
+            # this owned fixture and prove the saved original survives intact.
+            with monkeypatch.context() as unavailable:
+                unavailable.setattr(connector, "_try_clean_create_or_send", lambda **kw: None)
+                refused = await server.update_draft(original, body="Must not replace")
+            assert not refused["success"] and refused["error_type"] == "draft_error", refused
+            retained = connector.get_draft_state(original)
+            assert retained["body"] == state["body"]
+            assert retained["attachment_names"] == state["attachment_names"]
+            assert retained["from_account"] == state["from_account"]
             result = await server.update_draft(original, body="Updated disposable draft")
             if result.get("draft_id"):
                 cleanup_ids.append(result["draft_id"])

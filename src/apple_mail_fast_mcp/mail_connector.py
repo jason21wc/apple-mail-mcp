@@ -36,6 +36,7 @@ from .exceptions import (
     MailAppleScriptError,
     MailAttachmentIndexError,
     MailAttachmentTooLargeError,
+    MailDraftError,
     MailDraftHtmlUnavailableError,
     MailDraftNotFoundError,
     MailImapMoveUnsupportedError,
@@ -6135,6 +6136,7 @@ class AppleMailConnector:
         from_account: str | None = None,
         send_now: bool = False,
         on_warning: Callable[[str], None] | None = None,
+        require_stable_id: bool = False,
     ) -> dict[str, Any]:
         """Create a draft (fresh, reply, or forward). Optionally send.
 
@@ -6203,6 +6205,11 @@ class AppleMailConnector:
                 string when a save-as-draft falls back to the AppleScript
                 path (whose body carries Mail.app's cite-blockquote wrapper,
                 FB11734014) instead of the clean IMAP path. (#270)
+            require_stable_id: For saved-draft replacement, require the
+                IMAP path's generated RFC Message-ID. If unavailable, fail
+                before creating an AppleScript draft: its first-new-ID
+                heuristic cannot prove replacement identity. Ignored when
+                sending, which returns no draft ID.
             send_now: ``False`` saves as draft and returns
                 ``{"draft_id": ...}``. ``True`` sends and returns
                 ``{"draft_id": "", "sent_message_id": ""}`` (sent_message_id
@@ -6248,17 +6255,7 @@ class AppleMailConnector:
         if clean_result is not None:
             return clean_result
 
-        # HTML drafts exist only on the clean IMAP path (Mail.app's
-        # AppleScript `content` setter is plain-text only). If the IMAP path
-        # couldn't engage, fail loud rather than silently dropping the HTML
-        # into a plain-text AppleScript draft. (#251)
-        if body_html is not None:
-            raise MailDraftHtmlUnavailableError(
-                "HTML drafts require IMAP credentials"
-                + (f" for account {effective_account!r}" if effective_account else "")
-                + ". Opt in to Keychain IMAP access (see docs) or omit "
-                "body_html to create a plain-text draft."
-            )
+        self._validate_draft_fallback(require_stable_id, send_now, body_html, effective_account)
 
         # Committed to the AppleScript path, which carries Mail.app's
         # cite-blockquote wrapper (FB11734014). Warn save-as-draft callers
@@ -6426,6 +6423,31 @@ class AppleMailConnector:
             "sent_message_id": "",
             "from_account": effective_account or "",
         }
+
+    @staticmethod
+    def _validate_draft_fallback(
+        require_stable_id: bool, send_now: bool, body_html: str | None,
+        effective_account: str | None,
+    ) -> None:
+        """Refuse fallback when it cannot preserve the caller's requirements."""
+        if require_stable_id and not send_now:
+            raise MailDraftError(
+                "Draft replacement requires working IMAP access to identify the "
+                "saved replacement reliably. Original draft retained; no "
+                "AppleScript replacement was created."
+            )
+
+        # HTML drafts exist only on the clean IMAP path (Mail.app's
+        # AppleScript `content` setter is plain-text only). If the IMAP path
+        # couldn't engage, fail loud rather than silently dropping the HTML
+        # into a plain-text AppleScript draft. (#251)
+        if body_html is not None:
+            raise MailDraftHtmlUnavailableError(
+                "HTML drafts require IMAP credentials"
+                + (f" for account {effective_account!r}" if effective_account else "")
+                + ". Opt in to Keychain IMAP access (see docs) or omit "
+                "body_html to create a plain-text draft."
+            )
 
     def _sync_account_drafts(self, account: str | None) -> None:
         """Best-effort: poke Mail.app to synchronize ``account`` so a

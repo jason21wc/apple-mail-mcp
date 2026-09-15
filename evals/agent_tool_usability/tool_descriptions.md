@@ -435,6 +435,8 @@ Update an existing draft by creating a replacement before removing the original.
 **Returns a NEW draft_id** — Mail.app forbids mutating saved drafts,
 so update is implemented by reading the draft's current state,
 creating a replacement with merged fields, then removing the original.
+Saving a replacement requires working IMAP access for a stable identity;
+if unavailable, the operation fails and retains the original draft.
 Threading headers (for reply seeds) and forward anchor are preserved
 via persisted seed metadata.
 
