@@ -85,3 +85,9 @@ def _no_applescript_keychain_fallback(
         "_alternative_account_identifier",
         lambda self, account: None,
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_application_state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Unit tests must not inherit a developer's persisted account overrides."""
+    monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path / "application-state"))

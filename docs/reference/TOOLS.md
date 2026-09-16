@@ -1113,6 +1113,9 @@ Saved replacements require working IMAP access: the generated RFC Message-ID
 identifies the saved replacement reliably. If that path is unavailable,
 `update_draft` returns `draft_error` and keeps the original; it does not create
 an AppleScript replacement whose numeric ID may change during synchronization.
+For RFC-ID drafts with a verified account, existing attachments are read directly
+from that account's IMAP Drafts folder. The message identity, complete attachment
+list, and byte limits must pass validation before replacement proceeds.
 
 **⚠️ Returns a NEW `draft_id`** — the input id is no longer valid
 after a complete replacement. Partial outcomes can retain the original.
@@ -1532,6 +1535,8 @@ Breaking changes will only occur in major versions (1.0.0, 2.0.0, etc.).
 
 - In test mode, `update_message` requires both the test account and an explicit,
   nonempty `source_mailbox`; the account alone does not confine its fallback scan.
+- Numeric Mail.app IDs use the indexed AppleScript mutation path; they are not
+  IMAP UIDs or RFC Message-IDs. Mixed ID batches also stay on AppleScript.
 - `update_draft` preserves the original until replacement creation succeeds.
   Incomplete attachment extraction or unknown sender/body preservation fails
   without deleting it. Cleanup failure returns `success: true`, `partial: true`,

@@ -1770,6 +1770,31 @@ class ImapConnector:
             client.append(folder, raw_message, flags=[DRAFT])
             return folder
 
+    def fetch_raw_draft(self, message_id: str) -> bytes:
+        """Read one unambiguous saved draft from this account's Drafts folder.
+
+        HEADER search can match substrings, so bind the fetched MIME header
+        to the requested identity before allowing preservation/replacement.
+        PEEK and read-only SELECT leave message flags unchanged.
+        """
+        bracketed = _bracket_message_id(message_id)
+        with self._session() as client:
+            folder = self._find_drafts_folder(
+                client
+            ) or self._find_drafts_by_convention(client)
+            if folder is None:
+                raise MailMessageNotFoundError("No Drafts folder found")
+            client.select_folder(folder, readonly=True)
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if len(uids) != 1:
+                raise MailMessageNotFoundError("Draft lookup did not identify exactly one message")
+            fetched = client.fetch(uids, [b"BODY.PEEK[]"])
+            raw = bytes(fetched.get(uids[0], {}).get(b"BODY[]") or b"")
+            headers = message_from_bytes(raw, policy=policy.default).get_all("Message-ID", [])
+            if len(headers) != 1 or str(headers[0]).strip() != bracketed:
+                raise MailMessageNotFoundError("Fetched draft identity did not match")
+            return raw
+
     @staticmethod
     def _find_drafts_folder(client: IMAPClient) -> str | None:
         """Return the Drafts folder name via the ``\\Drafts`` SPECIAL-USE

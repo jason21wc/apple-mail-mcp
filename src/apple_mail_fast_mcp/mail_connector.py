@@ -3101,6 +3101,10 @@ class AppleMailConnector:
         (read_status / flagged / flag_color all None) and that account +
         source_mailbox + destination_mailbox are all provided.
         """
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -3155,6 +3159,10 @@ class AppleMailConnector:
         are both provided (without source_mailbox, IMAP would have to
         SEARCH every mailbox per Message-ID).
         """
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -3208,6 +3216,10 @@ class AppleMailConnector:
         Caller must already have verified this is a read-only patch
         and that account + source_mailbox are both provided.
         """
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -3327,6 +3339,10 @@ class AppleMailConnector:
     ) -> int | None:
         """Attempt IMAP fast path for flag-only patch. Returns count
         on success, or None to fall through to AppleScript."""
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -6667,13 +6683,16 @@ class AppleMailConnector:
         draft_id: str,
         attachment_names: list[str],
         dest_dir: Path,
+        *,
+        account: str | None = None,
     ) -> list[Path]:
         """Save each attachment of a draft to disk.
 
         Used by ``update_draft`` to preserve attachments through the
         delete-and-recreate cycle. Mail.app doesn't expose attachment
         file paths on saved drafts (`file of att` returns an opaque
-        reference), so we extract via the ``save`` AppleScript command.
+        reference). RFC-ID drafts with an explicit account use IMAP, avoiding
+        Mail's local download cache. Other callers use AppleScript ``save``.
 
         Each attachment lands in its own ``<dest_dir>/<i>/`` subdirectory
         so filename collisions between attachments don't lose data.
@@ -6686,6 +6705,8 @@ class AppleMailConnector:
                 these from ``get_draft_state(draft_id)["attachment_names"]``.
             dest_dir: Existing directory under which subdirectories are
                 created. Caller owns the lifecycle (e.g. tempdir cleanup).
+            account: Verified draft account. Enables strict IMAP extraction
+                for RFC IDs; retrieval or metadata failures retain the original.
 
         Returns:
             Paths of the extracted files, in the same order as
@@ -6699,17 +6720,21 @@ class AppleMailConnector:
             FileNotFoundError: ``dest_dir`` does not exist.
         """
         _validate_draft_id(draft_id)
+        dest_dir = Path(dest_dir)
+        if not dest_dir.is_dir():
+            raise FileNotFoundError(f"dest_dir does not exist: {dest_dir}")
+        if not attachment_names:
+            return []
+        if account and "@" in draft_id:
+            return self._extract_imap_draft_attachments(
+                draft_id, attachment_names, dest_dir, account=account,
+            )
         # Resolve RFC Message-ID draft ids (IMAP-APPEND drafts, #245) to
         # Mail's internal numeric id, matching delete_draft/get_draft_state.
         # Without this, update_draft loses attachments on IMAP-created drafts
         # (their `id` is numeric, never equal to the RFC-id targetId). (#294)
         lookup_id = self._resolve_draft_lookup_id(draft_id)
         lookup_id_safe = escape_applescript_string(sanitize_input(lookup_id))
-        dest_dir = Path(dest_dir)
-        if not dest_dir.is_dir():
-            raise FileNotFoundError(f"dest_dir does not exist: {dest_dir}")
-        if not attachment_names:
-            return []
 
         # Compute sanitized, containment-checked target paths on the Python
         # side (the attachment name is attacker-influenced — it can carry a
@@ -6763,3 +6788,40 @@ class AppleMailConnector:
 
         # Return only the paths that actually got files written.
         return [p for p in target_paths if p.is_file()]
+
+    def _extract_imap_draft_attachments(
+        self, draft_id: str, attachment_names: list[str], dest_dir: Path,
+        *, account: str,
+    ) -> list[Path]:
+        """Preserve bytes from the saved draft without Mail's download cache.
+
+        Require complete, index-aligned metadata before writing anything;
+        unknown/missing content must never permit replacement of the original.
+        """
+        try:
+            host, port, email = self._resolve_imap_config(account)
+            password = self._get_imap_password_with_fallback(account, email)
+            imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+            raw = imap.fetch_raw_draft(draft_id)
+        except _IMAP_FALLBACK_EXCS + (MailMessageNotFoundError,) as exc:
+            raise MailDraftError(
+                "Could not retrieve draft attachments through IMAP; original draft retained"
+            ) from exc
+        parsed = extract_attachment_payloads(raw)
+        if [part[0] for part in parsed] != attachment_names:
+            raise MailDraftError(
+                "Draft attachment metadata changed; original draft retained"
+            )
+        metadata = [{"name": part[0], "size": len(part[3])} for part in parsed]
+        _, rejected = _select_attachments_within_caps(
+            metadata, None, per_cap=self.max_attachment_bytes,
+            total_cap=self.max_total_attachment_bytes,
+        )
+        if rejected:
+            raise MailDraftError("Draft attachments exceed size limits; original draft retained")
+        targets = _compute_draft_extract_targets(attachment_names, dest_dir)
+        for target, part in zip(targets, parsed, strict=True):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as output:
+                output.write(part[3])
+        return targets

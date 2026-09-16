@@ -4168,3 +4168,37 @@ def test_thread_batches_long_ancestor_chain():
         client, "anchor@example.com", [f"parent{i}@example.com" for i in range(100)]
     )
     assert client.search.call_count == 7  # 3 anchor queries, 4 batches of 25 ancestors
+
+
+class TestFetchRawDraft:
+    @pytest.mark.parametrize("special", [True, False])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_scoped_readonly_exact_draft(self, cls, special):
+        client = cls.return_value
+        folder = "LocalizedDrafts" if special else "Drafts"
+        client.list_folders.return_value = [([b"\\Drafts"] if special else [], b"/", folder)]
+        client.search.return_value = [42]
+        raw = b"Message-ID: <draft@example.com>\r\n\r\noriginal"
+        client.fetch.return_value = {42: {b"BODY[]": raw}}
+        conn = ImapConnector("imap.example.com", 993, "test@example.com", "test-only")
+        assert conn.fetch_raw_draft("draft@example.com") == raw
+        client.select_folder.assert_called_once_with(folder, readonly=True)
+        client.search.assert_called_once_with(["HEADER", "Message-ID", "<draft@example.com>"])
+        client.fetch.assert_called_once_with([42], [b"BODY.PEEK[]"])
+
+    @pytest.mark.parametrize("uids,raw", [
+        ([], b""), ([1, 2], b""), ([1], b""),
+        ([1], b"Message-ID: <other@example.com>\r\n\r\nbody"),
+        ([1], b"Message-ID: <draft@example.com>\r\nMessage-ID: <draft@example.com>\r\n\r\nbody"),
+    ])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_refuses_unproven_identity(self, cls, uids, raw):
+        client = cls.return_value
+        client.list_folders.return_value = [([b"\\Drafts"], b"/", "Drafts")]
+        client.search.return_value = uids
+        client.fetch.return_value = {1: {b"BODY[]": raw}}
+        conn = ImapConnector("imap.example.com", 993, "test@example.com", "test-only")
+        with pytest.raises(MailMessageNotFoundError):
+            conn.fetch_raw_draft("draft@example.com")
+        if len(uids) != 1:
+            client.fetch.assert_not_called()

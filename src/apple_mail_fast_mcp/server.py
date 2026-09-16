@@ -3128,6 +3128,7 @@ def _resolve_draft_attachments(
     draft_id: str,
     attachment_paths: list[str] | None,
     existing_names: list[str],
+    *, account: str | None = None,
 ) -> tuple[list[Path] | None, "tempfile.TemporaryDirectory[str] | None"]:
     """Compute final attachment paths for an update_draft call.
 
@@ -3152,7 +3153,7 @@ def _resolve_draft_attachments(
     tempdir = tempfile.TemporaryDirectory(prefix="amm-update-attach-")
     try:
         extracted = mail.extract_draft_attachments(
-            draft_id, existing_names, Path(tempdir.name)
+            draft_id, existing_names, Path(tempdir.name), account=account,
         )
         if len(extracted) != len(existing_names) or not all(p.is_file() for p in extracted):
             raise MailDraftError("Could not preserve every attachment; original draft retained")
@@ -3818,7 +3819,8 @@ async def update_draft(
 
         # tempdir (if any) is cleaned up in the finally block.
         final_attachments, tempdir = _resolve_draft_attachments(
-            draft_id, attachment_paths, state.get("attachment_names", []) or []
+            draft_id, attachment_paths, state.get("attachment_names", []) or [],
+            account=state.get("from_account") or None,
         )
 
         if send_now:

@@ -4534,7 +4534,7 @@ class TestDraftToolErrorPaths:
         from pathlib import Path
 
         def fake_extract(
-            draft_id: str, names: list[str], dest: Path
+            draft_id: str, names: list[str], dest: Path, *, account: str | None = None,
         ) -> list[Path]:
             (dest / "0").mkdir(parents=True, exist_ok=True)
             p = dest / "0" / "report.pdf"

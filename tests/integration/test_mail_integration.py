@@ -3150,10 +3150,15 @@ class TestDraftReplacementReliability:
             assert state["content_type"]
             # Even with a working account, exercise unavailable IMAP against
             # this owned fixture and prove the saved original survives intact.
+            from unittest.mock import Mock
+
+            clean_path = Mock(return_value=None)
             with monkeypatch.context() as unavailable:
-                unavailable.setattr(connector, "_try_clean_create_or_send", lambda **kw: None)
+                unavailable.setattr(connector, "_try_clean_create_or_send", clean_path)
                 refused = await server.update_draft(original, body="Must not replace")
             assert not refused["success"] and refused["error_type"] == "draft_error", refused
+            assert "requires working IMAP" in refused["error"], refused
+            clean_path.assert_called_once()
             retained = connector.get_draft_state(original)
             assert retained["body"] == state["body"]
             assert retained["attachment_names"] == state["attachment_names"]
@@ -3171,6 +3176,7 @@ class TestDraftReplacementReliability:
             extracted_dir.mkdir()
             recovered = connector.extract_draft_attachments(
                 result["draft_id"], replacement["attachment_names"], extracted_dir,
+                account=test_account,
             )
             assert len(recovered) == 1
             assert recovered[0].read_bytes() == attachment.read_bytes()

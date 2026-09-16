@@ -214,3 +214,92 @@ async def test_partial_send_keeps_original_without_cleanup(draft_mail, monkeypat
     result = await server.update_draft("101", send_now=True)
     assert result["partial"] and result["original_draft_id"] == "101"
     draft_mail.delete_draft.assert_not_called()
+
+
+@pytest.mark.parametrize("ids", [["123"], ["123", "rfc@example.com"]])
+@pytest.mark.parametrize("change", [
+    {"destination_mailbox": "Archive"}, {"read_status": True}, {"flagged": True},
+])
+def test_numeric_mutation_ids_never_reach_imap(ids, change):
+    connector = AppleMailConnector()
+    with patch("apple_mail_fast_mcp.mail_connector.ImapConnector") as imap, \
+         patch.object(connector, "_resolve_bulk_ids", return_value=["123"]), \
+         patch.object(connector, "_run_applescript", return_value="1,0" if "destination_mailbox" in change else "1") as script:
+        assert connector.update_message(ids, account="TestAccount", source_mailbox="Drafts", **change) == 1
+    imap.assert_not_called()
+    assert 'set idList to {"123"}' in script.call_args.args[0]
+    assert "whose id is" in script.call_args.args[0]
+
+
+def test_numeric_delete_id_uses_mail_not_imap():
+    connector = AppleMailConnector()
+    with patch("apple_mail_fast_mcp.mail_connector.ImapConnector") as imap, \
+         patch.object(connector, "_run_applescript", return_value="1"):
+        assert connector.delete_messages(["123"], account="TestAccount", source_mailbox="Drafts") == 1
+    imap.assert_not_called()
+
+
+@pytest.fixture
+def imap_draft_extraction(monkeypatch):
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["Message-ID"] = "<draft@example.com>"
+    msg.set_content("Disposable draft")
+    msg.add_attachment(b"first", maintype="application", subtype="octet-stream", filename="same.txt")
+    msg.add_attachment(b"second", maintype="application", subtype="octet-stream", filename="same.txt")
+    connector = AppleMailConnector()
+    monkeypatch.setattr(connector, "_resolve_imap_config", lambda account: ("imap.example.com", 993, "test@example.com"))
+    monkeypatch.setattr(connector, "_get_imap_password_with_fallback", lambda account, email: "test-only")
+    imap = MagicMock()
+    imap.fetch_raw_draft.return_value = msg.as_bytes()
+    monkeypatch.setattr("apple_mail_fast_mcp.mail_connector.ImapConnector", lambda *args, **kwargs: imap)
+    return connector, imap
+
+
+def test_imap_draft_preserves_duplicate_names_and_bytes(imap_draft_extraction, tmp_path):
+    connector, imap = imap_draft_extraction
+    paths = connector.extract_draft_attachments("draft@example.com", ["same.txt", "same.txt"], tmp_path, account="TestAccount")
+    assert [p.read_bytes() for p in paths] == [b"first", b"second"]
+    assert paths[0] != paths[1]
+    imap.fetch_raw_draft.assert_called_once_with("draft@example.com")
+
+
+@pytest.mark.parametrize("names", [["same.txt"], ["same.txt", "wrong.txt"], ["same.txt"] * 3])
+def test_imap_draft_metadata_mismatch_writes_nothing(imap_draft_extraction, tmp_path, names):
+    connector, _ = imap_draft_extraction
+    with pytest.raises(MailDraftError, match="metadata changed"):
+        connector.extract_draft_attachments("draft@example.com", names, tmp_path, account="TestAccount")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("cap", ["max_attachment_bytes", "max_total_attachment_bytes"])
+def test_imap_draft_caps_apply_before_writing(imap_draft_extraction, tmp_path, cap):
+    connector, _ = imap_draft_extraction
+    setattr(connector, cap, 5)
+    with pytest.raises(MailDraftError, match="size limits"):
+        connector.extract_draft_attachments("draft@example.com", ["same.txt"] * 2, tmp_path, account="TestAccount")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("missing", [False, True])
+async def test_imap_extraction_failure_retains_original(imap_draft_extraction, monkeypatch, tmp_path, missing):
+    from imapclient.exceptions import IMAPClientError
+
+    from apple_mail_fast_mcp.exceptions import MailMessageNotFoundError
+
+    connector, imap = imap_draft_extraction
+    error = MailMessageNotFoundError if missing else IMAPClientError
+    imap.fetch_raw_draft.side_effect = error("unavailable")
+    monkeypatch.setattr(server, "mail", connector)
+    monkeypatch.setattr(server, "_get_draft_state_store", lambda: DraftStateStore(tmp_path / "state"))
+    with patch.object(connector, "get_draft_state", return_value={
+        "body": "original", "subject": "original", "content_type": "text/plain",
+        "from_account": "TestAccount", "attachment_names": ["same.txt"],
+    }), patch.object(connector, "create_draft") as create, \
+         patch.object(connector, "delete_draft") as delete:
+        result = await server.update_draft("draft@example.com", body="replacement")
+    assert result["error_type"] == "draft_error"
+    assert "through IMAP" in result["error"]
+    create.assert_not_called()
+    delete.assert_not_called()
