@@ -25,16 +25,30 @@ from apple_mail_fast_mcp.exceptions import (
 from apple_mail_fast_mcp.templates import _NAME_RE, _validate_name
 from apple_mail_fast_mcp.utils import escape_applescript_string, sanitize_input
 
+# Every token these four functions are documented to reject or escape, plus a
+# few characters they pass through. `st.text()` spans all of Unicode, so the
+# shapes that actually matter here are rare in a default 100-example run: it
+# produces a `"` or a `\` in under 4% of examples, and reaches a structure
+# like ".." or an otherwise-valid id with a trailing "\n" only by chance.
+# A property test drawing from it alone can therefore stay green against a
+# broken function for a whole run. That is measured, not hypothetical: see
+# the detection rates in #456. Drawing additionally from a small hostile
+# alphabet puts those shapes within easy reach on every run, while the
+# unrestricted `st.text()` stays in the union so the tests keep exploring
+# inputs no one has thought to pin as an @example.
+_HOSTILE_ALPHABET = 'aZ0._-@+=/\\"\r\n\x00<>'
+_boundary_text = st.one_of(st.text(), st.text(alphabet=_HOSTILE_ALPHABET, max_size=8))
+
 
 class TestSanitizeInputProperties:
-    @given(st.text())
+    @given(_boundary_text)
     def test_strips_nulls_and_bounds_length(self, s: str) -> None:
         out = sanitize_input(s)
         assert isinstance(out, str)
         assert "\x00" not in out
         assert len(out) <= 10000
 
-    @given(st.text())
+    @given(_boundary_text)
     def test_idempotent(self, s: str) -> None:
         once = sanitize_input(s)
         assert sanitize_input(once) == once
@@ -55,7 +69,7 @@ class TestSanitizeInputProperties:
 
 
 class TestEscapeApplescriptStringProperties:
-    @given(st.text())
+    @given(_boundary_text)
     def test_no_break_out(self, s: str) -> None:
         """After removing every escape pair, no bare delimiter remains — so
         no input can terminate the string literal early (injection) or leave
@@ -65,30 +79,17 @@ class TestEscapeApplescriptStringProperties:
         assert '"' not in stripped
         assert "\\" not in stripped
 
-    @given(st.text())
+    @given(_boundary_text)
     def test_only_adds_escaping_backslashes(self, s: str) -> None:
         esc = escape_applescript_string(s)
         assert len(esc) == len(s) + s.count('"') + s.count("\\")
 
-    @given(st.text())
+    @given(_boundary_text)
     def test_composes_with_sanitize_without_nulls(self, s: str) -> None:
         esc = escape_applescript_string(sanitize_input(s))
         assert "\x00" not in esc
         stripped = esc.replace("\\\\", "").replace('\\"', "")
         assert '"' not in stripped and "\\" not in stripped
-
-
-# Every token the two validators are documented to forbid, plus a few
-# characters they accept. `st.text()` spans all of Unicode, so it reaches a
-# shape like ".." or an otherwise-valid id with a trailing "\n" only by
-# chance: on its own it can leave a broken validator green for a whole run.
-# That is not hypothetical. Both #325 holes (`$` + re.match letting a
-# trailing newline through, and ".." matching the draft_id charset) shipped
-# in v0.9.1 with these property tests passing. Drawing from a small hostile
-# alphabet puts those shapes within easy reach on every run, and still
-# explores combinations no one has thought to pin as an example below.
-_HOSTILE_ALPHABET = 'aZ0._-@+=/\\"\r\n\x00<>'
-_boundary_text = st.one_of(st.text(), st.text(alphabet=_HOSTILE_ALPHABET, max_size=8))
 
 
 class TestValidateNameProperties:
