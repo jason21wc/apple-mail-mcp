@@ -14,7 +14,7 @@ stays out of the fast unit suite per #298).
 
 from pathlib import Path
 
-from hypothesis import given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 from apple_mail_fast_mcp.drafts import _DRAFT_ID_RE, _validate_draft_id
@@ -78,13 +78,28 @@ class TestEscapeApplescriptStringProperties:
         assert '"' not in stripped and "\\" not in stripped
 
 
+# Every token the two validators are documented to forbid, plus a few
+# characters they accept. `st.text()` spans all of Unicode, so it reaches a
+# shape like ".." or an otherwise-valid id with a trailing "\n" only by
+# chance: on its own it can leave a broken validator green for a whole run.
+# That is not hypothetical. Both #325 holes (`$` + re.match letting a
+# trailing newline through, and ".." matching the draft_id charset) shipped
+# in v0.9.1 with these property tests passing. Drawing from a small hostile
+# alphabet puts those shapes within easy reach on every run, and still
+# explores combinations no one has thought to pin as an example below.
+_HOSTILE_ALPHABET = 'aZ0._-@+=/\\"\r\n\x00<>'
+_boundary_text = st.one_of(st.text(), st.text(alphabet=_HOSTILE_ALPHABET, max_size=8))
+
+
 class TestValidateNameProperties:
     # A fixed absolute base (need not exist — Path.resolve normalizes either
     # way). Hypothesis-driven tests can't take function-scoped fixtures like
     # tmp_path, so we don't use one.
     _BASE = Path("/amm/property/base")
 
-    @given(st.text())
+    @given(_boundary_text)
+    @example("report\n")  # #325: `$` + re.match let a trailing newline pass
+    @example("..")
     def test_reject_or_path_contained(self, s: str) -> None:
         """Any input is either rejected, or accepted and provably contained
         directly under the base directory (no `..`, no separators, no
@@ -107,7 +122,9 @@ class TestValidateNameProperties:
 class TestValidateDraftIdProperties:
     _FORBIDDEN = ('"', "\\", "/", "\n", "\r", "\x00", "..")
 
-    @given(st.text())
+    @given(_boundary_text)
+    @example("160991\n")  # #325: `$` + re.match let a trailing newline pass
+    @example("..")  # #325: "." is in the charset, so ".." matched the regex
     def test_reject_or_safe_charset(self, s: str) -> None:
         """Any input is either rejected, or accepted and free of AppleScript-
         breaking / path-traversal characters."""
