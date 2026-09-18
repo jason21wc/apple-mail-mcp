@@ -2491,7 +2491,9 @@ class AppleMailConnector:
         # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
         # the emitted match is the INDEXED `whose id is N`. Must come AFTER
         # any IMAP fast path above — those batch the RFC ids themselves.
-        message_ids = self._resolve_bulk_ids(message_ids)
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
 
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
@@ -4053,7 +4055,9 @@ class AppleMailConnector:
         # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
         # the emitted match is the INDEXED `whose id is N`. Must come AFTER
         # any IMAP fast path above — those batch the RFC ids themselves.
-        message_ids = self._resolve_bulk_ids(message_ids)
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
 
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
@@ -4133,7 +4137,9 @@ class AppleMailConnector:
         # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
         # the emitted match is the INDEXED `whose id is N`. Must come AFTER
         # any IMAP fast path above — those batch the RFC ids themselves.
-        message_ids = self._resolve_bulk_ids(message_ids)
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
 
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
@@ -4305,7 +4311,9 @@ class AppleMailConnector:
         # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
         # the emitted match is the INDEXED `whose id is N`. Must come AFTER
         # any IMAP fast path above — those batch the RFC ids themselves.
-        message_ids = self._resolve_bulk_ids(message_ids)
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
 
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
@@ -4688,7 +4696,9 @@ class AppleMailConnector:
         # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
         # the emitted match is the INDEXED `whose id is N`. Must come AFTER
         # any IMAP fast path above — those batch the RFC ids themselves.
-        message_ids = self._resolve_bulk_ids(message_ids)
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
 
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
@@ -4905,7 +4915,11 @@ class AppleMailConnector:
         raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
 
     def find_message_by_message_id(
-        self, rfc5322_message_id: str
+        self,
+        rfc5322_message_id: str,
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
     ) -> str | None:
         """Resolve an RFC 5322 Message-ID header to Mail's internal id.
 
@@ -4917,20 +4931,22 @@ class AppleMailConnector:
         Args:
             rfc5322_message_id: e.g. ``<calendar-abc123@google.com>`` or
                 ``calendar-abc123@google.com``. Brackets are stripped
-                from the input; the AppleScript ``whose`` clause then
-                queries for both the bare and bracketed forms in one
-                pass. Mail.app's ``message id`` property storage
-                normalization is not uniform — IMAP-backed accounts
-                (iCloud, Gmail) store the value bare, while other paths
-                may store with angle brackets per RFC 5322. Querying
-                both forms in a single clause is robust to either
-                convention and matches in one round-trip.
+                from the input; the date-bounded AppleScript search checks
+                both bare and bracketed forms because Mail's normalization
+                varies by account.
+            account: Account name or UUID. Supply together with source_mailbox
+                to restrict both IMAP and AppleScript to that exact scope.
+            source_mailbox: Mailbox name or nested path; requires account.
 
         Returns:
             Mail's internal numeric id (as a string) of the first
             matching message found, or None if no message with that
-            Message-ID exists in any mailbox.
+            Message-ID exists in the probed scope. An unavailable scoped
+            lookup raises MailAnchorLookupIncompleteError instead of claiming
+            the message is absent.
         """
+        if (account is None) != (source_mailbox is None):
+            raise ValueError("account and source_mailbox must be supplied together")
         if not rfc5322_message_id:
             return None
 
@@ -4938,7 +4954,14 @@ class AppleMailConnector:
         # measured 0.14s over 61,880 messages. Failures here are
         # "could not determine", never "absent" (#425).
         try:
-            located = self._locate_via_imap(rfc5322_message_id)
+            located = (
+                self._locate_via_imap(
+                    rfc5322_message_id, account=account,
+                    source_mailbox=source_mailbox,
+                )
+                if account is not None and source_mailbox is not None
+                else self._locate_via_imap(rfc5322_message_id)
+            )
         except _IMAP_FALLBACK_EXCS as exc:
             raise MailAnchorLookupIncompleteError(
                 f"Could not determine whether Message-ID "
@@ -4950,16 +4973,27 @@ class AppleMailConnector:
                 "IMAP credentials."
             ) from exc
         if located is None:
-            # A clean IMAP answer. The probe set is Gmail's All Mail (which
-            # mirrors every message) or INBOX+Sent — so this is definitive.
+            # A clean absence answer for the requested folder, or for the
+            # legacy bounded probe set when no scope was supplied.
             return None
 
         # Stage 2: binary-search Mail by the date IMAP reported.
+        if account is not None and source_mailbox is not None:
+            return self._find_by_message_id_near_date(
+                rfc5322_message_id, cast(_datetime, located["internaldate"]),
+                account=account, source_mailbox=source_mailbox,
+            )
         return self._find_by_message_id_near_date(
             rfc5322_message_id, cast(_datetime, located["internaldate"])
         )
 
-    def _locate_via_imap(self, rfc5322_message_id: str) -> dict[str, Any] | None:
+    def _locate_via_imap(
+        self,
+        rfc5322_message_id: str,
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
+    ) -> dict[str, Any] | None:
         """Ask each IMAP-configured account where/when a Message-ID lives.
 
         Returns the first hit's ``{folder, uid, internaldate}``, or ``None``
@@ -4967,6 +5001,29 @@ class AppleMailConnector:
         it. Raises on failure so the caller can distinguish "absent" from
         "could not check" (#425).
         """
+        if account is not None and source_mailbox is not None:
+            # Explicit scope is a boundary: never probe another account or
+            # substitute INBOX/Sent when the requested folder is unavailable.
+            if self._imap_breaker_open(account):
+                raise MailAnchorLookupIncompleteError(
+                    f"IMAP lookup is temporarily unavailable for {account!r}"
+                )
+            host, port, email = self._resolve_imap_config(account)
+            if not host:
+                raise MailAnchorLookupIncompleteError(
+                    f"IMAP is not configured for {account!r}"
+                )
+            password = self._get_imap_password_with_fallback(account, email)
+            imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+            try:
+                found = imap.locate_message(
+                    rfc5322_message_id, mailbox=source_mailbox
+                )
+            except MailAnchorProbeIncompleteError as exc:
+                raise MailAnchorLookupIncompleteError(str(exc)) from exc
+            self._imap_clear_breaker(account)
+            return found
+
         last_exc: Exception | None = None
         for acct in self.list_accounts():
             account = cast(str, acct.get("name") or "")
@@ -4997,7 +5054,12 @@ class AppleMailConnector:
         return None
 
     def _find_by_message_id_near_date(
-        self, rfc5322_message_id: str, when: _datetime
+        self,
+        rfc5322_message_id: str,
+        when: _datetime,
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
     ) -> str | None:
         """Binary-search Mail's unified mailboxes for a Message-ID known to
         have arrived around ``when``, and return Mail's internal id (#432).
@@ -5027,6 +5089,15 @@ class AppleMailConnector:
             when.day,
             when.hour * 3600 + when.minute * 60 + when.second,
         )
+        scope_setup = ""
+        mailbox_refs = "{inbox, sent mailbox}"
+        if account is not None and source_mailbox is not None:
+            account_clause = applescript_account_clause(account)
+            mailbox_safe = escape_applescript_string(sanitize_input(source_mailbox))
+            scope_setup = (
+                f'set sourceMb to my resolveMailbox({account_clause}, "{mailbox_safe}")'
+            )
+            mailbox_refs = "{sourceMb}"
         script = _wrap_with_timeout(
             f"""tell application "Mail"
             {target_date}
@@ -5035,7 +5106,8 @@ class AppleMailConnector:
             set foundId to ""
             set sawOrderProblem to false
 
-            repeat with mb in {{inbox, sent mailbox}}
+            {scope_setup}
+            repeat with mb in {mailbox_refs}
                 set n to (count of messages of mb)
                 if n > 0 then
                     -- #242: Mail's iteration order has changed before. A
@@ -5087,6 +5159,8 @@ class AppleMailConnector:
             timeout=self.timeout,
         )
 
+        if scope_setup:
+            script = f"{_MAILBOX_RESOLVER_HANDLERS}\n{script}"
         result = self._run_applescript(script).strip()
         if result == "ORDER_UNEXPECTED":
             raise MailAnchorLookupIncompleteError(
@@ -5099,7 +5173,7 @@ class AppleMailConnector:
             raise MailAnchorLookupIncompleteError(
                 f"Could not locate Message-ID {rfc5322_message_id!r} in Mail. "
                 f"IMAP reports it arrived {when:%Y-%m-%d %H:%M:%S}, but it is "
-                "not in the unified inbox or sent mailbox within a day of "
+                "not in the requested search scope within a day of "
                 "that. It may live in another mailbox; searching every "
                 "mailbox by Message-ID is what freezes Mail, so that is not "
                 "attempted (#432)."
@@ -6510,7 +6584,13 @@ class AppleMailConnector:
             "repair IMAP for the account with `apple-mail-fast-mcp setup-imap`."
         )
 
-    def _resolve_bulk_ids(self, message_ids: list[str]) -> list[str]:
+    def _resolve_bulk_ids(
+        self,
+        message_ids: list[str],
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
+    ) -> list[str]:
         """Resolve RFC 5322 Message-IDs to Mail's internal numeric ids so the
         bulk AppleScript can match on the INDEXED ``whose id is N`` (#437).
 
@@ -6531,6 +6611,8 @@ class AppleMailConnector:
         ``_or_message_id_criteria`` (#316) into one OR-SEARCH per 50 ids.
         Handing them numeric ids would defeat that batching.
 
+        An explicit account/source_mailbox pair stays attached through both
+        resolver stages; neither stage may widen it to other folders/accounts.
         Numeric ids pass through untouched — they already take the indexed
         path and must not acquire a round-trip they never needed.
 
@@ -6553,7 +6635,13 @@ class AppleMailConnector:
                 resolved.append(mid)
                 continue
             try:
-                internal = self.find_message_by_message_id(mid)
+                internal = (
+                    self.find_message_by_message_id(
+                        mid, account=account, source_mailbox=source_mailbox
+                    )
+                    if account is not None and source_mailbox is not None
+                    else self.find_message_by_message_id(mid)
+                )
             except MailAnchorLookupIncompleteError as exc:
                 logger.warning(
                     "bulk id %s could not be resolved (%s); skipping it in "

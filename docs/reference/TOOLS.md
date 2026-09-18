@@ -447,6 +447,8 @@ Patch one or more messages: change read state, flag color, and/or move to anothe
 
 **Order of operations:** read-state and flag changes apply first (in the source mailbox), then the move. IMAP requires the message to exist in the source folder for STORE before MOVE.
 
+**Scoped RFC-ID lookup:** AppleScript-only patches, such as color flags and combined updates, resolve RFC Message-IDs within the supplied account and source mailbox. This includes Drafts, Archive, and nested folders. Resolution uses IMAP arrival dates and an indexed, date-bounded Mail lookup; it does not scan every mailbox or substitute an Inbox/Sent copy. If no requested IDs resolve and any lookup is incomplete, the operation reports an incomplete lookup instead of returning zero. Mixed batches retain best-effort behavior: unresolved IDs are skipped and the response counts completed updates.
+
 **Performance — IMAP fast paths:**
 
 - **Move-only patches (#149):** When `destination_mailbox` is the only field set and `source_mailbox` is provided, the move runs server-side via IMAP `UID MOVE`. On a 47k-message Gmail INBOX this drops the move from ~57s to <1s. Falls back to AppleScript when the server lacks `MOVE` / `UIDPLUS`.

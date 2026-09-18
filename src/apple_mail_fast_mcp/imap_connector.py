@@ -1293,7 +1293,9 @@ class ImapConnector:
                 entry.get(b"BODYSTRUCTURE")
             )
 
-    def locate_message(self, message_id: str) -> dict[str, Any] | None:
+    def locate_message(
+        self, message_id: str, mailbox: str | None = None
+    ) -> dict[str, Any] | None:
         """Locate an RFC 5322 Message-ID and return where and *when* it is.
 
         Returns ``{"folder": str, "uid": int, "internaldate": datetime}`` for
@@ -1309,7 +1311,10 @@ class ImapConnector:
         from the server side, where the lookup IS indexed (measured 0.14s over
         61,880 messages).
 
-        Shares the bounded probe-folder set with :meth:`resolve_anchor` — for
+        An explicit ``mailbox`` is a strict single-folder scope. Selection,
+        search, or fetch failures propagate; only a successful empty search
+        returns None. Without a mailbox, preserves the bounded probe-folder
+        set shared with :meth:`resolve_anchor` — for
         locating, Gmail's All Mail is ideal rather than a liability, since it
         mirrors every message and so answers for any folder.
 
@@ -1318,13 +1323,20 @@ class ImapConnector:
                 so the caller can distinguish "not there" from "could not
                 check" (#425).
         """
+        if mailbox is not None:
+            _reject_control_chars(mailbox, "mailbox")
         bracketed = _bracket_message_id(message_id)
         with self._session() as client:
-            for folder in self._anchor_probe_folders(client):
+            folders = (
+                [mailbox] if mailbox is not None else self._anchor_probe_folders(client)
+            )
+            for folder in folders:
                 try:
                     client.select_folder(folder, readonly=True)
                     uids = client.search(["HEADER", "Message-ID", bracketed])
                 except IMAPClientError as exc:
+                    if mailbox is not None:
+                        raise
                     logger.debug(
                         "locate_message: skipping %s (%s)", folder, exc
                     )
@@ -1334,10 +1346,16 @@ class ImapConnector:
                 try:
                     fetched = client.fetch([uids[0]], [b"INTERNALDATE"])
                 except IMAPClientError:
+                    if mailbox is not None:
+                        raise
                     continue
                 entry = fetched.get(uids[0]) or {}
                 internaldate = entry.get(b"INTERNALDATE")
                 if internaldate is None:
+                    if mailbox is not None:
+                        raise MailAnchorProbeIncompleteError(
+                            f"Message matched in {mailbox!r}, but INTERNALDATE is unavailable"
+                        )
                     continue
                 return {
                     "folder": folder,

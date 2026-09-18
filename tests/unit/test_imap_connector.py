@@ -4202,3 +4202,45 @@ class TestFetchRawDraft:
             conn.fetch_raw_draft("draft@example.com")
         if len(uids) != 1:
             client.fetch.assert_not_called()
+
+
+class TestScopedLocateMessage:
+    @pytest.mark.parametrize("mailbox", ["Archive", "Drafts", 'Parent/Child"Q'])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_probes_only_explicit_folder(self, mock_cls, mailbox):
+        client = mock_cls.return_value
+        when = datetime(2026, 8, 9)
+        client.search.return_value = [42]
+        client.fetch.return_value = {42: {b"INTERNALDATE": when}}
+        c = ImapConnector("host", 993, "u@example.com", "pw")
+        assert c.locate_message("a@example.com", mailbox=mailbox) == {
+            "folder": mailbox,
+            "uid": 42,
+            "internaldate": when,
+        }
+        client.select_folder.assert_called_once_with(mailbox, readonly=True)
+        client.list_folders.assert_not_called()
+
+    @pytest.mark.parametrize("failure", ["select", "search", "fetch", "missing_date"])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_scope_failure_is_not_absence(self, mock_cls, failure):
+        client = mock_cls.return_value
+        client.search.return_value = [42]
+        client.fetch.return_value = {42: {}}
+        if failure != "missing_date":
+            method = "select_folder" if failure == "select" else failure
+            getattr(client, method).side_effect = IMAPClientError("unavailable")
+        c = ImapConnector("host", 993, "u@example.com", "pw")
+        with pytest.raises((IMAPClientError, MailAnchorProbeIncompleteError)):
+            c.locate_message("a@example.com", mailbox="Archive")
+        client.select_folder.assert_called_once_with("Archive", readonly=True)
+        client.list_folders.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_successful_empty_search_is_absence(self, mock_cls):
+        client = mock_cls.return_value
+        client.search.return_value = []
+        c = ImapConnector("host", 993, "u@example.com", "pw")
+        assert c.locate_message("a@example.com", mailbox="Archive") is None
+        client.select_folder.assert_called_once_with("Archive", readonly=True)
+        client.fetch.assert_not_called()

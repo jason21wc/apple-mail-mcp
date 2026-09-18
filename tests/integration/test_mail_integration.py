@@ -2737,8 +2737,9 @@ class TestAnchorLookupIncompleteIntegration:
 class TestBulkRfcIdDoesNotFreezeMail:
     """Exercise RFC-ID flagging on an owned disposable message, never existing mail."""
 
+    @pytest.mark.parametrize("source_mailbox", ["INBOX", "Drafts"])
     def test_bulk_flag_by_rfc_id_completes_and_keeps_mail_responsive(
-        self, connector: AppleMailConnector, test_account: str
+        self, connector: AppleMailConnector, test_account: str, source_mailbox: str
     ) -> None:
         import uuid
 
@@ -2756,18 +2757,19 @@ class TestBulkRfcIdDoesNotFreezeMail:
             numeric_id = connector._resolve_draft_lookup_id(draft_id)
             if "@" not in draft_id:
                 pytest.skip("RFC-ID regression requires the IMAP draft path")
-            # The indexed RFC resolver searches INBOX/Sent. Move only this
-            # newly created fixture into INBOX; keep all live mutations scoped.
-            # Unit tests cover the original unscoped input shape.
-            moved_count = connector.update_message(
-                [numeric_id], destination_mailbox="INBOX", account=test_account,
-                source_mailbox="Drafts",
-            )
-            assert moved_count == 1, "Disposable fixture was not moved; retain Drafts cleanup"
-            moved = True
+            # INBOX exercises numeric-ID movement; Drafts proves RFC resolution
+            # honors the explicit folder outside the default Inbox/Sent set.
+            if source_mailbox == "INBOX":
+                moved_count = connector.update_message(
+                    [numeric_id], destination_mailbox="INBOX", account=test_account,
+                    source_mailbox="Drafts",
+                )
+                assert moved_count == 1, "Disposable fixture was not moved; retain Drafts cleanup"
+                moved = True
             started = time.monotonic()
             count = connector.update_message(
-                [draft_id], flag_color="orange", account=test_account, source_mailbox="INBOX"
+                [draft_id], flag_color="orange", account=test_account,
+                source_mailbox=source_mailbox,
             )
             assert count == 1
             assert time.monotonic() - started < 180
@@ -2778,7 +2780,7 @@ class TestBulkRfcIdDoesNotFreezeMail:
                     [draft_id], account=test_account, source_mailbox="INBOX"
                 ) == 1
             else:
-                connector.delete_draft(draft_id)
+                assert connector.delete_draft(draft_id)
 
 
 class TestGetThreadPartialFlagIntegration:

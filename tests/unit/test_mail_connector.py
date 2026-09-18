@@ -83,7 +83,7 @@ class TestAppleMailConnector:
         """
         c = AppleMailConnector(timeout=30)
         monkeypatch.setattr(
-            c, "find_message_by_message_id", lambda mid: "1"
+            c, "find_message_by_message_id", lambda mid, **scope: "1"
         )
         return c
 
@@ -5125,7 +5125,7 @@ class TestBulkBlockHasNoUnindexedArm:
     ) -> None:
         mock_run.return_value = "1"
         monkeypatch.setattr(
-            connector, "find_message_by_message_id", lambda mid: "160989"
+            connector, "find_message_by_message_id", lambda mid, **scope: "160989"
         )
         connector.update_message(
             ["abc@example.com"], flag_color="orange",
@@ -10072,3 +10072,133 @@ def test_smtp_partial_acceptance_does_not_fall_back_to_applescript(monkeypatch):
     }
     applescript.assert_not_called()
     client.send_message.assert_called_once()
+
+
+class TestScopedBulkResolution:
+    @pytest.mark.parametrize("mailbox", ["Archive", "Drafts"])
+    def test_scoped_lookup_stays_in_account_and_mailbox(self, mailbox):
+        c = AppleMailConnector()
+        when = datetime(2026, 8, 9, 11, 3, 51)
+        with (
+            patch.object(c, "list_accounts") as accounts,
+            patch.object(c, "_imap_breaker_open", return_value=False),
+            patch.object(
+                c, "_resolve_imap_config", return_value=("host", 993, "u@example.com")
+            ) as config,
+            patch.object(c, "_get_imap_password_with_fallback", return_value="pw"),
+            patch("apple_mail_fast_mcp.mail_connector.ImapConnector") as imap,
+            patch.object(c, "_run_applescript", return_value="123") as run,
+        ):
+            imap.return_value.locate_message.return_value = {"internaldate": when}
+            assert c._resolve_bulk_ids(
+                ["a@example.com"], account="iCloud", source_mailbox=mailbox
+            ) == ["123"]
+        accounts.assert_not_called()
+        config.assert_called_once_with("iCloud")
+        imap.return_value.locate_message.assert_called_once_with("a@example.com", mailbox=mailbox)
+        script = run.call_args.args[0]
+        assert f'my resolveMailbox(account "iCloud", "{mailbox}")' in script
+        assert "repeat with mb in {sourceMb}" in script
+        assert "repeat with mb in {inbox, sent mailbox}" not in script
+        assert "whose message id" not in script
+        assert "div 2" in script
+
+    def test_nested_mailbox_and_account_are_escaped(self):
+        c = AppleMailConnector()
+        with patch.object(c, "_run_applescript", return_value="123") as run:
+            c._find_by_message_id_near_date(
+                "a@example.com",
+                datetime(2026, 8, 9),
+                account='A"B',
+                source_mailbox='Parent/Child"Q',
+            )
+        script = run.call_args.args[0]
+        assert 'my resolveMailbox(account "A\\"B", "Parent/Child\\"Q")' in script
+        assert "on resolveMailbox" in script
+
+    @pytest.mark.parametrize("unavailable", ["breaker", "host", "password"])
+    def test_unavailable_scoped_lookup_is_indeterminate(self, unavailable):
+        c = AppleMailConnector()
+        with (
+            patch.object(c, "list_accounts") as accounts,
+            patch.object(c, "_imap_breaker_open", return_value=unavailable == "breaker"),
+            patch.object(
+                c,
+                "_resolve_imap_config",
+                return_value=("" if unavailable == "host" else "host", 993, "u@example.com"),
+            ),
+            patch.object(
+                c,
+                "_get_imap_password_with_fallback",
+                side_effect=MailKeychainEntryNotFoundError("missing"),
+            ),
+        ):
+            with pytest.raises(MailAnchorLookupIncompleteError):
+                c._resolve_bulk_ids(["a@example.com"], account="iCloud", source_mailbox="Drafts")
+        accounts.assert_not_called()
+
+    def test_scoped_numeric_ids_need_no_lookup(self):
+        c = AppleMailConnector()
+        with patch.object(c, "find_message_by_message_id") as find:
+            assert c._resolve_bulk_ids(["123"], account="iCloud", source_mailbox="Archive") == [
+                "123"
+            ]
+        find.assert_not_called()
+
+    @pytest.mark.parametrize("operation", ["mark", "flag", "delete", "move", "patch"])
+    def test_scoped_mutations_propagate_scope(self, operation):
+        c = AppleMailConnector()
+        scope = {"account": "iCloud", "source_mailbox": "Archive"}
+        with (
+            patch.object(c, "_resolve_bulk_ids", return_value=["123"]) as resolve,
+            patch.object(c, "_run_applescript", return_value="1"),
+            patch.object(c, "_try_imap_delete", return_value=None),
+            patch.object(c, "_try_imap_fast_paths", return_value=None),
+        ):
+            if operation == "mark":
+                c.mark_as_read(["a@example.com"], True, **scope)
+            elif operation == "flag":
+                c.flag_message(["a@example.com"], "red", **scope)
+            elif operation == "delete":
+                c.delete_messages(["a@example.com"], **scope)
+            elif operation == "move":
+                c.move_messages(["a@example.com"], "Trash", **scope)
+            else:
+                c.update_message(["a@example.com"], read_status=True, **scope)
+        resolve.assert_called_once_with(["a@example.com"], **scope)
+
+    @pytest.mark.parametrize("scope", [{"account": "iCloud"}, {"source_mailbox": "Drafts"}])
+    def test_public_resolver_rejects_partial_scope(self, scope):
+        c = AppleMailConnector()
+        with patch.object(c, "_locate_via_imap") as locate:
+            with pytest.raises(ValueError, match="together"):
+                c.find_message_by_message_id("a@example.com", **scope)
+        locate.assert_not_called()
+
+    def test_scoped_absence_does_not_search_other_accounts_or_mail(self):
+        c = AppleMailConnector()
+        with (
+            patch.object(c, "list_accounts") as accounts,
+            patch.object(c, "_imap_breaker_open", return_value=False),
+            patch.object(c, "_resolve_imap_config", return_value=("host", 993, "u@example.com")),
+            patch.object(c, "_get_imap_password_with_fallback", return_value="pw"),
+            patch("apple_mail_fast_mcp.mail_connector.ImapConnector") as imap,
+            patch.object(c, "_run_applescript") as run,
+        ):
+            imap.return_value.locate_message.return_value = None
+            assert (
+                c._resolve_bulk_ids(["a@example.com"], account="iCloud", source_mailbox="Archive")
+                == []
+            )
+        accounts.assert_not_called()
+        run.assert_not_called()
+        imap.return_value.locate_message.assert_called_once_with("a@example.com", mailbox="Archive")
+
+    def test_move_account_without_source_keeps_legacy_cross_account_resolution(self):
+        c = AppleMailConnector()
+        with (
+            patch.object(c, "find_message_by_message_id", return_value="123") as find,
+            patch.object(c, "_run_applescript", return_value="1"),
+        ):
+            assert c.move_messages(["a@example.com"], "Archive", account="Destination") == 1
+        find.assert_called_once_with("a@example.com")
