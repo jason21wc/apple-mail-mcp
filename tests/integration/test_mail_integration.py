@@ -2742,6 +2742,7 @@ class TestBulkRfcIdDoesNotFreezeMail:
         self, connector: AppleMailConnector, test_account: str, source_mailbox: str
     ) -> None:
         import uuid
+        from unittest.mock import patch
 
         # A local draft supplies unique fixture mail without sending anything.
         draft = connector.create_draft(
@@ -2766,13 +2767,48 @@ class TestBulkRfcIdDoesNotFreezeMail:
                 )
                 assert moved_count == 1, "Disposable fixture was not moved; retain Drafts cleanup"
                 moved = True
+            # Observe the real lookup calls, without adding a readiness wait or
+            # retrying the mutation. A move verified locally by Mail may not yet
+            # be visible through IMAP, or Mail's numeric index may still lag.
+            diagnostics: dict[str, Any] = {"source_mailbox": source_mailbox}
+            resolved_ids: list[str] = []
+            original_locate = connector._locate_via_imap
+            original_resolve = connector._resolve_bulk_ids
+
+            def trace_locate(*args: Any, **kwargs: Any) -> Any:
+                located = original_locate(*args, **kwargs)
+                diagnostics["imap_found_during_flag"] = located is not None
+                return located
+
+            def trace_resolve(*args: Any, **kwargs: Any) -> list[str]:
+                resolved = original_resolve(*args, **kwargs)
+                resolved_ids[:] = resolved
+                diagnostics["resolved_id_count"] = len(resolved)
+                return resolved
+
             started = time.monotonic()
-            count = connector.update_message(
-                [draft_id], flag_color="orange", account=test_account,
-                source_mailbox=source_mailbox,
-            )
-            assert count == 1
-            assert time.monotonic() - started < 180
+            with (
+                patch.object(connector, "_locate_via_imap", side_effect=trace_locate),
+                patch.object(connector, "_resolve_bulk_ids", side_effect=trace_resolve),
+            ):
+                count = connector.update_message(
+                    [draft_id], flag_color="orange", account=test_account,
+                    source_mailbox=source_mailbox,
+                )
+            elapsed = time.monotonic() - started
+            if count != 1:
+                try:
+                    diagnostics["imap_found_after_flag"] = original_locate(
+                        draft_id, account=test_account, source_mailbox=source_mailbox
+                    ) is not None
+                except Exception as exc:
+                    diagnostics["imap_probe_error"] = type(exc).__name__
+                if resolved_ids:
+                    diagnostics["indexed_lookup_after_flag"] = self._probe_numeric_id(
+                        connector, test_account, source_mailbox, resolved_ids[0]
+                    )
+            assert count == 1, f"Expected one flag update; got {count}; {diagnostics}"
+            assert elapsed < 180
             assert connector.list_accounts()  # Mail still responds after the mutation.
         finally:
             if moved:
@@ -2781,6 +2817,32 @@ class TestBulkRfcIdDoesNotFreezeMail:
                 ) == 1
             else:
                 assert connector.delete_draft(draft_id)
+
+    @staticmethod
+    def _probe_numeric_id(
+        connector: AppleMailConnector, account: str, mailbox: str, numeric_id: str
+    ) -> str:
+        """Read only the owned fixture; return visibility/error code, no mail content."""
+        from apple_mail_fast_mcp.utils import applescript_account_clause
+
+        if not numeric_id.isdigit():
+            return "non_numeric_resolution"
+        mailbox_safe = escape_applescript_string(mailbox)
+        script = _MAILBOX_RESOLVER_HANDLERS + _wrap_with_timeout(
+            f'''tell application "Mail"
+                set sourceMb to my resolveMailbox({applescript_account_clause(account)}, "{mailbox_safe}")
+                try
+                    set matchedMessage to first message of sourceMb whose id is "{numeric_id}"
+                    return "visible"
+                on error number errorCode
+                    return "lookup_error:" & (errorCode as text)
+                end try
+            end tell''', timeout=connector.timeout,
+        )
+        try:
+            return connector._run_applescript(script).strip()
+        except Exception as exc:
+            return type(exc).__name__
 
 
 class TestGetThreadPartialFlagIntegration:
