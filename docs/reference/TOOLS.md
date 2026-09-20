@@ -447,6 +447,8 @@ Patch one or more messages: change read state, flag color, and/or move to anothe
 
 **Order of operations:** read-state and flag changes apply first (in the source mailbox), then the move. IMAP requires the message to exist in the source folder for STORE before MOVE.
 
+**Move synchronization:** a move performed through AppleScript (including a numeric Mail.app ID) is verified using Mail's local state. Success does not guarantee that the IMAP server already sees the message in the destination mailbox. An immediate follow-up using an RFC Message-ID and the destination mailbox can therefore resolve no message and report zero updates while Mail synchronizes. When applying flags or read state with a move, prefer one combined `update_message` call, which applies those changes before moving. Separate IMAP-dependent operations require server visibility first; the server does not automatically wait for cross-path synchronization.
+
 **Scoped RFC-ID lookup:** AppleScript-only patches, such as color flags and combined updates, resolve RFC Message-IDs within the supplied account and source mailbox. This includes Drafts, Archive, and nested folders. Resolution uses IMAP arrival dates and an indexed, date-bounded Mail lookup; it does not scan every mailbox or substitute an Inbox/Sent copy. If no requested IDs resolve and any lookup is incomplete, the operation reports an incomplete lookup instead of returning zero. Mixed batches retain best-effort behavior: unresolved IDs are skipped and the response counts completed updates.
 
 **Performance — IMAP fast paths:**

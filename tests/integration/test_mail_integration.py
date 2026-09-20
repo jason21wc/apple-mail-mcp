@@ -2767,9 +2767,13 @@ class TestBulkRfcIdDoesNotFreezeMail:
                 )
                 assert moved_count == 1, "Disposable fixture was not moved; retain Drafts cleanup"
                 moved = True
-            # Observe the real lookup calls, without adding a readiness wait or
-            # retrying the mutation. A move verified locally by Mail may not yet
-            # be visible through IMAP, or Mail's numeric index may still lag.
+                # Numeric moves are verified locally by Mail. Establish server
+                # visibility before testing the separate IMAP-dependent lookup.
+                self._wait_for_imap_fixture(
+                    connector, draft_id, test_account, source_mailbox
+                )
+            # Observe the one flag attempt after fixture setup; the timer excludes
+            # synchronization. This does not test immediate move->flag consistency.
             diagnostics: dict[str, Any] = {"source_mailbox": source_mailbox}
             resolved_ids: list[str] = []
             original_locate = connector._locate_via_imap
@@ -2817,6 +2821,30 @@ class TestBulkRfcIdDoesNotFreezeMail:
                 ) == 1
             else:
                 assert connector.delete_draft(draft_id)
+
+    @staticmethod
+    def _wait_for_imap_fixture(
+        connector: AppleMailConnector, message_id: str, account: str, mailbox: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """Poll owned-fixture presence only; lookup errors propagate immediately.
+
+        The polling deadline does not shorten an in-flight connector request.
+        No mutation is retried and no other account/folder is searched.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if connector._locate_via_imap(
+                message_id, account=account, source_mailbox=mailbox
+            ) is not None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                pytest.fail(
+                    f"Fixture setup incomplete: moved message not visible through IMAP "
+                    f"in {mailbox!r} after {timeout_s}s polling; flag not attempted"
+                )
+            time.sleep(min(0.5, remaining))
 
     @staticmethod
     def _probe_numeric_id(
