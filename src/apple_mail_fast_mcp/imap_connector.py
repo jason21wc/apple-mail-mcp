@@ -317,7 +317,9 @@ def _validate_message_ids(message_ids: list[str]) -> None:
         _bracket_message_id(mid)
 
 
-def _or_message_id_criteria(message_ids: list[str]) -> list[Any]:
+def _or_message_id_criteria(
+    message_ids: list[str], headers: tuple[str, ...] = ("Message-ID",),
+) -> list[Any]:
     """Build an IMAP SEARCH criteria matching ANY of ``message_ids`` by
     ``HEADER "Message-ID"``, so a batch resolves in one round-trip. (#316)
 
@@ -327,8 +329,8 @@ def _or_message_id_criteria(message_ids: list[str]) -> list[Any]:
     ``["OR", a, ["OR", b, c]]``. Assumes ``message_ids`` is non-empty.
     """
     clauses = [
-        ["HEADER", "Message-ID", _bracket_message_id(mid)]
-        for mid in message_ids
+        ["HEADER", header, _bracket_message_id(mid)]
+        for mid in message_ids for header in headers
     ]
     criteria: list[Any] = clauses[-1]
     for clause in reversed(clauses[:-1]):
@@ -1291,7 +1293,9 @@ class ImapConnector:
                 entry.get(b"BODYSTRUCTURE")
             )
 
-    def locate_message(self, message_id: str) -> dict[str, Any] | None:
+    def locate_message(
+        self, message_id: str, mailbox: str | None = None
+    ) -> dict[str, Any] | None:
         """Locate an RFC 5322 Message-ID and return where and *when* it is.
 
         Returns ``{"folder": str, "uid": int, "internaldate": datetime}`` for
@@ -1307,7 +1311,10 @@ class ImapConnector:
         from the server side, where the lookup IS indexed (measured 0.14s over
         61,880 messages).
 
-        Shares the bounded probe-folder set with :meth:`resolve_anchor` — for
+        An explicit ``mailbox`` is a strict single-folder scope. Selection,
+        search, or fetch failures propagate; only a successful empty search
+        returns None. Without a mailbox, preserves the bounded probe-folder
+        set shared with :meth:`resolve_anchor` — for
         locating, Gmail's All Mail is ideal rather than a liability, since it
         mirrors every message and so answers for any folder.
 
@@ -1316,13 +1323,20 @@ class ImapConnector:
                 so the caller can distinguish "not there" from "could not
                 check" (#425).
         """
+        if mailbox is not None:
+            _reject_control_chars(mailbox, "mailbox")
         bracketed = _bracket_message_id(message_id)
         with self._session() as client:
-            for folder in self._anchor_probe_folders(client):
+            folders = (
+                [mailbox] if mailbox is not None else self._anchor_probe_folders(client)
+            )
+            for folder in folders:
                 try:
                     client.select_folder(folder, readonly=True)
                     uids = client.search(["HEADER", "Message-ID", bracketed])
                 except IMAPClientError as exc:
+                    if mailbox is not None:
+                        raise
                     logger.debug(
                         "locate_message: skipping %s (%s)", folder, exc
                     )
@@ -1332,10 +1346,16 @@ class ImapConnector:
                 try:
                     fetched = client.fetch([uids[0]], [b"INTERNALDATE"])
                 except IMAPClientError:
+                    if mailbox is not None:
+                        raise
                     continue
                 entry = fetched.get(uids[0]) or {}
                 internaldate = entry.get(b"INTERNALDATE")
                 if internaldate is None:
+                    if mailbox is not None:
+                        raise MailAnchorProbeIncompleteError(
+                            f"Message matched in {mailbox!r}, but INTERNALDATE is unavailable"
+                        )
                     continue
                 return {
                     "folder": folder,
@@ -1767,6 +1787,31 @@ class ImapConnector:
                 )
             client.append(folder, raw_message, flags=[DRAFT])
             return folder
+
+    def fetch_raw_draft(self, message_id: str) -> bytes:
+        """Read one unambiguous saved draft from this account's Drafts folder.
+
+        HEADER search can match substrings, so bind the fetched MIME header
+        to the requested identity before allowing preservation/replacement.
+        PEEK and read-only SELECT leave message flags unchanged.
+        """
+        bracketed = _bracket_message_id(message_id)
+        with self._session() as client:
+            folder = self._find_drafts_folder(
+                client
+            ) or self._find_drafts_by_convention(client)
+            if folder is None:
+                raise MailMessageNotFoundError("No Drafts folder found")
+            client.select_folder(folder, readonly=True)
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if len(uids) != 1:
+                raise MailMessageNotFoundError("Draft lookup did not identify exactly one message")
+            fetched = client.fetch(uids, [b"BODY.PEEK[]"])
+            raw = bytes(fetched.get(uids[0], {}).get(b"BODY[]") or b"")
+            headers = message_from_bytes(raw, policy=policy.default).get_all("Message-ID", [])
+            if len(headers) != 1 or str(headers[0]).strip() != bracketed:
+                raise MailMessageNotFoundError("Fetched draft identity did not match")
+            return raw
 
     @staticmethod
     def _find_drafts_folder(client: IMAPClient) -> str | None:
@@ -2322,7 +2367,7 @@ class ImapConnector:
         Returns ``None`` (not raise) when THREAD gets rejected
         mid-flight — dispatcher then falls through to Tier 3.
         """
-        bracketed = _bracket_message_id(anchor_rfc_message_id)
+        seed_ids = list(dict.fromkeys([anchor_rfc_message_id, *anchor_references]))
         # Pick the algorithm name the server actually advertises.
         if self._has_capability(client, b"THREAD=REFERENCES"):
             algo = "REFERENCES"
@@ -2349,15 +2394,18 @@ class ImapConnector:
                 continue
             # Narrow-search: anchor UID + sibling-replies in this mailbox.
             try:
-                anchor_uids = client.search(
-                    ["HEADER", "Message-ID", bracketed]
-                )
-                ref_uids = client.search(
-                    ["HEADER", "References", bracketed]
-                )
+                relevant_uids: set[int] = set()
+                headers = ("Message-ID", "References", "In-Reply-To")
+                bracketed = _bracket_message_id(seed_ids[0])
+                for header in headers:
+                    relevant_uids.update(client.search(["HEADER", header, bracketed]))
+                # Bound OR depth/command size and round trips for long chains.
+                for start in range(1, len(seed_ids), 25):
+                    relevant_uids.update(client.search(
+                        _or_message_id_criteria(seed_ids[start:start + 25], headers)
+                    ))
             except IMAPClientError:
                 continue
-            relevant_uids = set(anchor_uids) | set(ref_uids)
             if not relevant_uids:
                 continue
             # Run THREAD; walk tree for clusters intersecting relevant_uids.

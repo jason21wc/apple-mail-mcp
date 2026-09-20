@@ -12,7 +12,7 @@ doesn't), so there is no second source of truth to drift. This file exists only
 for undo.
 
 Trust boundary: ``record`` is the gate — it stores the *resolved* ``dest_path``;
-``undo`` only acts on a logged path whose content still matches (sha256) AND
+``undo`` only acts on a logged path whose file identity and content still match AND
 whose resolved path is unchanged since record. The skill is responsible for only
 recording paths inside a recipe's destination directory.
 
@@ -34,11 +34,14 @@ exit non-zero when ``success`` is false, so the skill can branch on it.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
+from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -115,12 +118,60 @@ def _load(recipe: str) -> dict[str, Any]:
     return data
 
 
+def _locked(func: Any) -> Any:
+    """Serialize the complete read/modify/write operation across processes."""
+    @wraps(func)
+    def wrapper(args: argparse.Namespace) -> dict[str, Any]:
+        path = _path_for(args.recipe).with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return func(args)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return wrapper
+
+
+def _identity(path: Path) -> list[int]:
+    st = path.stat()
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def stable_filename(message_id: str, attachment_name: str, attachment_index: int) -> str:
+    """Order-independent destination identity; index is within the source message."""
+    if not message_id.strip() or attachment_index < 0:
+        raise UndoLogError("A stable message ID and nonnegative attachment index are required")
+    identity = json.dumps([message_id.strip().strip("<>"), attachment_name, attachment_index])
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    basename = Path(attachment_name).name
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", basename) or "attachment"
+    return f"{digest}-{safe[:180]}"
+
+
+def cmd_filename(args: argparse.Namespace) -> dict[str, Any]:
+    return {"success": True, "filename": stable_filename(
+        args.rfc_message_id, args.attachment_name, args.attachment_index
+    )}
+
+
 def _save(recipe: str, data: dict[str, Any]) -> None:
     path = _path_for(recipe)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / f".{path.name}.tmp"
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)  # atomic on the same filesystem
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     prefix=f".{path.name}.", delete=False) as fh:
+        tmp = Path(fh.name)
+        try:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _resolve_target_run(records: list[dict[str, Any]], run_id: str | None, last: bool) -> str:
@@ -144,6 +195,7 @@ def cmd_new_run_id(args: argparse.Namespace) -> dict[str, Any]:
     return {"success": True, "run_id": _gen_run_id()}
 
 
+@_locked
 def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
     data = _load(args.recipe)
     dest = Path(args.dest_path).expanduser().resolve()
@@ -152,10 +204,18 @@ def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
             f"dest_path does not exist (record only confirmed saves): {dest}",
             error_type="dest_missing",
         )
+    identity = _identity(dest)
+    digest = _sha256_of(dest)
+    if _identity(dest) != identity:
+        raise UndoLogError("File changed during record; retry after writes finish")
+    for previous in data["records"]:
+        if previous.get("dest_path") == str(dest) and previous.get("status") == _STATUS_SAVED:
+            previous["status"] = "superseded"
     record = {
         "run_id": args.run_id,
         "dest_path": str(dest),
-        "sha256": _sha256_of(dest),
+        "sha256": digest,
+        "identity": identity,
         "size": dest.stat().st_size,
         "saved_at": _utc_now(),
         "rfc_message_id": args.rfc_message_id,
@@ -172,6 +232,7 @@ def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
     return {"success": True, "recorded": 1, "dest_path": str(dest)}
 
 
+@_locked
 def cmd_undo(args: argparse.Namespace) -> dict[str, Any]:
     data = _load(args.recipe)
     records = data["records"]
@@ -198,16 +259,26 @@ def cmd_undo(args: argparse.Namespace) -> dict[str, Any]:
             # the sha256 check alone can't tell a moved file from a byte-twin.
             modified_skipped += 1
             details.append({"dest_path": dest_str, "outcome": "path_changed"})
+        elif rec.get("identity") != _identity(dest):
+            # Legacy logs cannot prove ownership. Identical bytes in a new file
+            # are still a different save and must survive this run's undo.
+            modified_skipped += 1
+            details.append({"dest_path": dest_str, "outcome": "identity_changed"})
         elif _sha256_of(dest) != rec.get("sha256"):
             modified_skipped += 1
             details.append({"dest_path": dest_str, "outcome": "modified_skipped"})
         else:
+            if str(dest.resolve()) != dest_str or _identity(dest) != rec["identity"]:
+                modified_skipped += 1
+                details.append({"dest_path": dest_str, "outcome": "identity_changed"})
+                continue
             dest.unlink()
             rec["status"] = _STATUS_REVERTED
             rec["reverted_at"] = _utc_now()
             rec["revert_note"] = f"undo {run_id}"
             deleted += 1
             details.append({"dest_path": dest_str, "outcome": "deleted"})
+            _save(args.recipe, data)
     _save(args.recipe, data)
     return {
         "success": True,
@@ -220,6 +291,7 @@ def cmd_undo(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+@_locked
 def cmd_list_runs(args: argparse.Namespace) -> dict[str, Any]:
     data = _load(args.recipe)
     runs: dict[str, dict[str, Any]] = {}
@@ -230,7 +302,7 @@ def cmd_list_runs(args: argparse.Namespace) -> dict[str, Any]:
         )
         if rec.get("status") == _STATUS_REVERTED:
             run["reverted"] += 1
-        else:
+        elif rec.get("status") == _STATUS_SAVED:
             run["saved"] += 1
     ordered = sorted(runs.values(), key=lambda r: r["run_id"], reverse=True)
     return {"success": True, "runs": ordered}
@@ -239,6 +311,12 @@ def cmd_list_runs(args: argparse.Namespace) -> dict[str, Any]:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Undo log for attachment-retrieval grabs.")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_filename = sub.add_parser("filename", help="Derive a stable attachment filename.")
+    p_filename.add_argument("--rfc-message-id", required=True)
+    p_filename.add_argument("--attachment-name", required=True)
+    p_filename.add_argument("--attachment-index", type=int, required=True)
+    p_filename.set_defaults(func=cmd_filename)
 
     p_new = sub.add_parser("new-run-id", help="Generate a run_id for a grab.")
     p_new.add_argument("--recipe", required=True)

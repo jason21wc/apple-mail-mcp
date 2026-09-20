@@ -53,7 +53,10 @@ def test_account() -> str:
     This matches the account name the server.py safety gate verifies.
     """
     import os
-    return os.getenv("MAIL_TEST_ACCOUNT", "Gmail")
+    account = os.getenv("MAIL_TEST_ACCOUNT")
+    if not account or os.getenv("MAIL_TEST_MODE", "").lower() != "true":
+        pytest.skip("Explicit MAIL_TEST_ACCOUNT and MAIL_TEST_MODE=true required")
+    return account
 
 
 def _newest_inbox_ids(
@@ -2731,6 +2734,145 @@ class TestAnchorLookupIncompleteIntegration:
         assert isinstance(thread, list) and len(thread) >= 1
 
 
+class TestBulkRfcIdDoesNotFreezeMail:
+    """Exercise RFC-ID flagging on an owned disposable message, never existing mail."""
+
+    @pytest.mark.parametrize("source_mailbox", ["INBOX", "Drafts"])
+    def test_bulk_flag_by_rfc_id_completes_and_keeps_mail_responsive(
+        self, connector: AppleMailConnector, test_account: str, source_mailbox: str
+    ) -> None:
+        import uuid
+        from unittest.mock import patch
+
+        # A local draft supplies unique fixture mail without sending anything.
+        draft = connector.create_draft(
+            to=["fixture@example.invalid"], subject=f"MCP TEST {uuid.uuid4()}",
+            body="Disposable bulk mutation fixture", from_account=test_account,
+            require_stable_id=True,
+        )
+        draft_id = draft["draft_id"]
+        numeric_id = None
+        moved = False
+        try:
+            TestDraftsLifecycleIntegration._wait_for_draft(connector, draft_id)
+            numeric_id = connector._resolve_draft_lookup_id(draft_id)
+            if "@" not in draft_id:
+                pytest.skip("RFC-ID regression requires the IMAP draft path")
+            # INBOX exercises numeric-ID movement; Drafts proves RFC resolution
+            # honors the explicit folder outside the default Inbox/Sent set.
+            if source_mailbox == "INBOX":
+                moved_count = connector.update_message(
+                    [numeric_id], destination_mailbox="INBOX", account=test_account,
+                    source_mailbox="Drafts",
+                )
+                assert moved_count == 1, "Disposable fixture was not moved; retain Drafts cleanup"
+                moved = True
+                # Numeric moves are verified locally by Mail. Establish server
+                # visibility before testing the separate IMAP-dependent lookup.
+                self._wait_for_imap_fixture(
+                    connector, draft_id, test_account, source_mailbox
+                )
+            # Observe the one flag attempt after fixture setup; the timer excludes
+            # synchronization. This does not test immediate move->flag consistency.
+            diagnostics: dict[str, Any] = {"source_mailbox": source_mailbox}
+            resolved_ids: list[str] = []
+            original_locate = connector._locate_via_imap
+            original_resolve = connector._resolve_bulk_ids
+
+            def trace_locate(*args: Any, **kwargs: Any) -> Any:
+                located = original_locate(*args, **kwargs)
+                diagnostics["imap_found_during_flag"] = located is not None
+                return located
+
+            def trace_resolve(*args: Any, **kwargs: Any) -> list[str]:
+                resolved = original_resolve(*args, **kwargs)
+                resolved_ids[:] = resolved
+                diagnostics["resolved_id_count"] = len(resolved)
+                return resolved
+
+            started = time.monotonic()
+            with (
+                patch.object(connector, "_locate_via_imap", side_effect=trace_locate),
+                patch.object(connector, "_resolve_bulk_ids", side_effect=trace_resolve),
+            ):
+                count = connector.update_message(
+                    [draft_id], flag_color="orange", account=test_account,
+                    source_mailbox=source_mailbox,
+                )
+            elapsed = time.monotonic() - started
+            if count != 1:
+                try:
+                    diagnostics["imap_found_after_flag"] = original_locate(
+                        draft_id, account=test_account, source_mailbox=source_mailbox
+                    ) is not None
+                except Exception as exc:
+                    diagnostics["imap_probe_error"] = type(exc).__name__
+                if resolved_ids:
+                    diagnostics["indexed_lookup_after_flag"] = self._probe_numeric_id(
+                        connector, test_account, source_mailbox, resolved_ids[0]
+                    )
+            assert count == 1, f"Expected one flag update; got {count}; {diagnostics}"
+            assert elapsed < 180
+            assert connector.list_accounts()  # Mail still responds after the mutation.
+        finally:
+            if moved:
+                assert connector.delete_messages(
+                    [draft_id], account=test_account, source_mailbox="INBOX"
+                ) == 1
+            else:
+                assert connector.delete_draft(draft_id)
+
+    @staticmethod
+    def _wait_for_imap_fixture(
+        connector: AppleMailConnector, message_id: str, account: str, mailbox: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """Poll owned-fixture presence only; lookup errors propagate immediately.
+
+        The polling deadline does not shorten an in-flight connector request.
+        No mutation is retried and no other account/folder is searched.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if connector._locate_via_imap(
+                message_id, account=account, source_mailbox=mailbox
+            ) is not None:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                pytest.fail(
+                    f"Fixture setup incomplete: moved message not visible through IMAP "
+                    f"in {mailbox!r} after {timeout_s}s polling; flag not attempted"
+                )
+            time.sleep(min(0.5, remaining))
+
+    @staticmethod
+    def _probe_numeric_id(
+        connector: AppleMailConnector, account: str, mailbox: str, numeric_id: str
+    ) -> str:
+        """Read only the owned fixture; return visibility/error code, no mail content."""
+        from apple_mail_fast_mcp.utils import applescript_account_clause
+
+        if not numeric_id.isdigit():
+            return "non_numeric_resolution"
+        mailbox_safe = escape_applescript_string(mailbox)
+        script = _MAILBOX_RESOLVER_HANDLERS + _wrap_with_timeout(
+            f'''tell application "Mail"
+                set sourceMb to my resolveMailbox({applescript_account_clause(account)}, "{mailbox_safe}")
+                try
+                    set matchedMessage to first message of sourceMb whose id is "{numeric_id}"
+                    return "visible"
+                on error number errorCode
+                    return "lookup_error:" & (errorCode as text)
+                end try
+            end tell''', timeout=connector.timeout,
+        )
+        try:
+            return connector._run_applescript(script).strip()
+        except Exception as exc:
+            return type(exc).__name__
+
+
 class TestGetThreadPartialFlagIntegration:
     """#420: a degraded thread must announce itself against real Mail.
 
@@ -3068,3 +3210,74 @@ class TestSaveAttachmentsByteCapSizeSource:
         # Meaningfully populated for real content (not all zero), so the
         # per-attachment / aggregate caps have a real size to gate on.
         assert any(a["size"] > 0 for a in atts)
+
+
+class TestDraftReplacementReliability:
+    async def test_scoped_replacement_preserves_attachment_and_account(
+        self, connector: AppleMailConnector, test_account: str, tmp_path: Path,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        import uuid
+
+        from apple_mail_fast_mcp import server
+        from apple_mail_fast_mcp.drafts import DraftStateStore
+        from apple_mail_fast_mcp.exceptions import MailDraftNotFoundError
+
+        # Isolate seed metadata without hiding the account's IMAP overrides.
+        store = DraftStateStore(tmp_path / "state")
+        monkeypatch.setattr(server, "_get_draft_state_store", lambda: store)
+        monkeypatch.setattr(server, "mail", connector)
+        attachment = tmp_path / "fixture.txt"
+        attachment.write_text("Disposable attachment fixture")
+        original = connector.create_draft(
+            to=["fixture@example.invalid"], subject=f"MCP TEST {uuid.uuid4()}",
+            body="Disposable draft", from_account=test_account,
+            attachment_paths=[attachment],
+            require_stable_id=True,
+        )["draft_id"]
+        cleanup_ids = [original]
+        try:
+            state = TestDraftsLifecycleIntegration._wait_for_draft(connector, original)
+            assert state["from_account"] == test_account
+            assert state["content_type"]
+            # Even with a working account, exercise unavailable IMAP against
+            # this owned fixture and prove the saved original survives intact.
+            from unittest.mock import Mock
+
+            clean_path = Mock(return_value=None)
+            with monkeypatch.context() as unavailable:
+                unavailable.setattr(connector, "_try_clean_create_or_send", clean_path)
+                refused = await server.update_draft(original, body="Must not replace")
+            assert not refused["success"] and refused["error_type"] == "draft_error", refused
+            assert "requires working IMAP" in refused["error"], refused
+            clean_path.assert_called_once()
+            retained = connector.get_draft_state(original)
+            assert retained["body"] == state["body"]
+            assert retained["attachment_names"] == state["attachment_names"]
+            assert retained["from_account"] == state["from_account"]
+            result = await server.update_draft(original, body="Updated disposable draft")
+            if result.get("draft_id"):
+                cleanup_ids.append(result["draft_id"])
+            assert result["success"] and not result.get("partial"), result
+            replacement = TestDraftsLifecycleIntegration._wait_for_draft(
+                connector, result["draft_id"]
+            )
+            assert replacement["from_account"] == test_account
+            assert replacement["attachment_names"] == ["fixture.txt"]
+            extracted_dir = tmp_path / "recovered"
+            extracted_dir.mkdir()
+            recovered = connector.extract_draft_attachments(
+                result["draft_id"], replacement["attachment_names"], extracted_dir,
+                account=test_account,
+            )
+            assert len(recovered) == 1
+            assert recovered[0].read_bytes() == attachment.read_bytes()
+            assert "Updated disposable draft" in replacement["body"]
+            with pytest.raises(MailDraftNotFoundError):
+                connector.get_draft_state(original)
+        finally:
+            for draft_id in cleanup_ids:
+                try:
+                    connector.delete_draft(draft_id)
+                except MailDraftNotFoundError:
+                    pass

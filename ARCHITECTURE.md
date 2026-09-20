@@ -25,7 +25,7 @@ weekly property reports — into local folders, incrementally and undoably.
               |
     apple_mail_fast_mcp.server   FastMCP tool surface  <-- both fork mods live here
               |                          (plus a TEMPORARY connector exception,
-              |                           upstream PR #439 — see ADR-3)
+              |                           upstream PR #439 and bounded reliability fixes — see below)
               |
       +-------+-------+
       |               |
@@ -74,7 +74,7 @@ Sync small and often; prefer contributing upstream over accumulating fork code.
 
 An attachment retrieval, end to end:
 
-1. Agent calls a tool; ai-governance-proxy evaluates and permits it.
+1. Agent calls a tool; ai-governance-proxy checks that a governance call occurred within its recency window, then forwards it. The agent must interpret and follow the governance verdict.
 2. `server.py` sanitizes input, checks rate limits and the test-mode safety gate.
 3. The connector tries direct IMAP first, falling back to AppleScript.
 4. Bytes come back; `_mark_untrusted()` tags the response as external data.
@@ -171,3 +171,20 @@ stronger gate.
 test counts and tool counts drift every PR; a pinned number rots and then
 misleads. *Consequence:* instruction files point at `make test` and
 `docs/reference/TOOLS.md` instead of quoting them.
+
+### Approved reliability exceptions (September 2026)
+
+The owner authorized bounded fixes alongside the v0.11.0 upstream sync: source
+mailbox confinement in test mode, confirmation before activating rules, draft
+replacement before cleanup with complete attachment preservation, SMTP partial
+recipient outcomes, and IMAP THREAD ancestor discovery. These touch server,
+security, and connector code and should be offered upstream as separate fixes
+when authorized. They do not expand the fork's standing product scope.
+
+The attachment skill also records file identity, serializes recipe log updates,
+and derives stable attachment filenames independent of search order. Legacy undo
+records cannot prove ownership and are conservatively left untouched.
+
+The stdio E2E smoke test also requires `ai-governance-proxy` on PATH and launches
+the tested interpreter through it in hard mode. It performs handshake and tool
+discovery only; it does not call Mail tools.

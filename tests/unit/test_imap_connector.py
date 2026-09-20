@@ -3306,10 +3306,13 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [7],   # INBOX HEADER Message-ID
             [],    # INBOX HEADER References
+            [],    # In-Reply-To
             [],    # Sent HEADER Message-ID
             [],    # Sent HEADER References
+            [],    # In-Reply-To
             [],    # Archive HEADER Message-ID
             [99],  # Archive HEADER References (sibling reply)
+            [],    # In-Reply-To
         ]
         # THREAD response: nested tuples per RFC 5256.
         client.thread.side_effect = [
@@ -3345,10 +3348,13 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [1],   # INBOX MsgID
             [],    # INBOX References
+            [],    # In-Reply-To
             [],    # Sent MsgID
             [],    # Sent References
+            [],    # In-Reply-To
             [],    # Archive MsgID
             [],    # Archive References
+            [],    # In-Reply-To
         ]
         client.thread.return_value = ((1,),)
         client.fetch.return_value = _fake_fetch_result([1])
@@ -3402,6 +3408,7 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [1],   # INBOX MsgID
             [],    # INBOX References
+            [],    # In-Reply-To
         ] + [[]] * 100  # plenty for BFS to fast-exit
         client.thread.side_effect = IMAPClientError("THREAD rejected")
         client.fetch.return_value = {}
@@ -3454,8 +3461,10 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [7],   # INBOX MsgID
             [],    # INBOX References
+            [],    # In-Reply-To
             [],    # Archive MsgID
             [],    # Archive References
+            [],    # In-Reply-To
         ]
         client.thread.return_value = ((7,),)
         client.fetch.return_value = _fake_fetch_result([7])
@@ -3484,8 +3493,10 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [7],   # INBOX MsgID
             [],    # INBOX References
+            [],    # In-Reply-To
             [],    # Archive MsgID
             [],    # Archive References
+            [],    # In-Reply-To
         ]
         client.thread.return_value = ((7,),)
         client.fetch.return_value = _fake_fetch_result([7])
@@ -3518,8 +3529,10 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [7],   # INBOX MsgID
             [],    # INBOX References
+            [],    # In-Reply-To
             [],    # Archive MsgID
             [],    # Archive References
+            [],    # In-Reply-To
         ]
         client.thread.return_value = ((7,),)
         client.fetch.return_value = _fake_fetch_result([7])
@@ -3549,8 +3562,10 @@ class TestFindThreadMembersImapThread:
             # next iteration: Sent
             [],   # Sent MsgID
             [],   # Sent References
+            [],    # In-Reply-To
             [7],  # Archive MsgID
             [],   # Archive References
+            [],    # In-Reply-To
         ]
         client.thread.return_value = ((7,),)
         client.fetch.return_value = _fake_fetch_result([7])
@@ -3578,8 +3593,10 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [7],    # INBOX MsgID
             [],     # INBOX References
+            [],    # In-Reply-To
             [],     # Archive MsgID
             [99],   # Archive References (sibling reply)
+            [],    # In-Reply-To
         ]
         client.thread.side_effect = [
             ((1, 2, 3),),       # INBOX clusters: no overlap with {7}
@@ -3611,8 +3628,10 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [7],    # INBOX MsgID
             [],     # INBOX References
+            [],    # In-Reply-To
             [],     # Archive MsgID
             [99],   # Archive References
+            [],    # In-Reply-To
         ]
         client.thread.side_effect = [
             ((7,),),
@@ -3647,8 +3666,10 @@ class TestFindThreadMembersImapThread:
         client.search.side_effect = [
             [7],   # INBOX MsgID
             [],    # INBOX References
+            [],    # In-Reply-To
             [],    # Archive MsgID
             [99],  # Archive References
+            [],    # In-Reply-To
         ]
         client.thread.side_effect = [
             ((7, 8, 9),),
@@ -4112,3 +4133,114 @@ class TestAnchorProbeEvidenceOfAbsence:
         # Discovery happens only when the hint did not resolve.
         next(probe)
         assert client.list_folders.called
+
+
+def test_thread_finds_ancestor_in_separate_archive():
+    client = MagicMock()
+    client.capabilities.return_value = (b"IMAP4rev1", b"THREAD=REFERENCES")
+    client.list_folders.return_value = [((), b"/", "INBOX"), ((), b"/", "Archive")]
+    current = [""]
+    client.select_folder.side_effect = lambda folder, **kw: current.__setitem__(0, folder)
+
+    def search(criteria):
+        if current[0] == "INBOX" and criteria[1:] == ["Message-ID", "<child@example.com>"]:
+            return [2]
+        if current[0] == "Archive" and "<parent@example.com>" in str(criteria):
+            return [1]
+        return []
+
+    client.search.side_effect = search
+    client.thread.side_effect = [((2,),), ((1,),)]
+    client.fetch.side_effect = lambda uids, fields: _fake_fetch_result(uids)
+    result = ImapConnector("h", 993, "u@example.com", "pw")._thread_via_imap_thread(
+        client, "child@example.com", ["parent@example.com", "parent@example.com"]
+    )
+    assert len(result) == 2
+    assert client.search.call_count == 8  # three anchor queries + one ancestor batch per folder
+
+
+def test_thread_batches_long_ancestor_chain():
+    client = MagicMock()
+    client.capabilities.return_value = (b"THREAD=REFERENCES",)
+    client.list_folders.return_value = [((), b"/", "Archive")]
+    client.search.return_value = []
+    ImapConnector("h", 993, "u@example.com", "pw")._thread_via_imap_thread(
+        client, "anchor@example.com", [f"parent{i}@example.com" for i in range(100)]
+    )
+    assert client.search.call_count == 7  # 3 anchor queries, 4 batches of 25 ancestors
+
+
+class TestFetchRawDraft:
+    @pytest.mark.parametrize("special", [True, False])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_scoped_readonly_exact_draft(self, cls, special):
+        client = cls.return_value
+        folder = "LocalizedDrafts" if special else "Drafts"
+        client.list_folders.return_value = [([b"\\Drafts"] if special else [], b"/", folder)]
+        client.search.return_value = [42]
+        raw = b"Message-ID: <draft@example.com>\r\n\r\noriginal"
+        client.fetch.return_value = {42: {b"BODY[]": raw}}
+        conn = ImapConnector("imap.example.com", 993, "test@example.com", "test-only")
+        assert conn.fetch_raw_draft("draft@example.com") == raw
+        client.select_folder.assert_called_once_with(folder, readonly=True)
+        client.search.assert_called_once_with(["HEADER", "Message-ID", "<draft@example.com>"])
+        client.fetch.assert_called_once_with([42], [b"BODY.PEEK[]"])
+
+    @pytest.mark.parametrize("uids,raw", [
+        ([], b""), ([1, 2], b""), ([1], b""),
+        ([1], b"Message-ID: <other@example.com>\r\n\r\nbody"),
+        ([1], b"Message-ID: <draft@example.com>\r\nMessage-ID: <draft@example.com>\r\n\r\nbody"),
+    ])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_refuses_unproven_identity(self, cls, uids, raw):
+        client = cls.return_value
+        client.list_folders.return_value = [([b"\\Drafts"], b"/", "Drafts")]
+        client.search.return_value = uids
+        client.fetch.return_value = {1: {b"BODY[]": raw}}
+        conn = ImapConnector("imap.example.com", 993, "test@example.com", "test-only")
+        with pytest.raises(MailMessageNotFoundError):
+            conn.fetch_raw_draft("draft@example.com")
+        if len(uids) != 1:
+            client.fetch.assert_not_called()
+
+
+class TestScopedLocateMessage:
+    @pytest.mark.parametrize("mailbox", ["Archive", "Drafts", 'Parent/Child"Q'])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_probes_only_explicit_folder(self, mock_cls, mailbox):
+        client = mock_cls.return_value
+        when = datetime(2026, 8, 9)
+        client.search.return_value = [42]
+        client.fetch.return_value = {42: {b"INTERNALDATE": when}}
+        c = ImapConnector("host", 993, "u@example.com", "pw")
+        assert c.locate_message("a@example.com", mailbox=mailbox) == {
+            "folder": mailbox,
+            "uid": 42,
+            "internaldate": when,
+        }
+        client.select_folder.assert_called_once_with(mailbox, readonly=True)
+        client.list_folders.assert_not_called()
+
+    @pytest.mark.parametrize("failure", ["select", "search", "fetch", "missing_date"])
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_scope_failure_is_not_absence(self, mock_cls, failure):
+        client = mock_cls.return_value
+        client.search.return_value = [42]
+        client.fetch.return_value = {42: {}}
+        if failure != "missing_date":
+            method = "select_folder" if failure == "select" else failure
+            getattr(client, method).side_effect = IMAPClientError("unavailable")
+        c = ImapConnector("host", 993, "u@example.com", "pw")
+        with pytest.raises((IMAPClientError, MailAnchorProbeIncompleteError)):
+            c.locate_message("a@example.com", mailbox="Archive")
+        client.select_folder.assert_called_once_with("Archive", readonly=True)
+        client.list_folders.assert_not_called()
+
+    @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
+    def test_successful_empty_search_is_absence(self, mock_cls):
+        client = mock_cls.return_value
+        client.search.return_value = []
+        c = ImapConnector("host", 993, "u@example.com", "pw")
+        assert c.locate_message("a@example.com", mailbox="Archive") is None
+        client.select_folder.assert_called_once_with("Archive", readonly=True)
+        client.fetch.assert_not_called()

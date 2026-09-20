@@ -356,7 +356,7 @@ def list_rules() -> dict[str, Any]:
         }
 
 
-def _rule_target_snapshot(rule_index: int) -> tuple[str | None, list[tuple[int, str]], str | None]:
+def _rule_target_snapshot(rule_index: int) -> tuple[str | None, list[tuple[int, str, bool | None]], str | None]:
     """Resolve a rule target and capture the list it was resolved against.
 
     Returns ``(name, snapshot, error_kind)``. ``error_kind`` is
@@ -369,12 +369,13 @@ def _rule_target_snapshot(rule_index: int) -> tuple[str | None, list[tuple[int, 
     """
     rules = mail.list_rules()
     snapshot = [
-        (int(r.get("index", -1)), cast(str, r.get("name", ""))) for r in rules
+        (int(r.get("index", -1)), cast(str, r.get("name", "")), r.get("enabled"))
+        for r in rules
     ]
-    name = next((n for i, n in snapshot if i == rule_index), None)
+    name = next((n for i, n, _enabled in snapshot if i == rule_index), None)
     if name is None:
         return None, snapshot, None
-    if sum(1 for _i, n in snapshot if n == name) > 1:
+    if sum(1 for _i, n, _enabled in snapshot if n == name) > 1:
         return name, snapshot, "ambiguous_target"
     return name, snapshot, None
 
@@ -650,8 +651,9 @@ async def update_rule(
     scope), or replaces ``actions`` with a set that includes a dangerous
     action (move / forward / delete / copy). An ``actions`` patch limited to
     organizational flags (``mark_read`` / ``mark_flagged`` / ``flag_color``)
-    skips the prompt, as do patches limited to ``enabled`` and/or ``name``
-    (trivially reversible). The enable/disable path replaces the removed
+    skips the prompt. Activating a disabled rule always confirms because
+    existing actions may have destructive effects. Disabling, renaming, or
+    leaving an already enabled rule enabled skips the prompt. The path replaces the removed
     ``set_rule_enabled`` tool: call ``update_rule(rule_index,
     enabled=True|False)``.
 
@@ -708,14 +710,18 @@ async def update_rule(
         # dangerous action (move/forward/delete/copy) — organizational-only
         # patches (mark_read / mark_flagged / flag_color) skip the prompt.
         needs_confirmation = (
-            conditions is not None
+            (enabled is True and not any(
+                i == rule_index and active is True for i, _n, active in rule_snapshot
+            ))
+            or conditions is not None
             or match_logic is not None
             or (actions is not None and _rule_actions_require_confirmation(actions))
         )
         if needs_confirmation:
             summary = (
                 f"Update Mail.app rule '{rule_name}' (index {rule_index})? "
-                f"Previous condition/action state cannot be recovered."
+                f"This may activate automatic actions on incoming mail or replace "
+                f"condition/action state that cannot be recovered."
             )
             cancel_err = await _elicit_confirmation(
                 ctx, summary, "update_rule", {"rule_index": rule_index}
@@ -1559,7 +1565,9 @@ async def update_message(
         # Called UNCONDITIONALLY: an omitted account is the broad path, which
         # targets every configured account. Gating only when account is set
         # let exactly that case through in test mode.
-        safety_err = check_test_mode_safety("update_message", account=account)
+        safety_err = check_test_mode_safety(
+            "update_message", account=account, source_mailbox=source_mailbox
+        )
         if safety_err:
             return safety_err
 
@@ -3120,6 +3128,7 @@ def _resolve_draft_attachments(
     draft_id: str,
     attachment_paths: list[str] | None,
     existing_names: list[str],
+    *, account: str | None = None,
 ) -> tuple[list[Path] | None, "tempfile.TemporaryDirectory[str] | None"]:
     """Compute final attachment paths for an update_draft call.
 
@@ -3142,10 +3151,16 @@ def _resolve_draft_attachments(
         return None, None
 
     tempdir = tempfile.TemporaryDirectory(prefix="amm-update-attach-")
-    extracted = mail.extract_draft_attachments(
-        draft_id, existing_names, Path(tempdir.name)
-    )
-    return extracted, tempdir
+    try:
+        extracted = mail.extract_draft_attachments(
+            draft_id, existing_names, Path(tempdir.name), account=account,
+        )
+        if len(extracted) != len(existing_names) or not all(p.is_file() for p in extracted):
+            raise MailDraftError("Could not preserve every attachment; original draft retained")
+        return extracted, tempdir
+    except Exception:
+        tempdir.cleanup()
+        raise
 
 
 def _build_draft_send_summary(
@@ -3631,6 +3646,8 @@ async def create_draft(
                 "from_account": result.get("from_account", ""),
             },
         }
+        if "delivery" in result:
+            response["delivery"] = result["delivery"]
         if warnings:
             response["warnings"] = warnings
         return response
@@ -3643,8 +3660,60 @@ async def create_draft(
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
+def _validate_draft_preservation(
+    state: dict[str, Any], from_account: str | None, body: str | None,
+    body_html: str | None, template_name: str | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    account = from_account if from_account is not None else state.get("from_account")
+    error = None
+    if not account:
+        error = "Cannot preserve the original sender account/alias; pass from_account"
+    elif body is None and body_html is None and not template_name:
+        if not state.get("content_type", "").lower().startswith("text/plain"):
+            error = "Cannot preserve rich or unknown body format; pass body or body_html"
+    if error:
+        return account, {"success": False, "error_type": "preservation_unavailable", "error": error}
+    return account, None
+
+
+def _finish_draft_replacement(
+    result: dict[str, Any], draft_id: str, store: DraftStateStore,
+    seed_kind: str, seed_id: str | None, reply_all: bool, send_now: bool,
+) -> dict[str, Any]:
+    """Publish the replacement outcome before any fallible original cleanup."""
+    new_draft_id = result.get("draft_id", "")
+    if not send_now and (not new_draft_id or new_draft_id == draft_id):
+        raise MailDraftError("Replacement returned no distinct draft ID; original retained")
+    response: dict[str, Any] = {
+        "success": True, "draft_id": new_draft_id,
+        "sent_message_id": result.get("sent_message_id", ""),
+        "details": {"seed_kind": seed_kind, "send_now": send_now},
+    }
+    if "delivery" in result:
+        response["delivery"] = result["delivery"]
+    warning = None
+    if send_now and result.get("delivery", {}).get("partial"):
+        warning = ("Some recipients were refused. Original draft retained; retry only "
+                   "refused recipients after checking the delivery result, never the full list.")
+    else:
+        try:
+            _persist_draft_seed(new_draft_id, seed_kind, seed_id, reply_all, send_now)
+            mail.delete_draft(draft_id)
+            store.delete(draft_id)
+        except Exception as cleanup_error:
+            warning = (f"Replacement completed but cleanup failed: {cleanup_error}. "
+                       "Inspect both drafts before cleanup; do not repeat a send.")
+    if warning:
+        response.update(partial=True, original_draft_id=draft_id, warnings=[warning])
+    operation_logger.log_operation(
+        "update_draft", {"old_draft_id": draft_id, "new_draft_id": new_draft_id,
+                         "send_now": send_now}, "partial" if warning else "success",
+    )
+    return response
+
+
 @_tool(
-    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": True},
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": False},
     mutating=True,
 )
 async def update_draft(
@@ -3662,11 +3731,13 @@ async def update_draft(
     send_now: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Update an existing draft. Implemented as delete-and-recreate.
+    """Update an existing draft by creating a replacement before removing the original.
 
     **Returns a NEW draft_id** — Mail.app forbids mutating saved drafts,
     so update is implemented by reading the draft's current state,
-    deleting it, and creating a new draft with the merged fields.
+    creating a replacement with merged fields, then removing the original.
+    Saving a replacement requires working IMAP access for a stable identity;
+    if unavailable, the operation fails and retains the original draft.
     Threading headers (for reply seeds) and forward anchor are preserved
     via persisted seed metadata.
 
@@ -3694,12 +3765,14 @@ async def update_draft(
             ``send_now=False``. NOTE: because the draft is recreated and
             draft state captures only plain text, an existing HTML draft is
             NOT preserved across an update unless ``body_html`` is passed
-            again. (#251)
+            again, or pass body to explicitly replace it with plain text.
+            Unknown/rich body formats are refused when preserving the body. (#251)
         attachment_paths: Override attachments. None preserves existing
             via temp-dir extraction; [] clears; list replaces.
         template_name / template_vars: Optional template render. User-
             supplied subject/body override the rendered output.
-        from_account: Override sender.
+        from_account: Override sender account. None preserves the source account;
+            if it cannot be determined, the update is refused.
         send_now: ``False`` (default) saves new draft. ``True`` sends
             after eliciting confirmation.
 
@@ -3746,7 +3819,8 @@ async def update_draft(
 
         # tempdir (if any) is cleaned up in the finally block.
         final_attachments, tempdir = _resolve_draft_attachments(
-            draft_id, attachment_paths, state.get("attachment_names", []) or []
+            draft_id, attachment_paths, state.get("attachment_names", []) or [],
+            account=state.get("from_account") or None,
         )
 
         if send_now:
@@ -3770,15 +3844,11 @@ async def update_draft(
             if gate_err:
                 return gate_err
 
-        # Delete + recreate. Clear stale state first so a connector failure
-        # doesn't leave orphan entries.
-        try:
-            mail.delete_draft(draft_id)
-        except MailDraftNotFoundError:
-            return _draft_error_response(
-                MailDraftNotFoundError(f"no draft with id {draft_id!r}")
-            )
-        store.delete(draft_id)
+        from_account, preservation_error = _validate_draft_preservation(
+            state, from_account, body, body_html, template_name,
+        )
+        if preservation_error:
+            return preservation_error
 
         result = mail.create_draft(
             seed=seed_kind,
@@ -3793,28 +3863,11 @@ async def update_draft(
             reply_all=reply_all,
             from_account=from_account,
             send_now=send_now,
+            require_stable_id=not send_now,
         )
-        new_draft_id = result.get("draft_id", "")
-
-        _persist_draft_seed(
-            new_draft_id, seed_kind, seed_id, reply_all, send_now,
+        return _finish_draft_replacement(
+            result, draft_id, store, seed_kind, seed_id, reply_all, send_now,
         )
-
-        operation_logger.log_operation(
-            "update_draft",
-            {
-                "old_draft_id": draft_id,
-                "new_draft_id": new_draft_id,
-                "send_now": send_now,
-            },
-            "success",
-        )
-        return {
-            "success": True,
-            "draft_id": new_draft_id,
-            "sent_message_id": result.get("sent_message_id", ""),
-            "details": {"seed_kind": seed_kind, "send_now": send_now},
-        }
 
     except Exception as e:
         handled = _draft_action_error("update_draft", e)

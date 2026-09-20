@@ -236,17 +236,25 @@ class TestSaveAttachments:
             )
 
     @patch.object(AppleMailConnector, "_run_applescript")
-    def test_save_validates_path_traversal(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+    def test_save_contains_untrusted_attachment_name(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
     ) -> None:
-        """Test that path traversal is prevented."""
-        # Attempting path traversal should be blocked
-        # Will fail with FileNotFoundError or ValueError depending on path
-        with pytest.raises((ValueError, FileNotFoundError)):
-            connector.save_attachments(
-                message_id="12345",
-                save_directory=Path("../../etc")
-            )
+        """The caller chooses the root; untrusted attachment names cannot escape it.
+
+        An earlier test used ../../etc and passed only when that directory did
+        not exist relative to the checkout. Exercise the actual trust boundary
+        with a controlled destination and a hostile attachment name instead.
+        """
+        mock_run.side_effect = [
+            '[{"name":"../../outside.pdf","mime_type":"application/pdf",'
+            '"size":3,"downloaded":true}]',
+            "1",
+        ]
+        result = connector.save_attachments("12345", tmp_path)
+        script = mock_run.call_args.args[0]
+        assert result["saved"] == 1
+        assert str(tmp_path.resolve() / "outside.pdf") in script
+        assert "../../outside.pdf" not in script
 
 
 class TestAttachmentSecurity:

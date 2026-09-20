@@ -1,6 +1,6 @@
 """Smoke tests for the MCP server over the real stdio transport.
 
-These tests spawn the server as a subprocess and connect via the MCP client
+These tests spawn the server behind ai-governance-proxy in hard mode and connect via the MCP client
 SDK. They catch a different class of bug than tests/e2e/test_mcp_tools.py:
 
 - Startup errors (import failures, missing env, FastMCP banner interfering
@@ -17,6 +17,9 @@ the transport layer. Per-tool behavior is the job of test_mcp_tools.py.
 from __future__ import annotations
 
 import asyncio
+import shutil
+import sys
+from pathlib import Path
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -61,12 +64,16 @@ EXPECTED_TOOLS = {
 HANDSHAKE_TIMEOUT_SECONDS = 15.0
 
 
-async def _list_tools_over_stdio() -> set[str]:
+async def _list_tools_over_stdio(state_root: Path) -> set[str]:
     """Spawn the server, complete the MCP handshake, and return the tool names."""
+    proxy = shutil.which("ai-governance-proxy")
+    if proxy is None:
+        pytest.skip("Fork stdio tests require ai-governance-proxy on PATH")
     params = StdioServerParameters(
-        command="uv",
-        args=["run", "python", "-m", "apple_mail_fast_mcp.server"],
-        env=None,
+        command=proxy,
+        args=["--govern-all", "--", sys.executable, "-m", "apple_mail_fast_mcp.server"],
+        env={"MAIL_TEST_MODE": "true", "GOVERNANCE_ENFORCEMENT_SOFT_MODE": "false",
+             "APPLE_MAIL_MCP_HOME": str(state_root)},
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
@@ -75,7 +82,7 @@ async def _list_tools_over_stdio() -> set[str]:
             return {t.name for t in result.tools}
 
 
-async def test_stdio_subprocess_lists_all_tools() -> None:
+async def test_stdio_subprocess_lists_all_tools(tmp_path: Path) -> None:
     """The real stdio handshake surfaces all tools a client would see.
 
     If this fails where test_mcp_tools.py passes, the bug is in the transport
@@ -83,6 +90,6 @@ async def test_stdio_subprocess_lists_all_tools() -> None:
     or protocol-version negotiation.
     """
     names = await asyncio.wait_for(
-        _list_tools_over_stdio(), timeout=HANDSHAKE_TIMEOUT_SECONDS
+        _list_tools_over_stdio(tmp_path), timeout=HANDSHAKE_TIMEOUT_SECONDS
     )
     assert names == EXPECTED_TOOLS

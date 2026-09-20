@@ -249,3 +249,32 @@ class TestTeardownAfterAccept:
         with pytest.raises(smtplib.SMTPException):
             sender.send(_raw_with_bcc(), ["alice@example.net"])
         client.send_message.assert_not_called()
+
+
+@pytest.mark.parametrize("port", [465, 587])
+@pytest.mark.parametrize("quit_fails", [False, True])
+def test_partial_refusals_survive_teardown(port, quit_fails):
+    cls = "SMTP_SSL" if port == 465 else "SMTP"
+    refused = {"secret@example.com": (550, b"Mailbox unavailable")}
+    with patch(f"apple_mail_fast_mcp.smtp_sender.smtplib.{cls}") as smtp:
+        client = smtp.return_value.__enter__.return_value
+        client.send_message.return_value = refused
+        if quit_fails:
+            smtp.return_value.__exit__.side_effect = smtplib.SMTPResponseException(421, b"bye")
+        result = SmtpSender("smtp.example.com", port, "login@example.com", "pw").send(
+            _raw_with_bcc(), ["alice@example.net", "secret@example.com"]
+        )
+    assert result == refused
+    client.send_message.assert_called_once()
+
+
+def test_all_recipients_refused_propagates():
+    with patch("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP") as smtp:
+        client = smtp.return_value.__enter__.return_value
+        client.send_message.side_effect = smtplib.SMTPRecipientsRefused(
+            {"alice@example.net": (550, b"No mailbox")}
+        )
+        with pytest.raises(smtplib.SMTPRecipientsRefused):
+            SmtpSender("smtp.example.com", 587, "login@example.com", "pw").send(
+                _raw_with_bcc(), ["alice@example.net"]
+            )

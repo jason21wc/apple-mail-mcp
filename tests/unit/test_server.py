@@ -3682,6 +3682,7 @@ class TestUpdateDraftTool:
         )
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "Re: hello", "body": "old body",
@@ -3718,6 +3719,7 @@ class TestUpdateDraftTool:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "hi", "body": "old",
@@ -3754,6 +3756,7 @@ class TestUpdateDraftTool:
             SeedRecord(seed_kind="reply", seed_id="160000", reply_all=False),
         )
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "Re: hi", "body": "old",
@@ -3779,6 +3782,7 @@ class TestUpdateDraftTool:
 
         # No disk state. Must fall back to In-Reply-To header lookup.
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "Re: hi", "body": "",
@@ -3809,6 +3813,7 @@ class TestUpdateDraftTool:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "fresh", "body": "old",
@@ -3838,6 +3843,7 @@ class TestUpdateDraftTool:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["a@example.com"], "cc": [], "bcc": [],
             "subject": "hi", "body": "x",
@@ -3869,6 +3875,7 @@ class TestUpdateDraftTool:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["a@example.com"], "cc": [], "bcc": [],
             "subject": "hi", "body": "x",
@@ -3896,6 +3903,7 @@ class TestUpdateDraftTool:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["a@example.com"], "cc": [], "bcc": [],
             "subject": "hi", "body": "x",
@@ -3922,6 +3930,7 @@ class TestUpdateDraftTool:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["a@example.com"], "cc": [], "bcc": [],
             "subject": "hi", "body": "x",
@@ -3955,6 +3964,7 @@ class TestUpdateDraftTool:
         )
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991",
             "to": ["a@example.com"], "cc": [], "bcc": [],
             "subject": "Re: x", "body": "",
@@ -4273,6 +4283,7 @@ class TestDraftToolErrorPaths:
         # No to / cc / bcc and the existing draft has none either —
         # implicit-reply send path.
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "id": "draft-1", "to": [], "cc": [], "bcc": [],
             "subject": "Re: hi", "body": "stub",
             "attachments": [], "seed_kind": "reply",
@@ -4362,6 +4373,7 @@ class TestDraftToolErrorPaths:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": [], "cc": [], "bcc": [],
             "subject": "", "body": "", "in_reply_to": "",
             "references": "", "attachment_names": [],
@@ -4383,6 +4395,7 @@ class TestDraftToolErrorPaths:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": ["real@gmail.com"],
             "cc": [], "bcc": [], "subject": "x", "body": "y",
             "in_reply_to": "", "references": "", "attachment_names": [],
@@ -4412,6 +4425,7 @@ class TestDraftToolErrorPaths:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": ["a@example.com"],
             "cc": [], "bcc": [], "subject": "x", "body": "y",
             "in_reply_to": "", "references": "", "attachment_names": [],
@@ -4439,6 +4453,7 @@ class TestDraftToolErrorPaths:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": ["a@example.com"],
             "cc": [], "bcc": [], "subject": "x", "body": "y",
             "in_reply_to": "", "references": "", "attachment_names": [],
@@ -4459,6 +4474,7 @@ class TestDraftToolErrorPaths:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": [], "cc": [], "bcc": [],
             "subject": "", "body": "", "in_reply_to": "",
             "references": "", "attachment_names": [],
@@ -4494,6 +4510,7 @@ class TestDraftToolErrorPaths:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": ["a@example.com"],
             "cc": [], "bcc": [], "subject": "x", "body": "y",
             "in_reply_to": "", "references": "",
@@ -4517,7 +4534,7 @@ class TestDraftToolErrorPaths:
         from pathlib import Path
 
         def fake_extract(
-            draft_id: str, names: list[str], dest: Path
+            draft_id: str, names: list[str], dest: Path, *, account: str | None = None,
         ) -> list[Path]:
             (dest / "0").mkdir(parents=True, exist_ok=True)
             p = dest / "0" / "report.pdf"
@@ -4578,13 +4595,17 @@ class TestDraftToolErrorPaths:
         from apple_mail_fast_mcp.server import update_draft
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": [], "cc": [], "bcc": [],
             "subject": "", "body": "", "in_reply_to": "",
             "references": "", "attachment_names": [],
         }
         mock_mail.delete_draft.side_effect = MailDraftNotFoundError("gone")
+        mock_mail.create_draft.return_value = {"draft_id": "161000"}
         result = await update_draft(draft_id="160991", body="x")
-        assert result["error_type"] == "draft_not_found"
+        assert result["success"] and result["partial"]
+        assert result["original_draft_id"] == "160991"
+        assert result["draft_id"] == "161000"
 
     @pytest.mark.asyncio
     async def test_update_draft_template_success_renders(
@@ -4605,6 +4626,7 @@ class TestDraftToolErrorPaths:
         ))
 
         mock_mail.get_draft_state.return_value = {
+            "from_account": "TestAccount", "content_type": "text/plain",
             "draft_id": "160991", "to": ["a@example.com"],
             "cc": [], "bcc": [], "subject": "old", "body": "old",
             "in_reply_to": "", "references": "", "attachment_names": [],

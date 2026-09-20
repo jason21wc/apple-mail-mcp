@@ -430,11 +430,13 @@ anchor into thread member ids, then optionally pipe those ids into
 
 ### update_draft
 
-Update an existing draft. Implemented as delete-and-recreate.
+Update an existing draft by creating a replacement before removing the original.
 
 **Returns a NEW draft_id** — Mail.app forbids mutating saved drafts,
 so update is implemented by reading the draft's current state,
-deleting it, and creating a new draft with the merged fields.
+creating a replacement with merged fields, then removing the original.
+Saving a replacement requires working IMAP access for a stable identity;
+if unavailable, the operation fails and retains the original draft.
 Threading headers (for reply seeds) and forward anchor are preserved
 via persisted seed metadata.
 
@@ -457,11 +459,11 @@ explicit body if so.
 - `bcc` (list[string], optional)
 - `subject` (string, optional): Override subject. None keeps existing.
 - `body` (string, optional): Override body. None keeps existing. Non-None replaces (including the empty string, which clears).
-- `body_html` (string, optional): Optional HTML body for the recreated draft (see ``create_draft``). Requires IMAP credentials and is limited to drafts whose seed is a fresh draft (not reply/forward) and to ``send_now=False``. NOTE: because the draft is recreated and draft state captures only plain text, an existing HTML draft is NOT preserved across an update unless ``body_html`` is passed again. (#251)
+- `body_html` (string, optional): Optional HTML body for the recreated draft (see ``create_draft``). Requires IMAP credentials and is limited to drafts whose seed is a fresh draft (not reply/forward) and to ``send_now=False``. NOTE: because the draft is recreated and draft state captures only plain text, an existing HTML draft is NOT preserved across an update unless ``body_html`` is passed again, or pass body to explicitly replace it with plain text. Unknown/rich body formats are refused when preserving the body. (#251)
 - `attachment_paths` (list[string], optional): Override attachments. None preserves existing via temp-dir extraction; [] clears; list replaces.
 - `template_name` (string, optional)
 - `template_vars` (object, optional)
-- `from_account` (string, optional): Override sender.
+- `from_account` (string, optional): Override sender account. None preserves the source account; if it cannot be determined, the update is refused.
 - `send_now` (boolean, optional) (default: False): ``False`` (default) saves new draft. ``True`` sends after eliciting confirmation.
 
 ### update_mailbox
@@ -530,8 +532,9 @@ patch touches ``conditions`` or ``match_logic`` (which alter matching
 scope), or replaces ``actions`` with a set that includes a dangerous
 action (move / forward / delete / copy). An ``actions`` patch limited to
 organizational flags (``mark_read`` / ``mark_flagged`` / ``flag_color``)
-skips the prompt, as do patches limited to ``enabled`` and/or ``name``
-(trivially reversible). The enable/disable path replaces the removed
+skips the prompt. Activating a disabled rule always confirms because
+existing actions may have destructive effects. Disabling, renaming, or
+leaving an already enabled rule enabled skips the prompt. The path replaces the removed
 ``set_rule_enabled`` tool: call ``update_rule(rule_index,
 enabled=True|False)``.
 

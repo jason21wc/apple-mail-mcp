@@ -36,6 +36,7 @@ from .exceptions import (
     MailAppleScriptError,
     MailAttachmentIndexError,
     MailAttachmentTooLargeError,
+    MailDraftError,
     MailDraftHtmlUnavailableError,
     MailDraftNotFoundError,
     MailImapMoveUnsupportedError,
@@ -812,29 +813,30 @@ def _bulk_repeat_block(
         source_mailbox: Source mailbox name, or None.
         actions: One or more AppleScript statements to run inside the
             loop once a message is matched (under `if matched then`).
-            Each id is matched in TWO sequential attempts — first by
-            Mail's internal numeric `id`, then (if that misses) by the
-            RFC 5322 `message id`. This lets callers pass either form:
-            read tools hand back the RFC Message-ID on the IMAP path,
-            which a numeric `id` never equals (the cause of silent
-            `updated:0` patches; #205-family). The two predicates are
-            kept in SEPARATE `whose` clauses on purpose — combining them
-            as `whose (id is X or message id is X)` makes Mail's query
-            compiler fail the whole filter when X is a non-numeric RFC
-            id (the `id is X` integer comparison poisons the `or`),
-            matching nothing. The `message id` arm itself queries BOTH
-            the bare and `<bracketed>` forms (`message id is A or message
-            id is B` — safe, both are string comparisons), mirroring
-            `find_message_by_message_id`: IMAP-backed accounts store the
-            id bare, but other paths may store it bracketed per RFC 5322
-            (#232). The counter increment is appended automatically.
+            Ids are matched ONLY by Mail's internal numeric `id`, which is
+            an integer and INDEXED, so the match is instant. The counter
+            increment is appended automatically.
 
-            Performance: on the cross-scan path (no `source_mailbox`) the
-            `message id` fallback is NOT indexed (~20s/mailbox on a real
-            account; see APPLESCRIPT_GOTCHAS.md) and fires once per mailbox
-            for any RFC id, since the numeric `id` arm always misses for
-            those. Callers holding an RFC id should pass `account` +
-            `source_mailbox` to take the narrow single-mailbox path.
+            **Callers must pass numeric ids.** Route the caller's list
+            through `AppleMailConnector._resolve_bulk_ids` first — it
+            converts RFC 5322 Message-IDs (what read tools emit on the IMAP
+            path, #148) to internal ids via the indexed resolver.
+
+            This block used to carry a second arm matching `message id`
+            inline, so either id form worked without a resolver round-trip
+            (#205-family). That arm was the #437 freeze: `message id` is
+            UNINDEXED, and AppleScript runs on Mail's UI thread, so it
+            loaded every message in scope — once per id, up to the 100-item
+            bulk cap — on BOTH branches. Scoping to `source_mailbox` only
+            removed the mailbox-count multiplier, not the scan: `sourceMb`
+            is routinely a 33,569-message INBOX.
+
+            Historical note, in case anyone reintroduces a dual match: the
+            two predicates were deliberately in SEPARATE `whose` clauses,
+            never combined as `whose (id is X or message id is X)` — the
+            integer comparison poisons the `or` for a non-numeric RFC id and
+            Mail's query compiler then fails the whole filter, matching
+            nothing.
         counter_var: Name of the AppleScript counter variable (e.g.
             "updateCount", "moveCount") that gets incremented per success.
 
@@ -890,14 +892,6 @@ def _bulk_repeat_block(
             f"                    set msg to first message of sourceMb whose id is mid\n"
             f"                    set matched to true\n"
             f"                end try\n"
-            f"                if not matched then\n"
-            f"                    try\n"
-            f"                        set midBare to mid\n"
-            f'                        if midBare starts with "<" and midBare ends with ">" then set midBare to text 2 thru -2 of midBare\n'
-            f'                        set msg to first message of sourceMb whose (message id is midBare or message id is ("<" & midBare & ">"))\n'
-            f"                        set matched to true\n"
-            f"                    end try\n"
-            f"                end if\n"
             f"                if matched then\n"
             f"{action_lines}\n"
             f"{_success_tail(' ' * 20)}\n"
@@ -918,14 +912,6 @@ def _bulk_repeat_block(
         f"                            set msg to first message of mb whose id is mid\n"
         f"                            set matched to true\n"
         f"                        end try\n"
-        f"                        if not matched then\n"
-        f"                            try\n"
-        f"                                set midBare to mid\n"
-        f'                                if midBare starts with "<" and midBare ends with ">" then set midBare to text 2 thru -2 of midBare\n'
-        f'                                set msg to first message of mb whose (message id is midBare or message id is ("<" & midBare & ">"))\n'
-        f"                                set matched to true\n"
-        f"                            end try\n"
-        f"                        end if\n"
         f"                        if matched then\n"
         f"{action_lines}\n"
         f"{_success_tail(' ' * 28)}\n"
@@ -2502,6 +2488,13 @@ class AppleMailConnector:
         )
 
         # Build list of IDs (sanitize and escape each)
+        # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
+        # the emitted match is the INDEXED `whose id is N`. Must come AFTER
+        # any IMAP fast path above — those batch the RFC ids themselves.
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
+
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
             for mid in message_ids
@@ -3110,6 +3103,10 @@ class AppleMailConnector:
         (read_status / flagged / flag_color all None) and that account +
         source_mailbox + destination_mailbox are all provided.
         """
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -3164,6 +3161,10 @@ class AppleMailConnector:
         are both provided (without source_mailbox, IMAP would have to
         SEARCH every mailbox per Message-ID).
         """
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -3217,6 +3218,10 @@ class AppleMailConnector:
         Caller must already have verified this is a read-only patch
         and that account + source_mailbox are both provided.
         """
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -3336,6 +3341,10 @@ class AppleMailConnector:
     ) -> int | None:
         """Attempt IMAP fast path for flag-only patch. Returns count
         on success, or None to fall through to AppleScript."""
+        # Mail's numeric IDs are neither RFC Message-IDs nor IMAP UIDs.
+        # Keep the whole batch on the indexed AppleScript path when mixed.
+        if any(mid.strip().isdigit() for mid in message_ids):
+            return None
         if self._imap_breaker_open(account):
             return None
         try:
@@ -4043,6 +4052,13 @@ class AppleMailConnector:
         mailbox_safe = escape_applescript_string(
             sanitize_input(destination_mailbox)
         )
+        # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
+        # the emitted match is the INDEXED `whose id is N`. Must come AFTER
+        # any IMAP fast path above — those batch the RFC ids themselves.
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
+
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
             for mid in message_ids
@@ -4118,6 +4134,13 @@ class AppleMailConnector:
 
         flag_index = get_flag_index(flag_color)
         flagged_status = "true" if flag_color != "none" else "false"
+        # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
+        # the emitted match is the INDEXED `whose id is N`. Must come AFTER
+        # any IMAP fast path above — those batch the RFC ids themselves.
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
+
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
             for mid in message_ids
@@ -4283,6 +4306,13 @@ class AppleMailConnector:
             source_mailbox=source_mailbox,
             actions=actions,
             counter_var="updateCount",
+        )
+
+        # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
+        # the emitted match is the INDEXED `whose id is N`. Must come AFTER
+        # any IMAP fast path above — those batch the RFC ids themselves.
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
         )
 
         id_list = ", ".join(
@@ -4663,6 +4693,13 @@ class AppleMailConnector:
             if imap_count is not None:
                 return imap_count
 
+        # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
+        # the emitted match is the INDEXED `whose id is N`. Must come AFTER
+        # any IMAP fast path above — those batch the RFC ids themselves.
+        message_ids = self._resolve_bulk_ids(
+            message_ids, account=account, source_mailbox=source_mailbox,
+        )
+
         id_list = ", ".join(
             f'"{escape_applescript_string(sanitize_input(mid))}"'
             for mid in message_ids
@@ -4878,7 +4915,11 @@ class AppleMailConnector:
         raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
 
     def find_message_by_message_id(
-        self, rfc5322_message_id: str
+        self,
+        rfc5322_message_id: str,
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
     ) -> str | None:
         """Resolve an RFC 5322 Message-ID header to Mail's internal id.
 
@@ -4890,20 +4931,22 @@ class AppleMailConnector:
         Args:
             rfc5322_message_id: e.g. ``<calendar-abc123@google.com>`` or
                 ``calendar-abc123@google.com``. Brackets are stripped
-                from the input; the AppleScript ``whose`` clause then
-                queries for both the bare and bracketed forms in one
-                pass. Mail.app's ``message id`` property storage
-                normalization is not uniform — IMAP-backed accounts
-                (iCloud, Gmail) store the value bare, while other paths
-                may store with angle brackets per RFC 5322. Querying
-                both forms in a single clause is robust to either
-                convention and matches in one round-trip.
+                from the input; the date-bounded AppleScript search checks
+                both bare and bracketed forms because Mail's normalization
+                varies by account.
+            account: Account name or UUID. Supply together with source_mailbox
+                to restrict both IMAP and AppleScript to that exact scope.
+            source_mailbox: Mailbox name or nested path; requires account.
 
         Returns:
             Mail's internal numeric id (as a string) of the first
             matching message found, or None if no message with that
-            Message-ID exists in any mailbox.
+            Message-ID exists in the probed scope. An unavailable scoped
+            lookup raises MailAnchorLookupIncompleteError instead of claiming
+            the message is absent.
         """
+        if (account is None) != (source_mailbox is None):
+            raise ValueError("account and source_mailbox must be supplied together")
         if not rfc5322_message_id:
             return None
 
@@ -4911,7 +4954,14 @@ class AppleMailConnector:
         # measured 0.14s over 61,880 messages. Failures here are
         # "could not determine", never "absent" (#425).
         try:
-            located = self._locate_via_imap(rfc5322_message_id)
+            located = (
+                self._locate_via_imap(
+                    rfc5322_message_id, account=account,
+                    source_mailbox=source_mailbox,
+                )
+                if account is not None and source_mailbox is not None
+                else self._locate_via_imap(rfc5322_message_id)
+            )
         except _IMAP_FALLBACK_EXCS as exc:
             raise MailAnchorLookupIncompleteError(
                 f"Could not determine whether Message-ID "
@@ -4923,16 +4973,27 @@ class AppleMailConnector:
                 "IMAP credentials."
             ) from exc
         if located is None:
-            # A clean IMAP answer. The probe set is Gmail's All Mail (which
-            # mirrors every message) or INBOX+Sent — so this is definitive.
+            # A clean absence answer for the requested folder, or for the
+            # legacy bounded probe set when no scope was supplied.
             return None
 
         # Stage 2: binary-search Mail by the date IMAP reported.
+        if account is not None and source_mailbox is not None:
+            return self._find_by_message_id_near_date(
+                rfc5322_message_id, cast(_datetime, located["internaldate"]),
+                account=account, source_mailbox=source_mailbox,
+            )
         return self._find_by_message_id_near_date(
             rfc5322_message_id, cast(_datetime, located["internaldate"])
         )
 
-    def _locate_via_imap(self, rfc5322_message_id: str) -> dict[str, Any] | None:
+    def _locate_via_imap(
+        self,
+        rfc5322_message_id: str,
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
+    ) -> dict[str, Any] | None:
         """Ask each IMAP-configured account where/when a Message-ID lives.
 
         Returns the first hit's ``{folder, uid, internaldate}``, or ``None``
@@ -4940,6 +5001,29 @@ class AppleMailConnector:
         it. Raises on failure so the caller can distinguish "absent" from
         "could not check" (#425).
         """
+        if account is not None and source_mailbox is not None:
+            # Explicit scope is a boundary: never probe another account or
+            # substitute INBOX/Sent when the requested folder is unavailable.
+            if self._imap_breaker_open(account):
+                raise MailAnchorLookupIncompleteError(
+                    f"IMAP lookup is temporarily unavailable for {account!r}"
+                )
+            host, port, email = self._resolve_imap_config(account)
+            if not host:
+                raise MailAnchorLookupIncompleteError(
+                    f"IMAP is not configured for {account!r}"
+                )
+            password = self._get_imap_password_with_fallback(account, email)
+            imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+            try:
+                found = imap.locate_message(
+                    rfc5322_message_id, mailbox=source_mailbox
+                )
+            except MailAnchorProbeIncompleteError as exc:
+                raise MailAnchorLookupIncompleteError(str(exc)) from exc
+            self._imap_clear_breaker(account)
+            return found
+
         last_exc: Exception | None = None
         for acct in self.list_accounts():
             account = cast(str, acct.get("name") or "")
@@ -4970,7 +5054,12 @@ class AppleMailConnector:
         return None
 
     def _find_by_message_id_near_date(
-        self, rfc5322_message_id: str, when: _datetime
+        self,
+        rfc5322_message_id: str,
+        when: _datetime,
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
     ) -> str | None:
         """Binary-search Mail's unified mailboxes for a Message-ID known to
         have arrived around ``when``, and return Mail's internal id (#432).
@@ -5000,6 +5089,15 @@ class AppleMailConnector:
             when.day,
             when.hour * 3600 + when.minute * 60 + when.second,
         )
+        scope_setup = ""
+        mailbox_refs = "{inbox, sent mailbox}"
+        if account is not None and source_mailbox is not None:
+            account_clause = applescript_account_clause(account)
+            mailbox_safe = escape_applescript_string(sanitize_input(source_mailbox))
+            scope_setup = (
+                f'set sourceMb to my resolveMailbox({account_clause}, "{mailbox_safe}")'
+            )
+            mailbox_refs = "{sourceMb}"
         script = _wrap_with_timeout(
             f"""tell application "Mail"
             {target_date}
@@ -5008,7 +5106,8 @@ class AppleMailConnector:
             set foundId to ""
             set sawOrderProblem to false
 
-            repeat with mb in {{inbox, sent mailbox}}
+            {scope_setup}
+            repeat with mb in {mailbox_refs}
                 set n to (count of messages of mb)
                 if n > 0 then
                     -- #242: Mail's iteration order has changed before. A
@@ -5060,6 +5159,8 @@ class AppleMailConnector:
             timeout=self.timeout,
         )
 
+        if scope_setup:
+            script = f"{_MAILBOX_RESOLVER_HANDLERS}\n{script}"
         result = self._run_applescript(script).strip()
         if result == "ORDER_UNEXPECTED":
             raise MailAnchorLookupIncompleteError(
@@ -5072,7 +5173,7 @@ class AppleMailConnector:
             raise MailAnchorLookupIncompleteError(
                 f"Could not locate Message-ID {rfc5322_message_id!r} in Mail. "
                 f"IMAP reports it arrived {when:%Y-%m-%d %H:%M:%S}, but it is "
-                "not in the unified inbox or sent mailbox within a day of "
+                "not in the requested search scope within a day of "
                 "that. It may live in another mailbox; searching every "
                 "mailbox by Message-ID is what freezes Mail, so that is not "
                 "attempted (#432)."
@@ -5150,11 +5251,13 @@ class AppleMailConnector:
 
                 set inReplyTo to ""
                 set refs to ""
+                set contentType to ""
                 try
                     repeat with h in headers of foundDraft
                         set hname to (name of h)
                         if hname is "In-Reply-To" then set inReplyTo to (content of h)
                         if hname is "References" then set refs to (content of h)
+                        if hname is "Content-Type" then set contentType to (content of h)
                     end repeat
                 end try
 
@@ -5167,6 +5270,15 @@ class AppleMailConnector:
                     end repeat
                 end try
 
+                set originalSender to ""
+                try
+                    set originalSender to (sender of foundDraft)
+                end try
+                set fromAccount to ""
+                try
+                    set fromAccount to (name of account of mailbox of foundDraft)
+                end try
+
                 set draftSubject to ""
                 try
                     set draftSubject to (subject of foundDraft)
@@ -5176,7 +5288,7 @@ class AppleMailConnector:
                     set draftBody to (content of foundDraft)
                 end try
 
-                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames}}
+                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames, |from_account|:fromAccount, |content_type|:contentType, |sender|:originalSender}}
             end if
         end tell
         """
@@ -5186,6 +5298,15 @@ class AppleMailConnector:
         data = parse_applescript_json(raw)
         if not isinstance(data, dict) or not data.get("found"):
             raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
+        # An account override selects its first sender identity. If this draft
+        # used another alias, do not silently switch identity during replacement.
+        from email.utils import parseaddr
+
+        if data.get("from_account"):
+            original_sender = parseaddr(data.pop("sender", ""))[1]
+            configured_sender = parseaddr(self._resolve_account_to_sender(data["from_account"]))[1]
+            if not original_sender or original_sender.lower() != configured_sender.lower():
+                data["from_account"] = ""
         # Drop the internal flag from the user-visible payload.
         data.pop("found", None)
         return cast(dict[str, Any], data)
@@ -5729,7 +5850,7 @@ class AppleMailConnector:
         recipients: list[str],
         *,
         smtp_config: tuple[str, int, str],
-    ) -> None:
+    ) -> dict[str, Any]:
         """Enforce the test-mode reserved-domain guard, then submit
         ``raw_message`` over SMTP (issue #322).
 
@@ -5752,9 +5873,17 @@ class AppleMailConnector:
             raise MailSafetyError(violation)
         host, port, login_email = smtp_config
         password = self._get_imap_password_with_fallback(from_account, login_email)
-        SmtpSender(host, port, login_email, password, timeout=self.timeout).send(
+        refused = SmtpSender(host, port, login_email, password, timeout=self.timeout).send(
             raw_message, recipients
         )
+        return {
+            "accepted_recipients": [r for r in recipients if r not in refused],
+            "refused_recipients": {
+                recipient: {"code": code, "message": reason.decode("utf-8", errors="replace")}
+                for recipient, (code, reason) in refused.items()
+            },
+            "partial": bool(refused),
+        }
 
     def _send_new_via_smtp(
         self,
@@ -5767,7 +5896,7 @@ class AppleMailConnector:
         body: str,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Build a clean fresh-compose RFC 822 message and SMTP-send it
         (issue #322 — the ``seed="new"`` send analog of the #246 draft path).
         """
@@ -5784,12 +5913,12 @@ class AppleMailConnector:
             ),
         )
         recipients = list(to) + list(cc or []) + list(bcc or [])
-        self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
+        delivery = self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
         self._save_sent_copy(
             from_account, raw, answered=False, smtp_config=smtp_config
         )
-        return {"draft_id": "", "sent_message_id": ""}
+        return {"draft_id": "", "sent_message_id": "", "delivery": delivery}
 
     def _send_reply_forward_via_smtp(
         self,
@@ -5806,7 +5935,7 @@ class AppleMailConnector:
         reply_all: bool,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Rebuild a clean reply/forward from the original (fetched over IMAP)
         and SMTP-send it (issue #322 — the send analog of the #292 draft
         path). Recipient derivation and the transport-boundary safety guard
@@ -5830,7 +5959,7 @@ class AppleMailConnector:
             reply_all=reply_all,
             attachment_paths=attachment_paths,
         )
-        self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
+        delivery = self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
         # Reuse the connector already built for the original fetch — a reply
         # carries \\Answered in Sent.
@@ -5841,7 +5970,7 @@ class AppleMailConnector:
             smtp_config=smtp_config,
             imap=imap,
         )
-        return {"draft_id": "", "sent_message_id": ""}
+        return {"draft_id": "", "sent_message_id": "", "delivery": delivery}
 
     def _save_sent_copy(
         self,
@@ -5944,7 +6073,7 @@ class AppleMailConnector:
         body_html: str | None,
         reply_all: bool,
         attachment_paths: list[Path] | None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         """Try the clean, wrapper-free paths in order and return the first
         that engages, or ``None`` to fall through to AppleScript.
 
@@ -6013,7 +6142,7 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         """Clean SMTP send path for ``send_now=True`` (issue #322).
 
         Submits a wrapper-free RFC 822 message over SMTP instead of Mail.app's
@@ -6097,7 +6226,8 @@ class AppleMailConnector:
         from_account: str | None = None,
         send_now: bool = False,
         on_warning: Callable[[str], None] | None = None,
-    ) -> dict[str, str]:
+        require_stable_id: bool = False,
+    ) -> dict[str, Any]:
         """Create a draft (fresh, reply, or forward). Optionally send.
 
         For ``seed="new"`` save-as-draft (``send_now=False``) with a known
@@ -6165,6 +6295,11 @@ class AppleMailConnector:
                 string when a save-as-draft falls back to the AppleScript
                 path (whose body carries Mail.app's cite-blockquote wrapper,
                 FB11734014) instead of the clean IMAP path. (#270)
+            require_stable_id: For saved-draft replacement, require the
+                IMAP path's generated RFC Message-ID. If unavailable, fail
+                before creating an AppleScript draft: its first-new-ID
+                heuristic cannot prove replacement identity. Ignored when
+                sending, which returns no draft ID.
             send_now: ``False`` saves as draft and returns
                 ``{"draft_id": ...}``. ``True`` sends and returns
                 ``{"draft_id": "", "sent_message_id": ""}`` (sent_message_id
@@ -6210,17 +6345,7 @@ class AppleMailConnector:
         if clean_result is not None:
             return clean_result
 
-        # HTML drafts exist only on the clean IMAP path (Mail.app's
-        # AppleScript `content` setter is plain-text only). If the IMAP path
-        # couldn't engage, fail loud rather than silently dropping the HTML
-        # into a plain-text AppleScript draft. (#251)
-        if body_html is not None:
-            raise MailDraftHtmlUnavailableError(
-                "HTML drafts require IMAP credentials"
-                + (f" for account {effective_account!r}" if effective_account else "")
-                + ". Opt in to Keychain IMAP access (see docs) or omit "
-                "body_html to create a plain-text draft."
-            )
+        self._validate_draft_fallback(require_stable_id, send_now, body_html, effective_account)
 
         # Committed to the AppleScript path, which carries Mail.app's
         # cite-blockquote wrapper (FB11734014). Warn save-as-draft callers
@@ -6389,6 +6514,31 @@ class AppleMailConnector:
             "from_account": effective_account or "",
         }
 
+    @staticmethod
+    def _validate_draft_fallback(
+        require_stable_id: bool, send_now: bool, body_html: str | None,
+        effective_account: str | None,
+    ) -> None:
+        """Refuse fallback when it cannot preserve the caller's requirements."""
+        if require_stable_id and not send_now:
+            raise MailDraftError(
+                "Draft replacement requires working IMAP access to identify the "
+                "saved replacement reliably. Original draft retained; no "
+                "AppleScript replacement was created."
+            )
+
+        # HTML drafts exist only on the clean IMAP path (Mail.app's
+        # AppleScript `content` setter is plain-text only). If the IMAP path
+        # couldn't engage, fail loud rather than silently dropping the HTML
+        # into a plain-text AppleScript draft. (#251)
+        if body_html is not None:
+            raise MailDraftHtmlUnavailableError(
+                "HTML drafts require IMAP credentials"
+                + (f" for account {effective_account!r}" if effective_account else "")
+                + ". Opt in to Keychain IMAP access (see docs) or omit "
+                "body_html to create a plain-text draft."
+            )
+
     def _sync_account_drafts(self, account: str | None) -> None:
         """Best-effort: poke Mail.app to synchronize ``account`` so a
         just-APPENDed draft surfaces in the local Drafts pane without
@@ -6433,6 +6583,84 @@ class AppleMailConnector:
             f"unreachable, or a non-RFC reply seed). {tail} Configure or "
             "repair IMAP for the account with `apple-mail-fast-mcp setup-imap`."
         )
+
+    def _resolve_bulk_ids(
+        self,
+        message_ids: list[str],
+        *,
+        account: str | None = None,
+        source_mailbox: str | None = None,
+    ) -> list[str]:
+        """Resolve RFC 5322 Message-IDs to Mail's internal numeric ids so the
+        bulk AppleScript can match on the INDEXED ``whose id is N`` (#437).
+
+        The alternative — matching ``message id`` inline, which is what
+        `_bulk_repeat_block` used to do — is UNINDEXED. AppleScript runs on
+        Mail's UI thread, so that match loads every message in scope (33,569
+        in Gmail's INBOX, 62,085 in All Mail) once per id, up to the 100-item
+        bulk cap. Mail freezes, and a mid-batch freeze leaves the mutation
+        partially applied.
+
+        This reverses the #205-family decision to match inline rather than pay
+        "a separate resolver round-trip". That was sound when resolving meant
+        an all-mailbox scan; since #434 the resolver is an indexed IMAP lookup
+        plus a binary search, while the inline match still freezes Mail.
+
+        **Call this AFTER the IMAP fast paths**, never before: those want the
+        RFC ids and batch them through ``_resolve_uids_batch`` /
+        ``_or_message_id_criteria`` (#316) into one OR-SEARCH per 50 ids.
+        Handing them numeric ids would defeat that batching.
+
+        An explicit account/source_mailbox pair stays attached through both
+        resolver stages; neither stage may widen it to other folders/accounts.
+        Numeric ids pass through untouched — they already take the indexed
+        path and must not acquire a round-trip they never needed.
+
+        Failure handling mirrors #425:
+          * resolved            -> use it
+          * ``None`` (absent)   -> drop; matches the tools' best-effort
+                                   partial-success convention (they return a
+                                   count, not per-id errors)
+          * indeterminate       -> drop from this batch, but remember
+
+        Raises:
+            MailAnchorLookupIncompleteError: nothing resolved AND at least one
+                id could not be checked. Reporting ``updated: 0`` there would
+                be #425's "couldn't check presented as doesn't exist" again.
+        """
+        resolved: list[str] = []
+        indeterminate: list[str] = []
+        for mid in message_ids:
+            if "@" not in mid:
+                resolved.append(mid)
+                continue
+            try:
+                internal = (
+                    self.find_message_by_message_id(
+                        mid, account=account, source_mailbox=source_mailbox
+                    )
+                    if account is not None and source_mailbox is not None
+                    else self.find_message_by_message_id(mid)
+                )
+            except MailAnchorLookupIncompleteError as exc:
+                logger.warning(
+                    "bulk id %s could not be resolved (%s); skipping it in "
+                    "this batch", mid, exc,
+                )
+                indeterminate.append(mid)
+                continue
+            if internal is not None:
+                resolved.append(internal)
+        if not resolved and indeterminate:
+            raise MailAnchorLookupIncompleteError(
+                f"None of the {len(message_ids)} requested message(s) could "
+                f"be resolved, and {len(indeterminate)} could not be checked "
+                f"at all ({', '.join(indeterminate[:3])}"
+                f"{'...' if len(indeterminate) > 3 else ''}). Reporting 0 "
+                "updated would imply they do not exist. This is usually a "
+                "transient IMAP timeout — retry."
+            )
+        return resolved
 
     def _draft_poll_iterations(self) -> int:
         """How many times the AppleScript id-diff rescans the unified drafts
@@ -6543,13 +6771,16 @@ class AppleMailConnector:
         draft_id: str,
         attachment_names: list[str],
         dest_dir: Path,
+        *,
+        account: str | None = None,
     ) -> list[Path]:
         """Save each attachment of a draft to disk.
 
         Used by ``update_draft`` to preserve attachments through the
         delete-and-recreate cycle. Mail.app doesn't expose attachment
         file paths on saved drafts (`file of att` returns an opaque
-        reference), so we extract via the ``save`` AppleScript command.
+        reference). RFC-ID drafts with an explicit account use IMAP, avoiding
+        Mail's local download cache. Other callers use AppleScript ``save``.
 
         Each attachment lands in its own ``<dest_dir>/<i>/`` subdirectory
         so filename collisions between attachments don't lose data.
@@ -6562,6 +6793,8 @@ class AppleMailConnector:
                 these from ``get_draft_state(draft_id)["attachment_names"]``.
             dest_dir: Existing directory under which subdirectories are
                 created. Caller owns the lifecycle (e.g. tempdir cleanup).
+            account: Verified draft account. Enables strict IMAP extraction
+                for RFC IDs; retrieval or metadata failures retain the original.
 
         Returns:
             Paths of the extracted files, in the same order as
@@ -6575,17 +6808,21 @@ class AppleMailConnector:
             FileNotFoundError: ``dest_dir`` does not exist.
         """
         _validate_draft_id(draft_id)
+        dest_dir = Path(dest_dir)
+        if not dest_dir.is_dir():
+            raise FileNotFoundError(f"dest_dir does not exist: {dest_dir}")
+        if not attachment_names:
+            return []
+        if account and "@" in draft_id:
+            return self._extract_imap_draft_attachments(
+                draft_id, attachment_names, dest_dir, account=account,
+            )
         # Resolve RFC Message-ID draft ids (IMAP-APPEND drafts, #245) to
         # Mail's internal numeric id, matching delete_draft/get_draft_state.
         # Without this, update_draft loses attachments on IMAP-created drafts
         # (their `id` is numeric, never equal to the RFC-id targetId). (#294)
         lookup_id = self._resolve_draft_lookup_id(draft_id)
         lookup_id_safe = escape_applescript_string(sanitize_input(lookup_id))
-        dest_dir = Path(dest_dir)
-        if not dest_dir.is_dir():
-            raise FileNotFoundError(f"dest_dir does not exist: {dest_dir}")
-        if not attachment_names:
-            return []
 
         # Compute sanitized, containment-checked target paths on the Python
         # side (the attachment name is attacker-influenced — it can carry a
@@ -6639,3 +6876,40 @@ class AppleMailConnector:
 
         # Return only the paths that actually got files written.
         return [p for p in target_paths if p.is_file()]
+
+    def _extract_imap_draft_attachments(
+        self, draft_id: str, attachment_names: list[str], dest_dir: Path,
+        *, account: str,
+    ) -> list[Path]:
+        """Preserve bytes from the saved draft without Mail's download cache.
+
+        Require complete, index-aligned metadata before writing anything;
+        unknown/missing content must never permit replacement of the original.
+        """
+        try:
+            host, port, email = self._resolve_imap_config(account)
+            password = self._get_imap_password_with_fallback(account, email)
+            imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
+            raw = imap.fetch_raw_draft(draft_id)
+        except _IMAP_FALLBACK_EXCS + (MailMessageNotFoundError,) as exc:
+            raise MailDraftError(
+                "Could not retrieve draft attachments through IMAP; original draft retained"
+            ) from exc
+        parsed = extract_attachment_payloads(raw)
+        if [part[0] for part in parsed] != attachment_names:
+            raise MailDraftError(
+                "Draft attachment metadata changed; original draft retained"
+            )
+        metadata = [{"name": part[0], "size": len(part[3])} for part in parsed]
+        _, rejected = _select_attachments_within_caps(
+            metadata, None, per_cap=self.max_attachment_bytes,
+            total_cap=self.max_total_attachment_bytes,
+        )
+        if rejected:
+            raise MailDraftError("Draft attachments exceed size limits; original draft retained")
+        targets = _compute_draft_extract_targets(attachment_names, dest_dir)
+        for target, part in zip(targets, parsed, strict=True):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as output:
+                output.write(part[3])
+        return targets
