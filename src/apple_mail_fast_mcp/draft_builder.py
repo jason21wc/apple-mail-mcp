@@ -188,9 +188,10 @@ def derive_reply_recipients(
 
     - Primary recipient is the original ``Reply-To`` if present, else
       ``From``.
-    - ``reply_all`` adds the original ``To`` + ``Cc`` as Cc, minus any of
-      the account's own ``self_addresses`` and minus the primary (so the
-      replier isn't cc'ing themselves or duplicating the To).
+    - ``reply_all`` excludes the account's own ``self_addresses`` from all
+      recipients, then adds the original ``To`` + ``Cc`` as Cc without
+      duplicates. If no external primary remains, the first external Cc
+      recipient becomes To (for example, when replying to one's own Sent mail).
     - Address display names are preserved (``Name <email>``).
 
     Returns ``(to, cc)`` as lists of formatted address strings.
@@ -198,6 +199,8 @@ def derive_reply_recipients(
     selves = {a.lower() for a in (self_addresses or [])}
 
     primary_pairs = getaddresses([reply_to_header or from_header])
+    if reply_all:
+        primary_pairs = [pair for pair in primary_pairs if pair[1].lower() not in selves]
     to_list = [formataddr(p) for p in primary_pairs if p[1]]
     primary_emails = {p[1].lower() for p in primary_pairs if p[1]}
 
@@ -212,6 +215,8 @@ def derive_reply_recipients(
                 continue
             seen.add(key)
             cc_list.append(formataddr((name, email_addr)))
+        if not to_list and cc_list:
+            to_list.append(cc_list.pop(0))
     return to_list, cc_list
 
 

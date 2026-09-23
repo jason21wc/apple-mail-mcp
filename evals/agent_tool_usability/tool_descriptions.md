@@ -52,6 +52,7 @@ it for later or send it now.
 - `template_vars` (object, optional): Variables to pass to the template renderer. Requires ``template_name``.
 - `from_account` (string, optional): Mail.app account name or UUID. ``None`` uses Mail's default; on a save-as-draft with exactly one enabled account, that account is adopted so the clean (no iOS quote bug) IMAP draft path can engage.
 - `send_now` (boolean, optional) (default: False): ``False`` (default) saves as draft. ``True`` sends immediately and elicits user confirmation.
+- `sender_email` (string, optional): Optional bare From address configured on ``from_account``. Requires an explicit account; unconfigured aliases are rejected. Omitted selects the account's primary address. Authentication still uses the account's existing login, independently of this address.
 
 ### create_mailbox
 
@@ -465,6 +466,7 @@ explicit body if so.
 - `template_vars` (object, optional)
 - `from_account` (string, optional): Override sender account. None preserves the source account; if it cannot be determined, the update is refused.
 - `send_now` (boolean, optional) (default: False): ``False`` (default) saves new draft. ``True`` sends after eliciting confirmation.
+- `sender_email` (string, optional): Override with a bare address configured on the effective account. None preserves the original alias when keeping the same account (name or UUID); selecting a different account uses its primary address. An unconfigured alias is rejected and the original retained.
 
 ### update_mailbox
 

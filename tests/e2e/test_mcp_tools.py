@@ -86,6 +86,12 @@ class TestToolRegistration:
         missing = [t.name for t in tools if not (t.description and t.description.strip())]
         assert not missing, f"tools missing description: {missing}"
 
+    @pytest.mark.parametrize("tool_name", ["create_draft", "update_draft"])
+    async def test_sender_alias_is_optional_schema_field(self, tool_name: str) -> None:
+        tool = await server.mcp.get_tool(tool_name)
+        assert "sender_email" in tool.parameters["properties"]
+        assert "sender_email" not in tool.parameters.get("required", [])
+
     @pytest.mark.parametrize(
         "tool_name,expected_required",
         [
@@ -478,3 +484,28 @@ async def test_smtp_partial_recipients_survive_mcp_serialization(mock_mail, monk
     })
     assert result.structured_content["success"]
     assert result.structured_content["delivery"] == delivery
+
+
+@pytest.mark.parametrize("tool_name", ["create_draft", "update_draft"])
+async def test_sender_alias_dispatch(tool_name, mock_mail, tmp_path, monkeypatch):
+    """Protocol dispatch carries explicit aliases through both lifecycle tools."""
+    monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+    mock_mail._resolve_account_to_sender.return_value = "Example <alias@example.com>"
+    mock_mail.create_draft.return_value = {
+        "draft_id": "new@example.com", "from_account": "Example",
+        "sender_email": "alias@example.com",
+    }
+    mock_mail.get_draft_state.return_value = {
+        "from_account": "Example", "sender_email": "primary@example.com",
+        "content_type": "text/plain", "subject": "Example", "body": "Example",
+        "to": ["recipient@example.org"], "attachment_names": [], "in_reply_to": "",
+    }
+    args = {"from_account": "Example", "sender_email": "alias@example.com"}
+    if tool_name == "create_draft":
+        args.update(to=["recipient@example.org"], subject="Example")
+    else:
+        args["draft_id"] = "old@example.com"
+    result = await server.mcp.call_tool(tool_name, args)
+    assert result.structured_content["success"]
+    assert result.structured_content["details"]["sender_email"] == "alias@example.com"
+    assert mock_mail.create_draft.call_args.kwargs["sender_email"] == "alias@example.com"

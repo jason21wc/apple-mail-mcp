@@ -8253,6 +8253,10 @@ class TestCreateReplyForwardDraftViaImap:
                          return_value=("h", 993, "email@fmasi.eu")),
             patch.object(AppleMailConnector, "_resolve_account_to_sender",
                          return_value="email@fmasi.eu"),
+            patch.object(AppleMailConnector, "list_accounts", return_value=[
+                {"name": "iCloud", "id": "icloud-id",
+                 "email_addresses": ["email@fmasi.eu"]},
+            ]),
             # The IMAP path now fires a post-APPEND account sync (#269);
             # stub _run_applescript so it doesn't shell out to real
             # osascript in unit tests (#298).
@@ -8771,6 +8775,7 @@ class TestSmtpSendPath:
             "draft_id": "",
             "sent_message_id": "",
             "from_account": "Gmail",
+            "sender_email": "me@x.test",
         }
 
     def test_send_now_compose_includes_cc_and_bcc_in_envelope(
@@ -8886,6 +8891,7 @@ class TestSmtpSendPath:
             "draft_id": "",
             "sent_message_id": "",
             "from_account": "Gmail",
+            "sender_email": "me@x.test",
         }
 
     def test_keychain_miss_falls_back_to_applescript(
@@ -8977,7 +8983,9 @@ class TestSmtpSendPath:
         sender_cls.return_value.send.assert_called_once_with(
             b"rawreply", ["orig@example.net"]
         )
-        assert {k: v for k, v in result.items() if k != "delivery"} == {"draft_id": "", "sent_message_id": ""}
+        assert {k: v for k, v in result.items() if k != "delivery"} == {
+            "draft_id": "", "sent_message_id": "", "sender_email": "me@x.test",
+        }
 
     def test_reply_forward_folder_miss_falls_back(
         self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
@@ -9151,6 +9159,7 @@ class TestSmtpSendPath:
             "draft_id": "",
             "sent_message_id": "",
             "from_account": "Gmail",
+            "sender_email": "me@x.test",
         }
         assert not any("tell theMessage to send" in s for s in scripts)
 
