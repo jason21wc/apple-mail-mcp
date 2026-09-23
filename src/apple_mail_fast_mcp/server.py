@@ -3086,6 +3086,8 @@ def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
         return {"success": False, "error": str(e), "error_type": "file_not_found"}
     if isinstance(e, MailDraftError):
         return _draft_error_response(e)
+    if isinstance(e, ValueError):
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
     if isinstance(e, MailAppleScriptError):
         logger.error(f"AppleScript error in {op}: {e}")
         return {"success": False, "error": str(e), "error_type": "applescript_error"}
@@ -3170,12 +3172,15 @@ def _build_draft_send_summary(
     bcc: list[str] | None,
     subject: str | None,
     body: str,
+    sender: str | None = None,
 ) -> str:
     """Confirmation summary when create_draft / update_draft is sending."""
     verb = {"reply": "Send this reply?", "forward": "Forward this message?"}.get(
         seed_kind, "Send this email?"
     )
     lines: list[str] = []
+    if sender:
+        lines.append(f"From: {sender}")
     if to:
         lines.append(f"To: {', '.join(to)}")
     if cc:
@@ -3188,6 +3193,31 @@ def _build_draft_send_summary(
         preview = body[:200] + "..." if len(body) > 200 else body
         lines.append(f"\n{preview}")
     return verb + "\n\n" + "\n".join(lines)
+
+
+def _validate_sender_selection(
+    account: str | None, sender_email: str | None, *, resolve_primary: bool = False,
+) -> str | None:
+    """Validate an explicit sender before confirmation; transport revalidates it."""
+    if sender_email is not None:
+        if not account:
+            raise ValueError("sender_email requires from_account")
+        return mail._resolve_account_to_sender(account, sender_email)
+    return mail._resolve_account_to_sender(account) if account and resolve_primary else None
+
+
+def _merge_draft_sender(
+    state: dict[str, Any], from_account: str | None, sender_email: str | None,
+) -> str | None:
+    """Keep the original alias unless the caller selects a different account."""
+    if sender_email is not None:
+        return sender_email
+    source_account = state.get("from_account")
+    if from_account is None or (
+        source_account and mail._same_account(from_account, source_account)
+    ):
+        return cast(str | None, state.get("sender_email"))
+    return None
 
 
 def _validate_draft_common_inputs(
@@ -3466,6 +3496,7 @@ async def create_draft(
     from_account: str | None = None,
     send_now: bool = False,
     ctx: Context | None = None,
+    sender_email: str | None = None,
 ) -> dict[str, Any]:
     """Create a draft (fresh, reply, or forward). Optionally send immediately.
 
@@ -3519,6 +3550,10 @@ async def create_draft(
             default; on a save-as-draft with exactly one enabled account,
             that account is adopted so the clean (no iOS quote bug) IMAP
             draft path can engage.
+        sender_email: Optional bare From address configured on ``from_account``.
+            Requires an explicit account; unconfigured aliases are rejected.
+            Omitted selects the account's primary address. Authentication still
+            uses the account's existing login, independently of this address.
         send_now: ``False`` (default) saves as draft. ``True`` sends
             immediately and elicits user confirmation.
 
@@ -3567,6 +3602,8 @@ async def create_draft(
         if fresh_err:
             return fresh_err
 
+        sender = _validate_sender_selection(from_account, sender_email, resolve_primary=send_now)
+
         # ----------------------------------------------------------------
         # Send-only checks (drafts are local — no rate limit / safety).
         # #191: gate chain pulled out to _run_send_now_gates.
@@ -3574,7 +3611,7 @@ async def create_draft(
         if send_now:
             all_recipients = (to or []) + (cc or []) + (bcc or [])
             summary = _build_draft_send_summary(
-                seed_kind, to, cc, bcc, subject, body,
+                seed_kind, to, cc, bcc, subject, body, sender,
             )
             gate_err = await _run_send_now_gates(
                 operation="create_draft",
@@ -3617,6 +3654,7 @@ async def create_draft(
             attachment_paths=attachment_path_objs,
             reply_all=reply_all,
             from_account=from_account,
+            sender_email=sender_email,
             send_now=send_now,
             on_warning=warnings.append,
         )
@@ -3644,6 +3682,7 @@ async def create_draft(
                 "seed_kind": seed_kind,
                 "send_now": send_now,
                 "from_account": result.get("from_account", ""),
+                "sender_email": result.get("sender_email", ""),
             },
         }
         if "delivery" in result:
@@ -3687,7 +3726,9 @@ def _finish_draft_replacement(
     response: dict[str, Any] = {
         "success": True, "draft_id": new_draft_id,
         "sent_message_id": result.get("sent_message_id", ""),
-        "details": {"seed_kind": seed_kind, "send_now": send_now},
+        "details": {"seed_kind": seed_kind, "send_now": send_now,
+                    "from_account": result.get("from_account", ""),
+                    "sender_email": result.get("sender_email", "")},
     }
     if "delivery" in result:
         response["delivery"] = result["delivery"]
@@ -3730,6 +3771,7 @@ async def update_draft(
     from_account: str | None = None,
     send_now: bool = False,
     ctx: Context | None = None,
+    sender_email: str | None = None,
 ) -> dict[str, Any]:
     """Update an existing draft by creating a replacement before removing the original.
 
@@ -3773,6 +3815,10 @@ async def update_draft(
             supplied subject/body override the rendered output.
         from_account: Override sender account. None preserves the source account;
             if it cannot be determined, the update is refused.
+        sender_email: Override with a bare address configured on the effective
+            account. None preserves the original alias when keeping the same
+            account (name or UUID); selecting a different account uses its primary
+            address. An unconfigured alias is rejected and the original retained.
         send_now: ``False`` (default) saves new draft. ``True`` sends
             after eliciting confirmation.
 
@@ -3817,6 +3863,14 @@ async def update_draft(
             to, cc, bcc, state,
         )
 
+        sender_email = _merge_draft_sender(state, from_account, sender_email)
+        from_account, preservation_error = _validate_draft_preservation(
+            state, from_account, body, body_html, template_name,
+        )
+        if preservation_error:
+            return preservation_error
+        sender = _validate_sender_selection(from_account, sender_email, resolve_primary=send_now)
+
         # tempdir (if any) is cleaned up in the finally block.
         final_attachments, tempdir = _resolve_draft_attachments(
             draft_id, attachment_paths, state.get("attachment_names", []) or [],
@@ -3829,7 +3883,7 @@ async def update_draft(
             )
             summary = _build_draft_send_summary(
                 seed_kind, final_to, final_cc, final_bcc, final_subject,
-                final_body or "",
+                final_body or "", sender,
             )
             # validate_recipient_shape stays False — recipients came from
             # existing draft state, not fresh caller input. (#175 + #192)
@@ -3844,12 +3898,6 @@ async def update_draft(
             if gate_err:
                 return gate_err
 
-        from_account, preservation_error = _validate_draft_preservation(
-            state, from_account, body, body_html, template_name,
-        )
-        if preservation_error:
-            return preservation_error
-
         result = mail.create_draft(
             seed=seed_kind,
             seed_id=seed_id,
@@ -3862,6 +3910,7 @@ async def update_draft(
             attachment_paths=final_attachments,
             reply_all=reply_all,
             from_account=from_account,
+            sender_email=sender_email,
             send_now=send_now,
             require_stable_id=not send_now,
         )

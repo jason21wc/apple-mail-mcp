@@ -10,9 +10,11 @@ import tempfile
 import time
 import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, cast
 
@@ -922,6 +924,14 @@ def _bulk_repeat_block(
     )
 
 
+@dataclass(frozen=True)
+class _DraftSenderIdentity:
+    """Per-request sender selection; authentication stays on the account."""
+
+    sender: str
+    addresses: tuple[str, ...]
+
+
 class AppleMailConnector:
     """Interface to Apple Mail via AppleScript."""
 
@@ -1180,7 +1190,9 @@ class AppleMailConnector:
                 acc["full_name"] = None
         return accounts
 
-    def _resolve_account_to_sender(self, account: str) -> str:
+    def _resolve_account_to_sender(
+        self, account: str, sender_email: str | None = None,
+    ) -> str:
         """Resolve an account name or UUID to a sender string for the
         AppleScript ``sender`` property.
 
@@ -1189,14 +1201,29 @@ class AppleMailConnector:
         fallback when no full name is set. The Display-Name form is what
         recipients see in their inbox's From column.
 
+        ``sender_email`` selects a configured bare address, matched without
+        case sensitivity. Omission retains the account's first address.
+
         Used by the draft lifecycle (``create_draft`` / ``update_draft``)
         per #155. Accepts either name or UUID, matching the convention on
         ``list_mailboxes``, ``search_messages``, etc.
 
         Raises:
             MailAccountNotFoundError: No account matches the given name/UUID.
-            ValueError: Account exists but has no email addresses configured.
+            ValueError: Account has no addresses, or sender_email is malformed
+                or is not configured on the selected account.
         """
+        return self._resolve_sender_identity(account, sender_email).sender
+
+    def _resolve_sender_identity(
+        self, account: str, sender_email: str | None = None,
+    ) -> _DraftSenderIdentity:
+        """Validate a configured address without changing the login account."""
+        if sender_email is not None and (
+            not validate_email(sender_email)
+            or any(ord(char) < 33 or ord(char) == 127 for char in sender_email)
+        ):
+            raise ValueError("sender_email must be a single bare email address")
         for acc in self.list_accounts():
             if acc.get("id") == account or acc.get("name") == account:
                 emails = acc.get("email_addresses") or []
@@ -1206,12 +1233,26 @@ class AppleMailConnector:
                         f"configured."
                     )
                 email = cast(str, emails[0])
+                if sender_email is not None:
+                    matches = [addr for addr in emails if addr.lower() == sender_email.lower()]
+                    if not matches:
+                        raise ValueError(f"sender_email is not configured for account {account!r}")
+                    email = matches[0]
                 full_name = (acc.get("full_name") or "").strip()
-                if full_name:
-                    return f"{full_name} <{email}>"
-                return email
+                sender = f"{full_name} <{email}>" if full_name else email
+                return _DraftSenderIdentity(sender, tuple(emails))
         raise MailAccountNotFoundError(
             f"Account {account!r} not found in Mail.app configured accounts."
+        )
+
+    def _same_account(self, left: str, right: str) -> bool:
+        """Compare Mail account names/UUIDs using a single account snapshot."""
+        if left == right:
+            return True
+        return any(
+            left in (acc.get("id"), acc.get("name"))
+            and right in (acc.get("id"), acc.get("name"))
+            for acc in self.list_accounts()
         )
 
     def list_rules(self) -> list[dict[str, Any]]:
@@ -5298,14 +5339,19 @@ class AppleMailConnector:
         data = parse_applescript_json(raw)
         if not isinstance(data, dict) or not data.get("found"):
             raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
-        # An account override selects its first sender identity. If this draft
-        # used another alias, do not silently switch identity during replacement.
-        from email.utils import parseaddr
-
+        # Preserve only identities that are still configured on this account.
+        # Unknown senders remain unresolvable, so replacement can fail closed.
+        original_sender = parseaddr(data.pop("sender", ""))[1]
         if data.get("from_account"):
-            original_sender = parseaddr(data.pop("sender", ""))[1]
-            configured_sender = parseaddr(self._resolve_account_to_sender(data["from_account"]))[1]
-            if not original_sender or original_sender.lower() != configured_sender.lower():
+            try:
+                configured_sender = parseaddr(self._resolve_account_to_sender(
+                    data["from_account"], original_sender,
+                ))[1]
+            except (ValueError, MailAccountNotFoundError):
+                configured_sender = ""
+            if original_sender and original_sender.lower() == configured_sender.lower():
+                data["sender_email"] = configured_sender
+            else:
                 data["from_account"] = ""
         # Drop the internal flag from the user-visible payload.
         data.pop("found", None)
@@ -5448,6 +5494,7 @@ class AppleMailConnector:
         body: str,
         attachment_paths: list[Path] | None,
         body_html: str | None = None,
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, str]:
         """Create a save-as-draft by APPENDing a clean RFC822 message over
         IMAP (issue #245), instead of Mail.app's AppleScript ``content``
@@ -5463,7 +5510,10 @@ class AppleMailConnector:
         from sender resolution are NOT caught — they are caller/config
         errors and must surface.
         """
-        sender = self._resolve_account_to_sender(from_account)
+        sender = (
+            sender_identity.sender if sender_identity is not None
+            else self._resolve_account_to_sender(from_account)
+        )
         host, port, email = self._resolve_imap_config(from_account)
         password = self._get_imap_password_with_fallback(from_account, email)
         message_id, raw = build_draft_mime(
@@ -5481,7 +5531,10 @@ class AppleMailConnector:
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         imap.append_draft(raw)
         self._imap_clear_breaker(from_account)
-        return {"draft_id": _bare_message_id(message_id), "sent_message_id": ""}
+        return {
+            "draft_id": _bare_message_id(message_id), "sent_message_id": "",
+            "sender_email": parseaddr(sender)[1],
+        }
 
     def _create_reply_forward_draft_via_imap(
         self,
@@ -5497,6 +5550,7 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, str]:
         """Create a clean reply/forward save-as-draft via IMAP APPEND
         (issue #245 follow-up).
@@ -5513,12 +5567,16 @@ class AppleMailConnector:
         the AppleScript path — AppleScript resolves the message across all
         folders, so a folder-guess miss degrades gracefully.
         """
-        sender = self._resolve_account_to_sender(from_account)
+        sender = (
+            sender_identity.sender if sender_identity is not None
+            else self._resolve_account_to_sender(from_account)
+        )
         host, port, email = self._resolve_imap_config(from_account)
         password = self._get_imap_password_with_fallback(from_account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
 
         message_id, draft_raw, _recipients = self._build_reply_forward_mime(
+            self_addresses=sender_identity.addresses if sender_identity else (),
             imap=imap,
             seed=seed,
             seed_id=seed_id,
@@ -5535,7 +5593,10 @@ class AppleMailConnector:
         )
         imap.append_draft(draft_raw)
         self._imap_clear_breaker(from_account)
-        return {"draft_id": _bare_message_id(message_id), "sent_message_id": ""}
+        return {
+            "draft_id": _bare_message_id(message_id), "sent_message_id": "",
+            "sender_email": parseaddr(sender)[1],
+        }
 
     def _resolve_reply_forward_fields(
         self,
@@ -5548,6 +5609,7 @@ class AppleMailConnector:
         subject: str | None,
         body: str,
         reply_all: bool,
+        self_addresses: tuple[str, ...] = (),
     ) -> tuple[list[str], list[str] | None, str | None, str, Any]:
         """Derive the final (to, cc, subject, body, forwarded_attachments)
         for a clean reply/forward from the parsed original.
@@ -5565,7 +5627,7 @@ class AppleMailConnector:
                 reply_to_header=orig.reply_to_header,
                 to_header=orig.to_header,
                 cc_header=orig.cc_header,
-                self_addresses=[self_email],
+                self_addresses=[self_email, *self_addresses],
                 reply_all=reply_all,
             )
             final_to = to if to is not None else derived_to
@@ -5611,6 +5673,7 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        self_addresses: tuple[str, ...] = (),
     ) -> tuple[str, bytes, list[str]]:
         """Fetch the original over IMAP, rebuild a clean (no cite-blockquote)
         reply/forward MIME with threading headers, and return
@@ -5644,6 +5707,7 @@ class AppleMailConnector:
             final_body,
             forwarded_attachments,
         ) = self._resolve_reply_forward_fields(
+            self_addresses=self_addresses,
             seed=seed,
             orig=orig,
             self_email=self_email,
@@ -5684,6 +5748,7 @@ class AppleMailConnector:
         body: str,
         attachment_paths: list[Path] | None,
         body_html: str | None = None,
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, str] | None:
         """IMAP-APPEND path for a ``seed="new"`` save-as-draft (issue #245).
 
@@ -5703,6 +5768,7 @@ class AppleMailConnector:
             return None
         try:
             return self._create_draft_via_imap(
+                sender_identity=sender_identity,
                 from_account=from_account,
                 to=to or [],
                 cc=cc,
@@ -5731,6 +5797,7 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, str] | None:
         """IMAP-APPEND path for a reply/forward save-as-draft (issue #245
         follow-up).
@@ -5754,6 +5821,7 @@ class AppleMailConnector:
             return None
         try:
             return self._create_reply_forward_draft_via_imap(
+                sender_identity=sender_identity,
                 seed=seed,
                 seed_id=seed_id,
                 seed_mailbox=seed_mailbox or "INBOX",
@@ -5896,11 +5964,15 @@ class AppleMailConnector:
         body: str,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, Any]:
         """Build a clean fresh-compose RFC 822 message and SMTP-send it
         (issue #322 — the ``seed="new"`` send analog of the #246 draft path).
         """
-        sender = self._resolve_account_to_sender(from_account)
+        sender = (
+            sender_identity.sender if sender_identity is not None
+            else self._resolve_account_to_sender(from_account)
+        )
         _message_id, raw = build_draft_mime(
             sender=sender,
             to=to,
@@ -5918,7 +5990,10 @@ class AppleMailConnector:
         self._save_sent_copy(
             from_account, raw, answered=False, smtp_config=smtp_config
         )
-        return {"draft_id": "", "sent_message_id": "", "delivery": delivery}
+        return {
+            "draft_id": "", "sent_message_id": "", "delivery": delivery,
+            "sender_email": parseaddr(sender)[1],
+        }
 
     def _send_reply_forward_via_smtp(
         self,
@@ -5935,16 +6010,21 @@ class AppleMailConnector:
         reply_all: bool,
         attachment_paths: list[Path] | None,
         smtp_config: tuple[str, int, str],
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, Any]:
         """Rebuild a clean reply/forward from the original (fetched over IMAP)
         and SMTP-send it (issue #322 — the send analog of the #292 draft
         path). Recipient derivation and the transport-boundary safety guard
         both run against the fully-resolved recipient set."""
-        sender = self._resolve_account_to_sender(from_account)
+        sender = (
+            sender_identity.sender if sender_identity is not None
+            else self._resolve_account_to_sender(from_account)
+        )
         host, port, email = self._resolve_imap_config(from_account)
         password = self._get_imap_password_with_fallback(from_account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         _message_id, raw, recipients = self._build_reply_forward_mime(
+            self_addresses=sender_identity.addresses if sender_identity else (),
             imap=imap,
             seed=seed,
             seed_id=seed_id,
@@ -5970,7 +6050,10 @@ class AppleMailConnector:
             smtp_config=smtp_config,
             imap=imap,
         )
-        return {"draft_id": "", "sent_message_id": "", "delivery": delivery}
+        return {
+            "draft_id": "", "sent_message_id": "", "delivery": delivery,
+            "sender_email": parseaddr(sender)[1],
+        }
 
     def _save_sent_copy(
         self,
@@ -6073,6 +6156,7 @@ class AppleMailConnector:
         body_html: str | None,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, Any] | None:
         """Try the clean, wrapper-free paths in order and return the first
         that engages, or ``None`` to fall through to AppleScript.
@@ -6086,6 +6170,7 @@ class AppleMailConnector:
         method stays under the complexity ceiling.
         """
         imap_result = self._try_imap_draft_paths(
+            sender_identity=sender_identity,
             seed=seed,
             seed_id=seed_id,
             seed_mailbox=seed_mailbox,
@@ -6109,6 +6194,7 @@ class AppleMailConnector:
         # implicit account for send_now (#321), so an implicit-account send
         # stays on the AppleScript path — pass `from_account` for clean SMTP.
         smtp_result = self._try_smtp_send(
+            sender_identity=sender_identity,
             seed=seed,
             seed_id=seed_id,
             seed_mailbox=seed_mailbox,
@@ -6142,6 +6228,7 @@ class AppleMailConnector:
         body: str,
         reply_all: bool,
         attachment_paths: list[Path] | None,
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, Any] | None:
         """Clean SMTP send path for ``send_now=True`` (issue #322).
 
@@ -6178,6 +6265,7 @@ class AppleMailConnector:
                 return None  # No SMTP server configured — fall through.
             if is_compose:
                 return self._send_new_via_smtp(
+                    sender_identity=sender_identity,
                     from_account=from_account,
                     to=to or [],
                     cc=cc,
@@ -6188,6 +6276,7 @@ class AppleMailConnector:
                     smtp_config=smtp_config,
                 )
             return self._send_reply_forward_via_smtp(
+                sender_identity=sender_identity,
                 seed=seed,
                 seed_id=cast(str, seed_id),
                 seed_mailbox=seed_mailbox or "INBOX",
@@ -6224,6 +6313,7 @@ class AppleMailConnector:
         attachment_paths: list[Path] | None = None,
         reply_all: bool = False,
         from_account: str | None = None,
+        sender_email: str | None = None,
         send_now: bool = False,
         on_warning: Callable[[str], None] | None = None,
         require_stable_id: bool = False,
@@ -6291,6 +6381,8 @@ class AppleMailConnector:
                 that account is adopted so the clean IMAP path can engage
                 (it is Mail's default sender anyway, so the From is
                 unchanged). (#321)
+            sender_email: Optional bare address configured on ``from_account``.
+                Selects the From identity without changing authentication.
             on_warning: Optional callback invoked with a human-readable
                 string when a save-as-draft falls back to the AppleScript
                 path (whose body carries Mail.app's cite-blockquote wrapper,
@@ -6321,13 +6413,16 @@ class AppleMailConnector:
         # engage (it must name the account for creds + From); adopt the
         # sole enabled account when there is one (it's Mail's default
         # sender anyway, so the From is unchanged).
-        effective_account = self._effective_from_account(from_account, send_now)
+        effective_account, sender_identity = self._prepare_draft_sender(
+            from_account, sender_email, send_now, seed == "reply" and reply_all,
+        )
 
         # Clean (wrapper-free) paths that avoid Mail.app's cite-blockquote
         # (bug FB11734014): IMAP-APPEND for save-as-draft (#245), SMTP submit
         # for send_now (#322). Returns a result dict, or None to fall through
         # to the AppleScript path below.
         clean_result = self._try_clean_create_or_send(
+            sender_identity=sender_identity,
             seed=seed,
             seed_id=seed_id,
             seed_mailbox=seed_mailbox,
@@ -6379,8 +6474,11 @@ class AppleMailConnector:
         # characters can appear here. (#173)
         sender_clause = ""
         if effective_account is not None:
-            sender_email = self._resolve_account_to_sender(effective_account)
-            sender_safe = escape_applescript_string(sanitize_input(sender_email))
+            sender = (
+                sender_identity.sender if sender_identity is not None
+                else self._resolve_account_to_sender(effective_account)
+            )
+            sender_safe = escape_applescript_string(sanitize_input(sender))
             sender_clause = f'set sender of theMessage to "{sender_safe}"'
 
         # Recipient blocks: AppleScript fragments that, when included,
@@ -6506,13 +6604,14 @@ class AppleMailConnector:
                 ) from e
             raise
 
-        if send_now:
-            return {"draft_id": "", "sent_message_id": "", "from_account": ""}
-        return {
-            "draft_id": result,
+        response = {
+            "draft_id": "" if send_now else result,
             "sent_message_id": "",
             "from_account": effective_account or "",
         }
+        if effective_account is not None:
+            response["sender_email"] = parseaddr(sender)[1]
+        return response
 
     @staticmethod
     def _validate_draft_fallback(
@@ -6678,6 +6777,21 @@ class AppleMailConnector:
         budget = min(_DRAFT_POLL_MAX_S, self.timeout * 0.5)
         return max(1, int(budget / _DRAFT_POLL_INTERVAL_S))
 
+    def _prepare_draft_sender(
+        self, from_account: str | None, sender_email: str | None,
+        send_now: bool, reply_all: bool,
+    ) -> tuple[str | None, _DraftSenderIdentity | None]:
+        """Validate explicit identity before transport work and reuse one snapshot."""
+        if sender_email is not None and not from_account:
+            raise ValueError("sender_email requires an explicit from_account")
+        account = self._effective_from_account(from_account, send_now)
+        identity = (
+            self._resolve_sender_identity(account, sender_email)
+            if account is not None and (sender_email is not None or reply_all)
+            else None
+        )
+        return account, identity
+
     def _effective_from_account(
         self, from_account: str | None, send_now: bool
     ) -> str | None:
@@ -6708,6 +6822,7 @@ class AppleMailConnector:
         reply_all: bool,
         attachment_paths: list[Path] | None,
         body_html: str | None = None,
+        sender_identity: _DraftSenderIdentity | None = None,
     ) -> dict[str, str] | None:
         """Try the clean IMAP-APPEND draft paths (compose, then
         reply/forward), returning a draft dict or ``None`` to fall through
@@ -6717,6 +6832,7 @@ class AppleMailConnector:
         reply/forward HTML is out of scope for #251.
         """
         result = self._try_imap_compose_draft(
+            sender_identity=sender_identity,
             seed=seed,
             send_now=send_now,
             from_account=effective_account,
@@ -6731,6 +6847,7 @@ class AppleMailConnector:
         if result is not None:
             return result
         return self._try_imap_reply_forward_draft(
+            sender_identity=sender_identity,
             seed=seed,
             seed_id=seed_id,
             seed_mailbox=seed_mailbox,

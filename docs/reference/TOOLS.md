@@ -1017,6 +1017,7 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |
 | `template_vars` | object | No | None | Variables for the template renderer. Requires `template_name`. |
 | `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. On a save-as-draft with exactly one enabled account, that account is adopted so the clean (no iOS quote bug) IMAP draft path can engage — it's Mail's default sender anyway, so the From is unchanged (#321). |
+| `sender_email` | string | No | None | Bare From address from the selected account's configured `email_addresses`. Requires explicit `from_account`; unknown or malformed aliases are rejected. Omitted uses the primary address. This changes sender identity, not the account's authentication login. |
 | `send_now` | boolean | No | False | `False` saves as draft. `True` sends immediately and elicits confirmation. When the account has SMTP + IMAP credentials configured, the send goes out over a clean **SMTP** submission (#322) — a wrapper-free RFC 822 message — so sent mail avoids the iOS cite-blockquote (Mail.app bug FB11734014); it falls back to Mail's AppleScript send (which does apply the wrapper) when SMTP isn't available. Unlike a save-as-draft, a `send_now` with no `from_account` is **not** auto-resolved to the sole account (#321) — pass `from_account` to get the clean SMTP path. |
 
 **Returns:**
@@ -1034,6 +1035,21 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 reserved for future use. `details.from_account` is the account the draft
 was created under (including an auto-resolved one), or `""` when Mail's
 default was used.
+`details.sender_email` identifies the selected address when known; it is empty
+when the sender is left to Mail's implicit choice. Send confirmation includes
+the resolved From address when an account is specified. On the clean IMAP/SMTP
+paths, derived reply-all recipients exclude the account's configured addresses
+and login; explicitly provided recipient groups remain unchanged. AppleScript
+fallback delegates reply-all recipient selection to Mail.app.
+
+To select a configured alias, use both fields:
+
+```python
+create_draft(
+    from_account="iCloud", sender_email="alice@me.com",
+    to=["recipient@example.org"], subject="Review", body="Please review."
+)
+```
 
 A draft created via the clean IMAP path triggers an account sync so it
 appears in Mail.app's Drafts promptly; a brief lag can still remain since
@@ -1136,7 +1152,8 @@ Callers caching the id must re-read the response.
 | `body_html` | string | No | None | Optional HTML body for the recreated draft (#251); see `create_draft`. Requires IMAP credentials; limited to fresh-seed drafts (not reply/forward) and `send_now=False`. Existing HTML or an unknown body format is refused when preserving the body. Pass `body_html` again, or `body` to explicitly replace it with plain text. |
 | `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached); `[]` clears; populated list replaces. |
 | `template_name` / `template_vars` | string / object | No | None | Optional template render. User-supplied `subject`/`body` override the rendered output. |
-| `from_account` | string | No | None | Override sender. |
+| `from_account` | string | No | None | Override account by name or UUID. Omitted preserves the source account. Selecting a different account without `sender_email` uses its primary address. |
+| `sender_email` | string | No | None | Override with a configured address on the effective account. Omitted preserves the original alias when keeping the same account (including name/UUID equivalents). Unknown aliases are rejected before creating a replacement or deleting the original. |
 | `send_now` | boolean | No | False | `False` saves new draft. `True` sends after eliciting confirmation. |
 
 **Returns:**
@@ -1146,7 +1163,7 @@ Callers caching the id must re-read the response.
   "success": true,
   "draft_id": "161200",
   "sent_message_id": "",
-  "details": {"seed_kind": "reply", "send_now": false}
+  "details": {"seed_kind": "reply", "send_now": false, "from_account": "iCloud", "sender_email": "alice@me.com"}
 }
 ```
 

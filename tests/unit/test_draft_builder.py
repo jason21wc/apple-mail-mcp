@@ -11,6 +11,8 @@ from __future__ import annotations
 import email
 from email import policy
 
+import pytest
+
 from apple_mail_fast_mcp.draft_builder import build_draft_mime
 
 
@@ -228,6 +230,52 @@ def test_forward_subject_no_double_prefix():
     assert forward_subject("Flat 9") == "Fwd: Flat 9"
     assert forward_subject("Fwd: Flat 9") == "Fwd: Flat 9"
     assert forward_subject("FW: Flat 9") == "FW: Flat 9"
+
+
+@pytest.mark.parametrize("reply_to", ["", "Self <alias@example.com>"])
+def test_reply_all_to_own_sent_message_promotes_external_recipient(reply_to):
+    to, cc = derive_reply_recipients(
+        from_header="Self <ALIAS@example.com>",
+        reply_to_header=reply_to,
+        to_header="Self <primary@example.com>, Alice <alice@example.com>",
+        cc_header="Bob <bob@example.com>, Duplicate <ALICE@example.com>",
+        self_addresses=["alias@example.com", "primary@example.com"],
+        reply_all=True,
+    )
+    assert to == ["Alice <alice@example.com>"]
+    assert cc == ["Bob <bob@example.com>"]
+
+
+def test_reply_all_mixed_reply_to_retains_external_primary_names():
+    to, cc = derive_reply_recipients(
+        from_header="Author <author@example.com>",
+        reply_to_header="Self <ALIAS@example.com>, Alice <alice@example.com>, Bob <bob@example.com>",
+        to_header="Alias <alias@example.com>, Alice <alice@example.com>, Carol <carol@example.com>",
+        self_addresses=["alias@example.com"],
+        reply_all=True,
+    )
+    assert to == ["Alice <alice@example.com>", "Bob <bob@example.com>"]
+    assert cc == ["Carol <carol@example.com>"]
+
+
+def test_reply_all_all_self_headers_produce_no_recipients():
+    assert derive_reply_recipients(
+        from_header="Self <alias@example.com>",
+        reply_to_header="Self <primary@example.com>",
+        to_header="Alias <ALIAS@example.com>",
+        cc_header="Login <login@example.com>",
+        self_addresses=["alias@example.com", "primary@example.com", "login@example.com"],
+        reply_all=True,
+    ) == ([], [])
+
+
+def test_sender_only_reply_to_self_retains_existing_behavior():
+    assert derive_reply_recipients(
+        from_header="Self <alias@example.com>",
+        to_header="Alice <alice@example.com>",
+        self_addresses=["alias@example.com"],
+        reply_all=False,
+    ) == (["Self <alias@example.com>"], [])
 
 
 def test_derive_reply_recipients_simple():

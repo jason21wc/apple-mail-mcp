@@ -70,6 +70,14 @@ integration, the attachment-retrieval skill, and
 paid for at merge time, superlinearly — one past sync cost 109 conflicts.
 Sync small and often; prefer contributing upstream over accumulating fork code.
 
+**Authorized sender-alias exception.** Draft creation and replacement accept a
+configured `sender_email` independently of the account used for authentication.
+This bounded repair spans `server.py`, `mail_connector.py`, and
+`draft_builder.py`; it preserves aliases on update and excludes configured self
+addresses when deriving clean MIME reply-all recipients. It is suitable for
+upstream adoption, not a new fork-only workflow. See `docs/reference/TOOLS.md`
+for the contract.
+
 ## Data Flow
 
 An attachment retrieval, end to end:
