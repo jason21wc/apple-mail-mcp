@@ -4980,7 +4980,7 @@ class TestWhoseIdQuoting:
         # hint to pass the IMAP fast-path scope. RFC-id quoting/escaping safety
         # is covered by TestMessageIdMatchClause.
         uuid_id = "CF7C3761-C190-40BA-B94E-3EBC321980ED@icloud.com"
-        with pytest.raises(MailMessageNotFoundError, match="account"):
+        with pytest.raises(MailAppleScriptError, match="account"):
             connector.get_message(uuid_id, include_content=False)
         mock_run.assert_not_called()
 

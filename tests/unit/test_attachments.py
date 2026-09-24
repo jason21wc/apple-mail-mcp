@@ -76,7 +76,8 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
-        assert "|name|:(name of att)" in script
+        assert "|name|:attachmentName" in script
+        assert "set attachmentName to name of attachmentRef" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_script_quotes_size_key(
@@ -90,8 +91,9 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("msg-1")
         script = mock_run.call_args[0][0]
-        assert "|size|:(file size of att)" in script
-        assert ", size:(file size of att)" not in script
+        assert "|size|:attachmentSize" in script
+        assert "set attachmentSize to file size of attachmentRef" in script
+        assert ", size:" not in script
 
 
 class TestSaveAttachments:

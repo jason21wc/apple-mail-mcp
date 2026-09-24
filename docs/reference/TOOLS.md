@@ -163,12 +163,13 @@ Retrieve full details of one or more messages, with bodies. Returns a list (alwa
 | `message_ids` | list[string] | Yes | - | List of message ids to fetch. May include the literal token `"SELECTED"` (server-resolved to Mail.app's current UI selection at call time). Mixed lists like `["SELECTED", "12345"]` are valid. Empty list is a no-op. |
 | `include_content` | boolean | No | true | Include message bodies |
 | `headers_only` | boolean | No | false | IMAP fast-path optimization for explicit ids; ignored on AppleScript fallback |
-| `account` | string | No | None | Mail.app account name. With `mailbox`, activates the IMAP fast path for explicit ids (issue #72) |
-| `mailbox` | string | No | None | Folder for the IMAP fast path (e.g. "INBOX") |
+| `account` | string | No | None | Mail.app account name or UUID. Restricts numeric-ID AppleScript lookup; with `mailbox`, enables IMAP for RFC Message-IDs. |
+| `mailbox` | string | No | None | Folder to search (e.g. "INBOX"). Restricts both numeric-ID and RFC Message-ID lookup. |
 | `include_attachments` | boolean | No | true | When true, each message gains an `attachments: [{name, mime_type, size, downloaded}]` field. Default on for `get_messages` because id-list cardinality is bounded (typically 1-10) — cost is acceptable on both paths. |
 
 **Notes:**
-- Missing ids drop out silently — the response contains whatever was found (partial-results convention).
+- Genuinely missing ids drop out silently — the response contains whatever was found (partial-results convention). A failed read is an error, not evidence that the message is absent. AppleScript attachment/read failures return `success: false`, `error_type: "applescript_error"`.
+- Numeric Mail IDs use indexed AppleScript lookup even when IMAP is configured. RFC Message-IDs use IMAP with account/mailbox hints; an unavailable IMAP path must not start an unindexed all-message scan.
 - The `"SELECTED"` sentinel is resolved server-side via `mail.get_selected_messages()` at call time. Empty selection expands to nothing.
 - Pair with `search_messages` (metadata-only, criteria-based) and `get_thread` (thread member ids) to fetch bodies for specific messages.
 - **Body bounding (#365):** each `content` is scrubbed of transport-hostile characters (control bytes, non-UTF8-encodable codepoints) and capped at **1 MB** of UTF-8 text so a single large or malformed body can't crash the stdio server. When a body is truncated, the message carries `content_truncated: true` and `content_original_bytes: <int>`. Override the cap with `APPLE_MAIL_MCP_MAX_BODY_BYTES` (positive integer bytes).

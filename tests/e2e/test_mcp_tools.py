@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from apple_mail_fast_mcp import server
+from apple_mail_fast_mcp.exceptions import MailAppleScriptError
 
 pytestmark = pytest.mark.e2e
 
@@ -282,6 +283,18 @@ class TestToolInvocation:
         assert result.structured_content["success"] is True
         assert "error" not in result.structured_content
         getattr(mock_mail, connector_method).assert_called_once()
+
+
+async def test_attachment_read_failure_survives_mcp_dispatch(mock_mail: MagicMock) -> None:
+    mock_mail.get_message.side_effect = MailAppleScriptError(
+        "Message read failed at attachment MIME type (AppleScript -10000)"
+    )
+    result = await server.mcp.call_tool(
+        "get_messages", {"message_ids": ["123"], "include_content": False}
+    )
+    assert result.structured_content["success"] is False
+    assert result.structured_content["error_type"] == "applescript_error"
+    assert "count" not in result.structured_content
 
 
 class TestStringifiedParamCoercion:

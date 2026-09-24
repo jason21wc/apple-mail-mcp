@@ -575,6 +575,87 @@ def _anchor_from_applescript_record(
     }
 
 
+def _message_lookup_applescript(
+    message_id: str, account: str | None = None, mailbox: str | None = None,
+) -> str:
+    """Locate a message without hiding lookup errors or widening supplied scope.
+
+    Callers reject RFC scans before reaching this indexed numeric lookup.
+    Keep property reads outside the lookup so a found message cannot disappear
+    merely because Mail cannot read its body or attachment metadata.
+    """
+    accounts = f"{{{applescript_account_clause(account)}}}" if account else "accounts"
+    mailboxes = "mailboxes of acc"
+    mailbox_filter = "true"
+    if mailbox:
+        mailbox_safe = escape_applescript_string(sanitize_input(mailbox))
+        if account:
+            mailboxes = f'{{my resolveMailbox(acc, "{mailbox_safe}")}}'
+        else:
+            path = "my buildMailboxPath(mb)" if "/" in mailbox else "name of mb"
+            mailbox_filter = f'({path}) is "{mailbox_safe}"'
+    return f'''
+            set msg to missing value
+            set lookupAccounts to {accounts}
+            repeat with acc in lookupAccounts
+                set lookupMailboxes to {mailboxes}
+                repeat with mb in lookupMailboxes
+                    if {mailbox_filter} then
+                        try
+                            set matchedMessages to (messages of mb whose ({_message_id_match_clause(message_id)}))
+                            if (count of matchedMessages) > 0 then
+                                set msg to item 1 of matchedMessages
+                                exit repeat
+                            end if
+                        on error number errNum
+                            error "MAIL_READ_FAILED: message lookup; AppleScript error " & (errNum as text)
+                        end try
+                    end if
+                end repeat
+                if msg is not missing value then exit repeat
+            end repeat
+            if msg is missing value then
+                error "Can't get message: not found"
+            end if
+'''
+
+
+_ATTACHMENT_METADATA_HANDLERS = '''using terms from application "Mail"
+    on readAttachmentMetadata(msg)
+        set readStage to "attachment enumeration"
+        try
+            tell application "Mail"
+                set messageAttachments to mail attachments of msg
+                set attachmentRecords to {}
+                repeat with attachmentRef in messageAttachments
+                    set readStage to "attachment name"
+                    set attachmentName to name of attachmentRef
+                    if attachmentName is missing value then error number -1728
+                    set attachmentName to attachmentName as text
+                    set readStage to "attachment MIME type"
+                    set attachmentType to MIME type of attachmentRef
+                    if attachmentType is missing value then error number -1728
+                    set attachmentType to attachmentType as text
+                    set readStage to "attachment file size"
+                    set attachmentSize to file size of attachmentRef
+                    if attachmentSize is missing value then error number -1728
+                    set attachmentSize to attachmentSize as integer
+                    set readStage to "attachment downloaded"
+                    set attachmentDownloaded to downloaded of attachmentRef
+                    if attachmentDownloaded is missing value then error number -1728
+                    set attachmentDownloaded to attachmentDownloaded as boolean
+                    set end of attachmentRecords to {|name|:attachmentName, |mime_type|:attachmentType, |size|:attachmentSize, |downloaded|:attachmentDownloaded}
+                end repeat
+            end tell
+        on error number errNum
+            error "MAIL_READ_FAILED: " & readStage & "; AppleScript error " & (errNum as text) & ". Retry with include_attachments=false, or use the RFC Message-ID with account and mailbox for IMAP."
+        end try
+        return attachmentRecords
+    end readAttachmentMetadata
+end using terms from
+'''
+
+
 def _message_id_match_clause(message_id: str) -> str:
     """Build an AppleScript boolean (for a ``whose`` filter) that matches a
     message by EITHER Mail's numeric ``id`` OR its RFC 5322 ``message id``
@@ -1129,7 +1210,9 @@ class AppleMailConnector:
                 normalized = error_msg.replace("\u2019", "'")
 
                 # Parse error and raise appropriate exception
-                if "Can't get account" in normalized:
+                if "MAIL_READ_FAILED:" in normalized:
+                    raise MailAppleScriptError(error_msg)
+                elif "Can't get account" in normalized:
                     raise MailAccountNotFoundError(error_msg)
                 elif "Can't get mailbox" in normalized:
                     raise MailMailboxNotFoundError(error_msg)
@@ -2243,12 +2326,7 @@ class AppleMailConnector:
         effective_limit = str(limit) if limit else "999999999"
 
         if include_attachments:
-            attachments_clause = '''
-                    set attList to {}
-                    repeat with att in mail attachments of msg
-                        set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                        set end of attList to attRecord
-                    end repeat'''
+            attachments_clause = "\n                    set attList to my readAttachmentMetadata(msg)"
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
@@ -2283,7 +2361,9 @@ class AppleMailConnector:
         script = _wrap_as_json_script(
             tell_body,
             timeout=self.timeout,
-            handlers=_MAILBOX_RESOLVER_HANDLERS,
+            handlers=_MAILBOX_RESOLVER_HANDLERS + (
+                _ATTACHMENT_METADATA_HANDLERS if include_attachments else ""
+            ),
         )
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
@@ -2302,19 +2382,18 @@ class AppleMailConnector:
         """
         Get full message details.
 
-        Tries the IMAP path first when both ``account`` and ``mailbox``
-        are supplied AND the account has a Keychain entry. Falls back to
-        AppleScript on any IMAP failure per the graceful-degradation
-        invariants in docs/research/imap-auth-options-decision.md, and
-        also when no account/mailbox hint is given.
+        Numeric Mail IDs use the indexed AppleScript lookup, preserving any
+        supplied account/mailbox scope. RFC Message-IDs use IMAP when both
+        hints are supplied and credentials are available. An unavailable
+        IMAP route raises an error rather than attempting an unindexed RFC
+        scan or claiming that the message is absent.
 
         Note on identifier semantics: the IMAP path matches against the
         RFC 5322 ``Message-ID`` header (the same form ``search_messages``
         returns when delegated through IMAP). The AppleScript path
         matches Mail.app's internal numeric message id. Callers that
         obtained ``message_id`` from a `search_messages` call should
-        forward the same ``account`` + ``mailbox`` to keep the paths
-        consistent.
+        forward the same ``account`` + ``mailbox`` to preserve its scope.
 
         Args:
             message_id: Message ID. RFC 5322 form for the IMAP path,
@@ -2333,10 +2412,13 @@ class AppleMailConnector:
             date_received, read_status, flagged, content.
 
         Raises:
-            MailMessageNotFoundError: Message not found via either path.
+            MailMessageNotFoundError: The lookup verified that the message is absent.
+            MailAppleScriptError: Message properties could not be read, or
+                an RFC Message-ID cannot be resolved without an unsafe scan.
         """
         if (
-            account is not None
+            not message_id.strip().isdigit()
+            and account is not None
             and mailbox is not None
             and not self._imap_breaker_open(account)
         ):
@@ -2356,6 +2438,11 @@ class AppleMailConnector:
                 self._log_imap_fallback(account, exc)
                 # fall through to AppleScript
 
+        if account is not None or mailbox is not None:
+            return self._get_message_applescript(
+                message_id, include_content, include_attachments,
+                account=account, mailbox=mailbox,
+            )
         return self._get_message_applescript(
             message_id, include_content, include_attachments
         )
@@ -2411,61 +2498,45 @@ class AppleMailConnector:
         message_id: str,
         include_content: bool,
         include_attachments: bool = False,
+        *,
+        account: str | None = None,
+        mailbox: str | None = None,
     ) -> dict[str, Any]:
-        """AppleScript fallback for get_message — iterates account × mailbox.
-
-        Slow on accounts with many mailboxes (see issue #72). Callers
-        with a known account+mailbox should provide them to take the
-        IMAP path instead.
-        """
-        self._reject_rfc_id_scan(message_id)
-        # Accept either the numeric AppleScript id or the RFC Message-ID that
-        # the IMAP read path emits, so a search-result id resolves regardless
-        # of which path produced it (issue F2).
-        id_match_clause = _message_id_match_clause(message_id)
-
+        """Read a numeric Mail ID, keeping any supplied account/mailbox scope."""
+        try:
+            self._reject_rfc_id_scan(message_id)
+        except MailMessageNotFoundError as exc:
+            # Refusing an unsafe scan does not prove that the message is absent.
+            raise MailAppleScriptError(str(exc)) from exc
+        lookup = _message_lookup_applescript(message_id, account, mailbox)
         content_clause = (
             'set msgContent to content of msg'
             if include_content
             else 'set msgContent to ""'
         )
-
-        if include_attachments:
-            attachments_clause = '''
-                        set attList to {}
-                        repeat with att in mail attachments of msg
-                            set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                            set end of attList to attRecord
-                        end repeat
-'''
-            attachments_field = ", |attachments|:attList"
-        else:
-            attachments_clause = ""
-            attachments_field = ""
-
+        attachments_clause = (
+            "set attList to my readAttachmentMetadata(msg)"
+            if include_attachments else ""
+        )
+        attachments_field = ", |attachments|:attList" if include_attachments else ""
         tell_body = f'''
         tell application "Mail"
-            set resultData to missing value
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set msg to first message of mb whose ({id_match_clause})
-                        {content_clause}
-{attachments_clause}
-                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent{attachments_field}}}
-                        exit repeat
-                    end try
-                end repeat
-                if resultData is not missing value then exit repeat
-            end repeat
-
-            if resultData is missing value then
-                error "Can't get message: not found"
-            end if
+{lookup}
+            {attachments_clause}
+            try
+                {content_clause}
+                set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent{attachments_field}}}
+            on error number errNum
+                error "MAIL_READ_FAILED: message properties; AppleScript error " & (errNum as text)
+            end try
         end tell
         '''
-
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = _wrap_as_json_script(
+            tell_body, timeout=self.timeout,
+            handlers=_MAILBOX_RESOLVER_HANDLERS + (
+                _ATTACHMENT_METADATA_HANDLERS if include_attachments else ""
+            ),
+        )
         result = self._run_applescript(script)
         return cast(dict[str, Any], parse_applescript_json(result))
 
@@ -2566,8 +2637,9 @@ class AppleMailConnector:
         """
         Get list of attachments from a message.
 
-        Tries the IMAP path first when both ``account`` and ``mailbox``
-        are supplied AND the account has a Keychain entry — one
+        Numeric Mail IDs use the scoped AppleScript lookup. RFC IDs try
+        IMAP first when both ``account`` and ``mailbox`` are supplied
+        AND the account has a Keychain entry — one
         BODYSTRUCTURE FETCH instead of an account×mailbox AppleScript
         scan plus per-attachment property reads. Falls back to AppleScript
         on any IMAP failure per the graceful-degradation invariants in
@@ -2606,7 +2678,8 @@ class AppleMailConnector:
             MailMessageNotFoundError: Message not found via either path.
         """
         if (
-            account is not None
+            not message_id.strip().isdigit()
+            and account is not None
             and mailbox is not None
             and not self._imap_breaker_open(account)
         ):
@@ -2622,6 +2695,10 @@ class AppleMailConnector:
                 self._log_imap_fallback(account, exc)
                 # fall through to AppleScript
 
+        if account is not None or mailbox is not None:
+            return self._get_attachments_applescript(
+                message_id, account=account, mailbox=mailbox,
+            )
         return self._get_attachments_applescript(message_id)
 
     def _imap_get_attachments(
@@ -2814,47 +2891,22 @@ class AppleMailConnector:
             )
 
     def _get_attachments_applescript(
-        self, message_id: str
+        self, message_id: str, *,
+        account: str | None = None, mailbox: str | None = None,
     ) -> list[dict[str, Any]]:
-        """AppleScript fallback for get_attachments — iterates account ×
-        mailbox to locate the message, then enumerates attachments via
-        Mail.app's model layer. Slow on accounts with many mailboxes;
-        also subject to known silent-failure cases (see issue #73).
-        Callers with a known account+mailbox should provide them to take
-        the IMAP path instead.
-        """
+        """Read all attachment metadata, failing explicitly if any read fails."""
         self._reject_rfc_id_scan(message_id)
-        # Accept either the numeric AppleScript id or the RFC Message-ID from
-        # the IMAP read path so a search-result id resolves either way (F2).
-        id_match_clause = _message_id_match_clause(message_id)
-
+        lookup = _message_lookup_applescript(message_id, account, mailbox)
         tell_body = f'''
         tell application "Mail"
-            set resultData to missing value
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set msg to first message of mb whose ({id_match_clause})
-                        set attList to mail attachments of msg
-
-                        set resultData to {{}}
-                        repeat with att in attList
-                            set attRecord to {{|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}}
-                            set end of resultData to attRecord
-                        end repeat
-                        exit repeat
-                    end try
-                end repeat
-                if resultData is not missing value then exit repeat
-            end repeat
-
-            if resultData is missing value then
-                error "Can't get message: not found"
-            end if
+{lookup}
+            set resultData to my readAttachmentMetadata(msg)
         end tell
         '''
-
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = _wrap_as_json_script(
+            tell_body, timeout=self.timeout,
+            handlers=_MAILBOX_RESOLVER_HANDLERS + _ATTACHMENT_METADATA_HANDLERS,
+        )
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
@@ -4800,12 +4852,7 @@ class AppleMailConnector:
         )
 
         if include_attachments:
-            attachments_clause = '''
-                set attList to {}
-                repeat with att in mail attachments of msg
-                    set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                    set end of attList to attRecord
-                end repeat'''
+            attachments_clause = "\n                set attList to my readAttachmentMetadata(msg)"
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
@@ -4823,7 +4870,10 @@ class AppleMailConnector:
         end tell
         """
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = _wrap_as_json_script(
+            tell_body, timeout=self.timeout,
+            handlers=_ATTACHMENT_METADATA_HANDLERS if include_attachments else "",
+        )
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 

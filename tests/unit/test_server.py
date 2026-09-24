@@ -1594,6 +1594,20 @@ class TestGetMessages:
         assert result["success"] is True
         assert [m["id"] for m in result["messages"]] == ["good"]
 
+    def test_attachment_read_failure_is_not_successful_absence(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail.get_message.side_effect = MailAppleScriptError(
+            "Message read failed at attachment MIME type (AppleScript -10000)"
+        )
+
+        result = get_messages(["123"], include_content=False, include_attachments=True)
+
+        assert result["success"] is False
+        assert "attachment MIME type" in result["error"]
+        assert result["error_type"] == "applescript_error"
+        assert "count" not in result
+
     def test_imap_hint_params_pass_through_per_id(
         self, mock_mail: MagicMock
     ) -> None:

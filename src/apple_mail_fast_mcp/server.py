@@ -1381,11 +1381,11 @@ def get_messages(
         include_content: Include message bodies (default: True).
         headers_only: Skip body fetch on the IMAP path for explicit ids
             (default: False). Silently ignored on the AppleScript fallback.
-        account: Mail.app account name. Together with ``mailbox``, activates
-            the IMAP fast path for explicit ids: one round-trip lookup
-            instead of an account×mailbox AppleScript scan (issue #72).
+        account: Mail.app account name or UUID. Restricts numeric-ID
+            AppleScript lookup. Together with ``mailbox``, enables the
+            IMAP fast path for RFC Message-IDs.
             Ignored for the ``"SELECTED"`` sentinel (selection is global).
-        mailbox: Folder to look in for the IMAP fast path (e.g. "INBOX").
+        mailbox: Folder to search on either path (e.g. "INBOX").
         include_attachments: Include per-attachment metadata (name,
             mime_type, size, downloaded) on each message (default: True).
             Bounded cost — id-list cardinality is typically 1-10. Free on
@@ -1404,6 +1404,8 @@ def get_messages(
     Returns:
         Dictionary containing the list of messages and count. Each message
         includes ``to`` and ``cc`` (recipient strings) on the IMAP path.
+        Failed AppleScript reads return ``success: False`` with
+        ``error_type: "applescript_error"``; they are not missing messages.
         Each message body is bounded to 1 MB of UTF-8 text (override via
         ``APPLE_MAIL_MCP_MAX_BODY_BYTES``) and scrubbed of transport-hostile
         characters so a large or malformed body can't crash the server
@@ -1462,6 +1464,13 @@ def get_messages(
         # include_content=False — sender/subject are attacker-controlled too).
         return _mark_untrusted(response, bool(messages))
 
+    except MailAppleScriptError as e:
+        logger.error(f"Error reading messages through AppleScript: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "applescript_error",
+        }
     except Exception as e:
         logger.error(f"Error getting messages: {e}")
         return {
