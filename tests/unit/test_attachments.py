@@ -76,7 +76,8 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
-        assert "|name|:(name of att)" in script
+        assert "|name|:attachmentName" in script
+        assert "set attachmentName to name of attachmentRef" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_script_quotes_size_key(
@@ -90,8 +91,9 @@ class TestGetAttachments:
         mock_run.return_value = "[]"
         connector.get_attachments("msg-1")
         script = mock_run.call_args[0][0]
-        assert "|size|:(file size of att)" in script
-        assert ", size:(file size of att)" not in script
+        assert "|size|:attachmentSize" in script
+        assert "set attachmentSize to file size of attachmentRef" in script
+        assert ", size:" not in script
 
 
 class TestSaveAttachments:
@@ -517,6 +519,28 @@ class TestGetAttachmentContent:
         with pytest.raises(MailAttachmentTooLargeError):
             connector.get_attachment_content("12345", 0)
         assert save_calls == [], "must not save when over the inline cap"
+
+    @pytest.mark.parametrize("size,over_limit", [(3, False), (100, True)])
+    def test_unknown_mime_keeps_binary_fallback_and_size_limit(self, size, over_limit):
+        from apple_mail_fast_mcp.exceptions import MailAttachmentTooLargeError
+        connector = AppleMailConnector(timeout=30, max_inline_attachment_bytes=10)
+        metadata = [{"name": "unknown.bin", "size": size, "downloaded": True,
+                     "metadata_warnings": [{"field": "mime_type", "error_code": -10000}]}]
+
+        def fake_save(message_id, one_based_index, dest_path):
+            Path(dest_path).write_bytes(b"abc")
+
+        with patch.object(connector, "_get_attachments_applescript", return_value=metadata), patch.object(
+            connector, "_save_one_attachment_applescript", side_effect=fake_save,
+        ) as save:
+            if over_limit:
+                with pytest.raises(MailAttachmentTooLargeError):
+                    connector.get_attachment_content("123", 0)
+                save.assert_not_called()
+            else:
+                result = connector.get_attachment_content("123", 0)
+                assert result["mime_type"] == "application/octet-stream"
+                assert result["payload"] == b"abc"
 
     @patch.object(AppleMailConnector, "_get_attachments_applescript")
     def test_applescript_index_out_of_range_raises(self, mock_meta, connector):
