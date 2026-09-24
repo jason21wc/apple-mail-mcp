@@ -1,5 +1,6 @@
 """Read failures must not masquerade as missing messages or attachments."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -134,3 +135,37 @@ def test_attachment_readers_share_explicit_failure_handling(
     for stage in ("enumeration", "name", "MIME type", "file size", "downloaded"):
         assert f'"attachment {stage}"' in script
     assert "error errMsg" not in script  # Do not disclose message content via errors.
+
+
+def test_optional_mime_failure_is_narrow_and_explicit(connector: AppleMailConnector) -> None:
+    with patch.object(connector, "_run_applescript", return_value="[]") as run:
+        connector._get_attachments_applescript("123")
+    script = run.call_args.args[0]
+    assert "if mimeErrorNumber is not -10000 and mimeErrorNumber is not -1728" in script
+    assert '|metadata_warnings|:{{|field|:"mime_type", |error_code|:mimeErrorNumber}}' in script
+    assert "application/octet-stream" not in script  # Metadata must not guess a type.
+
+
+@pytest.mark.parametrize("operation", ["message", "search", "attachments", "selection"])
+def test_unavailable_mime_keeps_rows_order_and_warning(
+    connector: AppleMailConnector, operation: str,
+) -> None:
+    attachments = [
+        {"name": "first.pdf", "mime_type": "application/pdf", "size": 5, "downloaded": True},
+        {"name": "middle.bin", "size": 7, "downloaded": False,
+         "metadata_warnings": [{"field": "mime_type", "error_code": -10000}]},
+        {"name": "last.png", "mime_type": "image/png", "size": 9, "downloaded": True},
+    ]
+    row = {"id": "123", "attachments": attachments}
+    payload = attachments if operation == "attachments" else row if operation == "message" else [row]
+    with patch.object(connector, "_run_applescript", return_value=json.dumps(payload)):
+        if operation == "message":
+            result = connector._get_message_applescript("123", False, True)["attachments"]
+        elif operation == "search":
+            result = connector._search_messages_applescript("iCloud", "INBOX", include_attachments=True)[0]["attachments"]
+        elif operation == "selection":
+            result = connector.get_selected_messages(False, True)[0]["attachments"]
+        else:
+            result = connector._get_attachments_applescript("123")
+    assert result == attachments
+    assert "mime_type" not in result[1]

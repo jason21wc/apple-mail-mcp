@@ -297,6 +297,18 @@ async def test_attachment_read_failure_survives_mcp_dispatch(mock_mail: MagicMoc
     assert "count" not in result.structured_content
 
 
+async def test_unavailable_attachment_mime_survives_mcp_dispatch(mock_mail: MagicMock) -> None:
+    attachment = {"name": "report.pdf", "size": 42, "downloaded": True,
+                  "metadata_warnings": [{"field": "mime_type", "error_code": -10000}]}
+    mock_mail.get_message.return_value = {"id": "123", "attachments": [attachment]}
+    result = await server.mcp.call_tool(
+        "get_messages", {"message_ids": ["123"], "include_content": False}
+    )
+    assert result.structured_content["success"] is True
+    assert result.structured_content["count"] == 1
+    assert result.structured_content["messages"][0]["attachments"] == [attachment]
+
+
 class TestStringifiedParamCoercion:
     """#309: some MCP hosts (e.g. Cowork) serialize every tool argument as a
     string, so array/dict params arrive as JSON strings. The tool layer

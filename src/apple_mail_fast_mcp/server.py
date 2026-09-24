@@ -1388,6 +1388,8 @@ def get_messages(
         mailbox: Folder to search on either path (e.g. "INBOX").
         include_attachments: Include per-attachment metadata (name,
             mime_type, size, downloaded) on each message (default: True).
+            If Mail cannot provide MIME type, that field is omitted and
+            the attachment includes metadata_warnings with field/error_code.
             Bounded cost — id-list cardinality is typically 1-10. Free on
             the IMAP fast path; cheap-enough on the AppleScript fallback
             for typical id counts.

@@ -633,9 +633,15 @@ _ATTACHMENT_METADATA_HANDLERS = '''using terms from application "Mail"
                     if attachmentName is missing value then error number -1728
                     set attachmentName to attachmentName as text
                     set readStage to "attachment MIME type"
-                    set attachmentType to MIME type of attachmentRef
-                    if attachmentType is missing value then error number -1728
-                    set attachmentType to attachmentType as text
+                    set mimeErrorNumber to 0
+                    try
+                        set attachmentType to MIME type of attachmentRef
+                        if attachmentType is missing value then error number -1728
+                        set attachmentType to attachmentType as text
+                        if attachmentType is "" then error number -1728
+                    on error number mimeErrorNumber
+                        if mimeErrorNumber is not -10000 and mimeErrorNumber is not -1728 then error number mimeErrorNumber
+                    end try
                     set readStage to "attachment file size"
                     set attachmentSize to file size of attachmentRef
                     if attachmentSize is missing value then error number -1728
@@ -644,7 +650,11 @@ _ATTACHMENT_METADATA_HANDLERS = '''using terms from application "Mail"
                     set attachmentDownloaded to downloaded of attachmentRef
                     if attachmentDownloaded is missing value then error number -1728
                     set attachmentDownloaded to attachmentDownloaded as boolean
-                    set end of attachmentRecords to {|name|:attachmentName, |mime_type|:attachmentType, |size|:attachmentSize, |downloaded|:attachmentDownloaded}
+                    if mimeErrorNumber is 0 then
+                        set end of attachmentRecords to {|name|:attachmentName, |mime_type|:attachmentType, |size|:attachmentSize, |downloaded|:attachmentDownloaded}
+                    else
+                        set end of attachmentRecords to {|name|:attachmentName, |size|:attachmentSize, |downloaded|:attachmentDownloaded, |metadata_warnings|:{{|field|:"mime_type", |error_code|:mimeErrorNumber}}}
+                    end if
                 end repeat
             end tell
         on error number errNum
@@ -2672,7 +2682,9 @@ class AppleMailConnector:
 
         Returns:
             List of attachment dicts with keys ``name`` (str),
-            ``mime_type`` (str), ``size`` (int), ``downloaded`` (bool).
+            ``size`` (int), ``downloaded`` (bool), and ``mime_type`` (str)
+            when available. If Mail cannot provide MIME type, the field
+            is omitted and ``metadata_warnings`` identifies the field/error.
 
         Raises:
             MailMessageNotFoundError: Message not found via either path.
