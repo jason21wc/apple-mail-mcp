@@ -168,7 +168,7 @@ Retrieve full details of one or more messages, with bodies. Returns a list (alwa
 | `include_attachments` | boolean | No | true | When true, each message gains an `attachments: [{name, mime_type, size, downloaded}]` field. Default on for `get_messages` because id-list cardinality is bounded (typically 1-10) — cost is acceptable on both paths. |
 
 **Notes:**
-- Genuinely missing ids drop out silently — the response contains whatever was found (partial-results convention). A failed read is an error, not evidence that the message is absent. AppleScript attachment/read failures return `success: false`, `error_type: "applescript_error"`.
+- Genuinely missing ids are listed in `not_found`, present only when an id is absent; `messages` contains whatever was found (partial-results convention). A failed read is an error, not evidence that the message is absent. AppleScript attachment/read failures return `success: false`, `error_type: "applescript_error"`.
 - Numeric Mail IDs use indexed AppleScript lookup even when IMAP is configured. RFC Message-IDs use IMAP with account/mailbox hints; an unavailable IMAP path must not start an unindexed all-message scan.
 - If Mail cannot provide an attachment's MIME type (`-10000`, `-1728`, or a missing/empty value), that attachment remains in its original position with `name`, `size`, and `downloaded`. Its `mime_type` is omitted and `metadata_warnings: [{"field": "mime_type", "error_code": ...}]` explains the missing field. This also applies to attachment metadata returned by search and selection. Other read failures still return an error; no MIME type is guessed from the filename.
 - The `"SELECTED"` sentinel is resolved server-side via `mail.get_selected_messages()` at call time. Empty selection expands to nothing.
