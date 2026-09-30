@@ -4,14 +4,31 @@
 
 | Level | Command | Purpose |
 |-------|---------|---------|
-| Unit | `make test` | Python logic with mocked AppleScript (~1s) — **in CI** |
+| Unit | `make test` | Python logic with mocked I/O — **in CI** |
+| Quick smoke | `make smoke` | Every registered MCP tool through FastMCP dispatch, with mail I/O mocked and temporary local storage |
 | Integration | `make test-integration` | Real Mail.app operations — local only |
 | E2E | `make test-e2e` | FastMCP dispatch layer — local only |
 | Benchmarks | `make benchmark` | Performance regression detection (opt-in) — see [BENCHMARKING.md](BENCHMARKING.md) |
 | Blind agent eval | (see below) | Whether models can use the tools from descriptions alone — see [`evals/agent_tool_usability/`](../../evals/agent_tool_usability/) |
 
-**CI runs unit tests only.** Integration / e2e / benchmark tests need real Mail.app (and, for some,
-IMAP credentials), so CI can't run them — they're manual. See **Manual e2e policy** below.
+**CI currently runs unit tests only.** Integration and benchmark tests require real Mail.app
+and, for some paths, IMAP credentials. The smoke suite does not require either. The stdio
+E2E check also avoids mail access but requires `ai-governance-proxy` on PATH; it skips
+explicitly if that executable is unavailable. See **Manual e2e policy** below.
+
+### Quick functional check
+
+Run `make smoke` after setup or changes. It asserts that every registered tool has a
+successful invocation case, checks selected typed failures, and verifies that missing
+confirmation cannot delete a message or template. Template save/read/render/delete
+uses real files under pytest's temporary directory. All Mail connector calls are mocked;
+the suite does not read credentials, send mail, or change Mail.app data.
+
+This checks API wiring and selected behavior, not every input combination or live provider
+behavior. For transport startup, also run `make test-e2e`. For IMAP/AppleScript correctness,
+use reviewed, operation-specific integration fixtures with an explicit dedicated account;
+do not interpret a passing smoke suite as permission to run the full integration suite on
+a personal mailbox. Mutation fixtures must verify cleanup as well as the operation.
 
 ### E2E Scope
 
@@ -22,7 +39,7 @@ IMAP credentials), so CI can't run them — they're manual. See **Manual e2e pol
 
 ### Manual e2e policy
 
-CI does not run e2e (it needs Mail.app). **If your PR touches IMAP or AppleScript code paths** —
+CI does not currently run e2e. **If your PR touches IMAP or AppleScript code paths** —
 `imap_connector.py`, `mail_connector.py` AppleScript bodies/wrappers, or any tool gated by
 `_elicit_confirmation` — run `make test-e2e` (and, where relevant, `make test-integration`) **before
 pushing**. A stale e2e failure on `main` is only caught by someone running it locally. `make

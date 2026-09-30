@@ -1,4 +1,4 @@
-.PHONY: help install dev test test-unit test-integration test-e2e test-verbose lint format typecheck complexity audit check-all coverage clean eval-descriptions eval-tools
+.PHONY: help install dev test test-unit test-integration test-e2e smoke test-verbose lint format typecheck complexity audit check-all coverage clean eval-descriptions eval-tools
 
 help:
 	@echo "Available targets:"
@@ -8,6 +8,7 @@ help:
 	@echo "  make test-unit        - Run unit tests only"
 	@echo "  make test-integration - Run integration tests (requires Mail.app)"
 	@echo "  make test-e2e         - Run end-to-end tests"
+	@echo "  make smoke            - Check every MCP tool offline; no Mail.app or credentials"
 	@echo "  make test-verbose     - Run tests with verbose output"
 	@echo "  make lint             - Run ruff linter"
 	@echo "  make format           - Run ruff formatter"
@@ -35,6 +36,9 @@ test-integration:
 
 test-e2e:
 	MAIL_TEST_MODE=true uv run pytest tests/e2e/ -v
+
+smoke:
+	uv run pytest tests/e2e/test_mcp_tools.py -q
 
 benchmark:
 	MAIL_TEST_MODE=true uv run pytest tests/benchmarks/ --run-benchmark -v -s

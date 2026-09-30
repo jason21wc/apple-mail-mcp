@@ -4,9 +4,9 @@ These tests exercise the full FastMCP dispatch layer in-process: they
 enumerate tools via mcp.list_tools() and invoke them via mcp.call_tool().
 The mail connector is mocked; no AppleScript runs.
 
-MAIL_TEST_MODE is disabled per-test so the safety gate does not interfere
-with mocked dispatch. These tests verify MCP wiring, not safety behavior
-(safety is covered by tests/unit/test_security.py).
+MAIL_TEST_MODE is disabled per-test so the account safety gate does not
+interfere with mocked dispatch. Selected confirmation refusals are exercised
+here; comprehensive safety tests live in tests/unit/test_security.py.
 """
 
 from __future__ import annotations
@@ -18,7 +18,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from apple_mail_fast_mcp import server
-from apple_mail_fast_mcp.exceptions import MailAppleScriptError
+from apple_mail_fast_mcp.exceptions import (
+    MailAppleScriptError,
+    MailDraftError,
+    MailMessageNotFoundError,
+)
+from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+from apple_mail_fast_mcp.templates import Template, TemplateStore
 
 pytestmark = pytest.mark.e2e
 
@@ -58,18 +64,19 @@ EXPECTED_TOOLS = {
 
 
 @pytest.fixture(autouse=True)
-def _disable_test_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def _disable_test_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Disable MAIL_TEST_MODE so the safety gate does not interfere.
 
     The connector is mocked, so destructive operations cannot reach Mail.app.
     """
     monkeypatch.setenv("MAIL_TEST_MODE", "false")
+    monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def mock_mail(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """Replace the module-level mail connector with a MagicMock."""
-    mock = MagicMock()
+    """Isolate every test, including future tests that omit an explicit fixture argument."""
+    mock = MagicMock(spec=AppleMailConnector)
     monkeypatch.setattr(server, "mail", mock)
     return mock
 
@@ -81,6 +88,10 @@ class TestToolRegistration:
         tools = await server.mcp.list_tools()
         names = {t.name for t in tools}
         assert names == EXPECTED_TOOLS
+
+    async def test_every_registered_tool_has_an_invocation_case(self) -> None:
+        names = {t.name for t in await server.mcp.list_tools()}
+        assert {case[0] for case in INVOCATION_CASES} == names
 
     async def test_every_tool_has_description(self) -> None:
         tools = await server.mcp.list_tools()
@@ -124,7 +135,7 @@ _TMP_FILE = "__TMP_FILE__"
 
 
 # (tool_name, call_args, connector_method, connector_return_value)
-INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
+INVOCATION_CASES: list[tuple[str, dict[str, Any], str | None, Any]] = [
     (
         "list_accounts",
         {},
@@ -222,6 +233,22 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
         "delete_messages",
         1,
     ),
+    ("get_attachment_content", {"message_id": "msg-1", "attachment_index": 0},
+     "get_attachment_content",
+     {"payload": b"hello", "mime_type": "text/plain", "name": "note.txt", "size": 5}),
+    ("update_draft", {"draft_id": "old-1", "subject": "updated", "attachment_paths": []},
+     "create_draft", {"draft_id": "new-1", "sent_message_id": ""}),
+    ("create_rule", {"name": "Smoke", "conditions": [
+        {"field": "from", "operator": "contains", "value": "example.com"}],
+        "actions": {"mark_as_read": True}}, "create_rule", 1),
+    ("update_rule", {"rule_index": 1, "enabled": False}, "update_rule", True),
+    ("delete_rule", {"rule_index": 1}, "delete_rule", True),
+    # These use a real TemplateStore under tmp_path, rather than a mocked store.
+    ("list_templates", {}, None, None),
+    ("get_template", {"name": "smoke"}, None, None),
+    ("save_template", {"name": "new", "body": "Hi {person}"}, None, None),
+    ("render_template", {"name": "smoke", "vars": {"person": "Ada"}}, None, None),
+    ("delete_template", {"name": "smoke"}, None, None),
 ]
 
 
@@ -256,7 +283,7 @@ class TestToolInvocation:
         tmp_path: Path,
         tool_name: str,
         call_args: dict[str, Any],
-        connector_method: str,
+        connector_method: str | None,
         connector_return: Any,
     ) -> None:
         # Materialize tmp_path-dependent sentinels. save_attachments requires
@@ -275,14 +302,78 @@ class TestToolInvocation:
             else:
                 resolved_args[key] = value
 
-        getattr(mock_mail, connector_method).return_value = connector_return
+        mock_mail.list_rules.return_value = [{"index": 1, "name": "Smoke", "enabled": True}]
+        mock_mail.get_draft_state.return_value = {
+            "to": ["a@example.com"], "subject": "original", "body": "body",
+            "from_account": "TestAccount", "content_type": "text/plain",
+        }
+        mock_mail.auto_template_vars.return_value = {}
+        if connector_method is not None:
+            getattr(mock_mail, connector_method).return_value = connector_return
+        else:
+            TemplateStore().save(Template("smoke", "Hello {person}", "Hi {person}\n"))
 
         result = await server.mcp.call_tool(tool_name, resolved_args)
 
         assert result.structured_content is not None
         assert result.structured_content["success"] is True
         assert "error" not in result.structured_content
-        getattr(mock_mail, connector_method).assert_called_once()
+        if connector_method is not None:
+            getattr(mock_mail, connector_method).assert_called_once()
+        if tool_name == "get_attachment_content":
+            assert result.structured_content["content"] == "hello"
+            assert result.structured_content["encoding"] == "text"
+        elif tool_name == "update_draft":
+            assert result.structured_content["draft_id"] == "new-1"
+            mock_mail.delete_draft.assert_called_once_with("old-1")
+        elif tool_name == "list_templates":
+            assert result.structured_content["templates"] == [
+                {"name": "smoke", "subject": "Hello {person}"}]
+        elif tool_name == "get_template":
+            assert result.structured_content["body"] == "Hi {person}\n"
+        elif tool_name == "render_template":
+            assert result.structured_content["subject"] == "Hello Ada"
+            assert result.structured_content["body"] == "Hi Ada\n"
+        elif tool_name == "save_template":
+            assert TemplateStore().get("new").body == "Hi {person}\n"
+        elif tool_name == "delete_template":
+            assert TemplateStore().list() == []
+
+
+@pytest.mark.parametrize("tool_name,args,method,error,error_type", [
+    ("create_draft", {"to": ["a@example.com"], "subject": "smoke"},
+     "create_draft", MailDraftError("unavailable"), "draft_error"),
+    ("get_attachment_content", {"message_id": "missing", "attachment_index": 0},
+     "get_attachment_content", MailMessageNotFoundError("missing"), "message_not_found"),
+])
+async def test_backend_failure_is_structured(mock_mail, tool_name, args, method, error, error_type):
+    getattr(mock_mail, method).side_effect = error
+    result = await server.mcp.call_tool(tool_name, args)
+    assert result.structured_content["success"] is False
+    assert result.structured_content["error_type"] == error_type
+    assert result.structured_content["error"]
+
+
+async def test_template_lifecycle_preserves_data_on_refused_operations(mock_mail):
+    """Real files and real confirmation behavior; no MCP session can approve deletion."""
+    async def call(name, args):
+        return (await server.mcp.call_tool(name, args)).structured_content
+
+    assert (await call("save_template", {"name": "smoke", "body": "Hi {person}"}))["success"]
+    rejected = await call("save_template", {"name": "smoke", "body": "replacement"})
+    assert rejected["error_type"] == "already_exists"
+    mock_mail.auto_template_vars.return_value = {}
+    missing = await call("render_template", {"name": "smoke"})
+    assert missing["success"] is False
+    blocked = await call("delete_template", {"name": "smoke"})
+    assert blocked["error_type"] == "confirmation_required"
+    assert (await call("get_template", {"name": "smoke"}))["body"] == "Hi {person}\n"
+
+
+async def test_delete_messages_cannot_mutate_without_confirmation(mock_mail):
+    result = await server.mcp.call_tool("delete_messages", {"message_ids": ["msg-1"]})
+    assert result.structured_content["error_type"] == "confirmation_required"
+    mock_mail.delete_messages.assert_not_called()
 
 
 async def test_attachment_read_failure_survives_mcp_dispatch(mock_mail: MagicMock) -> None:
