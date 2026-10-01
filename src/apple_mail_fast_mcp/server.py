@@ -1371,6 +1371,8 @@ def search_messages(
             response["warnings"] = warnings
         return _mark_untrusted(response, bool(messages))
 
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except (MailAccountNotFoundError, MailMailboxNotFoundError) as e:
         logger.error(f"Not found error: {e}")
         return {

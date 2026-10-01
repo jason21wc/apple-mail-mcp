@@ -221,3 +221,71 @@ def test_quoted_last_range_cannot_allow_extra_eof_literal():
     with pytest.raises(MailRawMessageLimitError):
         fetch_bounded_message(client, 7, budget=6, chunk_size=2, transfer=transfer)
     assert transfer.remaining == 0
+
+
+def section_backend(body):
+    client = backend(body)
+    original = client.fetch.side_effect
+    def fetch(uids, keys):
+        key = keys[0]
+        section = key.split(b"[", 1)[1].split(b"]", 1)[0]
+        rows = original(uids, [key.replace(b"[" + section + b"]", b"[]")])
+        return {uid: {k.replace(b"[]", b"[" + section + b"]"): v for k, v in row.items()}
+                for uid, row in rows.items()}
+    client.fetch.side_effect = fetch
+    return client
+
+
+def test_numbered_sections_use_bounded_ranges_and_share_transfer_budget():
+    from apple_mail_fast_mcp.raw_message import LiteralBudget, fetch_bounded_section
+
+    client = section_backend(b"abcdef")
+    budget = LiteralBudget(10)
+    assert fetch_bounded_section(client, 7, "2.1", 6, budget=10, chunk_size=2, transfer=budget) == b"abcdef"
+    assert budget.remaining == 4
+    assert [c.args[1][0] for c in client.fetch.call_args_list] == [
+        b"BODY.PEEK[2.1]<0.2>", b"BODY.PEEK[2.1]<2.2>", b"BODY.PEEK[2.1]<4.2>", b"BODY.PEEK[2.1]<6.1>",
+    ]
+    client.fetch.reset_mock()
+    with pytest.raises(MailRawMessageLimitError):
+        fetch_bounded_section(client, 7, "3", 6, budget=10, transfer=budget)
+    client.fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("advertised", [0, 2, 7])
+def test_selected_section_inaccurate_size_is_an_error(advertised):
+    from apple_mail_fast_mcp.raw_message import LiteralBudget, fetch_bounded_section
+
+    client = section_backend(b"abcdef")
+    with pytest.raises(MailRawMessageReadError):
+        fetch_bounded_section(client, 7, "1", advertised, budget=10, chunk_size=2, transfer=LiteralBudget(10))
+
+
+def test_selected_section_exact_budget_rejects_nonempty_eof_before_read():
+    from apple_mail_fast_mcp.raw_message import LiteralBudget, fetch_bounded_section
+
+    client = section_backend(b"abcdef")
+    with pytest.raises(MailRawMessageLimitError):
+        fetch_bounded_section(client, 7, "1", 5, budget=5, transfer=LiteralBudget(5))
+    client.shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize("section", ["", "0", "1.0", "1.MIME", "1]<0.999>", "1\r\nNOOP"])
+def test_invalid_section_is_rejected_before_fetch(section):
+    from apple_mail_fast_mcp.raw_message import LiteralBudget, fetch_bounded_section
+
+    client = section_backend(b"x")
+    with pytest.raises(ValueError):
+        fetch_bounded_section(client, 7, section, 1, budget=10, transfer=LiteralBudget(10))
+    client.fetch.assert_not_called()
+
+
+def test_quoted_selected_responses_share_the_per_fetch_allowance():
+    from apple_mail_fast_mcp.raw_message import LiteralBudget, guarded_fetch
+
+    client = MagicMock()
+    client._imap = SimpleNamespace(read=MagicMock())
+    client.fetch.return_value = {7: {b"BODY[1]<0>": b"a", b"BODY[2]<0>": b"b"}}
+    with pytest.raises(MailRawMessageLimitError):
+        guarded_fetch(client, 7, [b"BODY.PEEK[1]<0.1>"], 1, LiteralBudget(10))
+    client.shutdown.assert_called_once()

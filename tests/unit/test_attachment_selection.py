@@ -21,11 +21,13 @@ from apple_mail_fast_mcp.imap_connector import _bodystructure_extract_attachment
 
 
 def metadata_leaf(maintype, subtype, filename=None, disposition=None):
-    params = (b"filename", filename.encode()) if filename else ()
-    return (
-        maintype.encode(), subtype.encode(), (), None, None, b"7bit", 0,
-        (disposition.encode(), params) if disposition else None,
-    )
+    params = (b"filename", filename.encode()) if filename else None
+    fields = (maintype.encode(), subtype.encode(), None, None, None, b"7bit", 0)
+    if maintype == "text":
+        fields += (0,)
+    elif (maintype, subtype) == ("message", "rfc822"):
+        fields += ((None,) * 10, metadata_leaf("text", "plain"), 0)
+    return fields + (None, (disposition.encode(), params) if disposition else None)
 
 
 @pytest.fixture
@@ -78,14 +80,14 @@ def paired_message():
     structure = ([
         ([metadata_leaf("text", "html"),
           metadata_leaf("image", "png", "logo.png", "inline"),
-          metadata_leaf("image", "png", disposition="inline")], b"related"),
+          metadata_leaf("image", "png", disposition="inline")], b"related", None, None),
         ([metadata_leaf("text", "plain"),
           ([metadata_leaf("text", "plain"),
             metadata_leaf("application", "pdf", "résumé.pdf", "attachment"),
-            metadata_leaf("application", "octet-stream", disposition="attachment")], b"mixed")], b"alternative"),
+            metadata_leaf("application", "octet-stream", disposition="attachment")], b"mixed", None, None)], b"alternative", None, None),
         metadata_leaf("text", "plain", "notes-世界.txt", "attachment"),
         metadata_leaf("message", "rfc822", "forwarded.eml", "attachment"),
-    ], b"mixed")
+    ], b"mixed", None, None)
     return outer.as_bytes(), expected, structure
 
 

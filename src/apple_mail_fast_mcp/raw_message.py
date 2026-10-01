@@ -8,6 +8,7 @@ when upgrading IMAPClient or Python. Every caller must own the connection lease.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -75,7 +76,7 @@ def guarded_fetch(
     stream.read = limited_read
     try:
         rows = cast(dict[Any, Any], client.fetch([uid], keys))
-        _charge_quoted_bodies(rows, transfer)
+        _charge_quoted_bodies(rows, transfer, remaining)
         return rows
     except (MailRawMessageLimitError, MailRawMessageReadError, IMAPClientError, OSError) as exc:
         # An interrupted literal leaves the stream unsynchronized. Close it
@@ -91,7 +92,7 @@ def guarded_fetch(
         stream.read = original_read
 
 
-def _charge_quoted_bodies(rows: dict[Any, Any], transfer: LiteralBudget) -> None:
+def _charge_quoted_bodies(rows: dict[Any, Any], transfer: LiteralBudget, allowance: int) -> None:
     """Quoted BODY nstrings bypass imaplib.read; count them before another FETCH.
 
     IMAPClient preserves literal byte objects. The dedicated subclass avoids
@@ -106,12 +107,13 @@ def _charge_quoted_bodies(rows: dict[Any, Any], transfer: LiteralBudget) -> None
                 b"RFC822", b"RFC822.TEXT", b"RFC822.HEADER",
             ))
             if is_body and isinstance(value, bytes) and not isinstance(value, _CountedLiteral):
-                if len(value) > transfer.remaining:
-                    raise MailRawMessageLimitError("Quoted IMAP body exceeds the remaining raw-message allowance")
+                if len(value) > min(transfer.remaining, allowance):
+                    raise MailRawMessageLimitError("Quoted IMAP body exceeds the remaining transfer or FETCH allowance")
                 transfer.remaining -= len(value)
+                allowance -= len(value)
 
 
-def _size(client: Any, uid: int, budget: int, transfer: LiteralBudget) -> int:
+def preflight_message_size(client: Any, uid: int, budget: int, transfer: LiteralBudget) -> int:
     rows = guarded_fetch(client, uid, [b"RFC822.SIZE"], 0, transfer)
     entry = rows.get(uid)
     if not isinstance(entry, dict):
@@ -126,13 +128,14 @@ def _size(client: Any, uid: int, budget: int, transfer: LiteralBudget) -> int:
 
 def _chunk(
     client: Any, uid: int, offset: int, count: int, allowance: int, transfer: LiteralBudget,
+    *, section: str = "",
 ) -> bytes:
-    rows = guarded_fetch(client, uid, [f"BODY.PEEK[]<{offset}.{count}>".encode()], allowance, transfer)
+    rows = guarded_fetch(client, uid, [f"BODY.PEEK[{section}]<{offset}.{count}>".encode()], allowance, transfer)
     entry = rows.get(uid)
     if not isinstance(entry, dict):
         raise MailRawMessageReadError("IMAP omitted the selected UID from body retrieval")
     # RFC9051 requires origin even when the range contains the entire message.
-    data = entry.get(f"BODY[]<{offset}>".encode())
+    data = entry.get(f"BODY[{section}]<{offset}>".encode())
     if not isinstance(data, bytes) or len(data) > count:
         raise MailRawMessageReadError("IMAP returned a missing, oversized, or inconsistent body range")
     return data
@@ -152,14 +155,42 @@ def fetch_bounded_message(
     if type(limit) is not int or limit <= 0 or type(chunk_size) is not int or chunk_size <= 0:
         raise ValueError("Raw-message budget and chunk size must be positive integer byte counts")
     transfer = transfer if transfer is not None else LiteralBudget(limit)
-    size = _size(client, uid, limit, transfer)
+    size = preflight_message_size(client, uid, limit, transfer)
+    return _fetch_sized_body(client, uid, "", size, limit, chunk_size, transfer)
+
+
+def fetch_bounded_section(
+    client: Any, uid: int, section: str, encoded_size: int, *,
+    transfer: LiteralBudget, budget: int | None = None, chunk_size: int = RAW_CHUNK_BYTES,
+) -> bytes:
+    """Read an exact numbered part with range/EOF checks and shared allowance.
+
+    Caller must preflight RFC822.SIZE and own the connection lease. This budget
+    limits cumulative transfer, including metadata literals; it is not a RAM cap.
+    """
+    limit = raw_message_budget() if budget is None else budget
+    if not isinstance(section, str) or not re.fullmatch(r"[1-9][0-9]*(?:\.[1-9][0-9]*)*", section):
+        raise ValueError("IMAP section must contain positive numeric part components")
+    if type(encoded_size) is not int or encoded_size < 0:
+        raise MailRawMessageReadError("Selected section has an invalid encoded size")
+    if type(limit) is not int or limit <= 0 or type(chunk_size) is not int or chunk_size <= 0:
+        raise ValueError("Raw-message budget and chunk size must be positive integer byte counts")
+    return _fetch_sized_body(client, uid, section, encoded_size, limit, chunk_size, transfer)
+
+
+def _fetch_sized_body(
+    client: Any, uid: int, section: str, size: int, limit: int,
+    chunk_size: int, transfer: LiteralBudget,
+) -> bytes:
+    if size > min(limit, transfer.remaining):
+        raise MailRawMessageLimitError("Body exceeds the remaining raw-message transfer allowance")
     data = bytearray()
     while len(data) < size:
         count = min(chunk_size, size - len(data))
-        piece = _chunk(client, uid, len(data), count, min(count, limit - len(data)), transfer)
+        piece = _chunk(client, uid, len(data), count, min(count, limit - len(data)), transfer, section=section)
         if len(piece) != count:
-            raise MailRawMessageReadError("IMAP body ended before its advertised RFC822.SIZE")
+            raise MailRawMessageReadError("IMAP body ended before its advertised size")
         data.extend(piece)
-    if _chunk(client, uid, size, 1, min(1, limit - size), transfer):
-        raise MailRawMessageReadError("IMAP body is longer than its advertised RFC822.SIZE")
+    if _chunk(client, uid, size, 1, min(1, limit - size), transfer, section=section):
+        raise MailRawMessageReadError("IMAP body is longer than its advertised size")
     return bytes(data)

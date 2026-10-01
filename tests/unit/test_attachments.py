@@ -9,6 +9,7 @@ from apple_mail_fast_mcp.exceptions import (
     MailMessageNotFoundError,
 )
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+from tests.attachment_fixtures import selected_payloads_from_raw
 
 pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
 
@@ -424,7 +425,7 @@ class TestGetAttachmentContent:
         import contextlib
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)
@@ -434,13 +435,13 @@ class TestGetAttachmentContent:
         assert result["name"] == "notes.txt"
         assert result["mime_type"] == "text/plain"
         assert result["payload"] == b"hello from a text attachment\n"
-        mock_imap.fetch_raw_message.assert_called_once_with("<m@x>", "INBOX")
+        mock_imap.fetch_attachment_payloads.assert_called_once_with("<m@x>", "INBOX", indices=[0])
 
     def test_imap_path_binary_attachment(self, connector, tmp_path):
         import contextlib
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)
@@ -456,7 +457,7 @@ class TestGetAttachmentContent:
         from apple_mail_fast_mcp.exceptions import MailAttachmentIndexError
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)
@@ -472,7 +473,7 @@ class TestGetAttachmentContent:
         connector = AppleMailConnector(timeout=30, max_inline_attachment_bytes=4)
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)

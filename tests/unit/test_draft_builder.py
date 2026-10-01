@@ -521,13 +521,10 @@ def test_forwarded_rfc822_attachment_round_trips_through_build():
 
 
 def test_build_draft_with_empty_rfc822_forward_does_not_raise():
-    """Pins the read->write edge the two halves of this fix jointly create.
+    """An explicitly supplied empty forwarded message remains serializable.
 
-    The read-path guard degrades a non-conformant base64 ``message/rfc822``
-    to ``b""``; if such a tuple is then forwarded, ``build_draft_mime`` runs
-    ``email.message_from_bytes(b"")`` in ``_attach_forwarded``. That is safe
-    today only by stdlib leniency — pin it so a future parser/policy change
-    can't turn a real forward operation into a crash.
+    Malformed encoded messages now fail during extraction. This separate input
+    still exercises the builder's supported handling of an empty .eml payload.
     """
     import email
     from email.policy import default as _pol

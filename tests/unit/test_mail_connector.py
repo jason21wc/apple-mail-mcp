@@ -35,6 +35,7 @@ from apple_mail_fast_mcp.mail_connector import (
     _wrap_as_json_script,
     _wrap_with_timeout,
 )
+from tests.attachment_fixtures import selected_payloads_from_raw
 
 pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
 
@@ -5523,7 +5524,7 @@ def _raw_with_attachments(atts: list[tuple[str, str, bytes]]) -> bytes:
 
 class TestSaveAttachmentsImapFastPath:
     """#371: save_attachments(account, mailbox) uses the IMAP fast path
-    (one fetch_raw_message) instead of the O(accounts × mailboxes)
+    (one fetch_attachment_payloads) instead of the O(accounts × mailboxes)
     AppleScript cross-scan that hangs on Gmail."""
 
     @pytest.fixture
@@ -5557,7 +5558,7 @@ class TestSaveAttachmentsImapFastPath:
             [("offer.pdf", "pdf", b"PDF-OFFER"), ("agreement.pdf", "pdf", b"PDF-AGREE")]
         )
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(mock_imap):
                 stack.enter_context(p)
@@ -5575,8 +5576,8 @@ class TestSaveAttachmentsImapFastPath:
         assert result["saved"] == 2
         assert (tmp_path / "offer.pdf").read_bytes() == b"PDF-OFFER"
         assert (tmp_path / "agreement.pdf").read_bytes() == b"PDF-AGREE"
-        mock_imap.fetch_raw_message.assert_called_once_with(
-            "att-test@example.com", "INBOX"
+        mock_imap.fetch_attachment_payloads.assert_called_once_with(
+            "att-test@example.com", "INBOX", indices=None
         )
 
     def test_imap_path_respects_attachment_indices(
@@ -5586,7 +5587,7 @@ class TestSaveAttachmentsImapFastPath:
 
         raw = _raw_with_attachments([("a.pdf", "pdf", b"AAA"), ("b.pdf", "pdf", b"BBB")])
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(mock_imap):
                 stack.enter_context(p)
@@ -5608,7 +5609,7 @@ class TestSaveAttachmentsImapFastPath:
         import contextlib
 
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.side_effect = OSError("conn reset")
+        mock_imap.fetch_attachment_payloads.side_effect = OSError("conn reset")
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(mock_imap):
                 stack.enter_context(p)
@@ -5633,7 +5634,7 @@ class TestSaveAttachmentsImapFastPath:
 
         raw = _raw_with_attachments([("big.bin", "octet-stream", b"x" * 100)])
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         connector.max_attachment_bytes = 10  # tiny cap
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(mock_imap):

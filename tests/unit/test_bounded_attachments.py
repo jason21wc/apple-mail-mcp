@@ -7,6 +7,7 @@ import pytest
 from apple_mail_fast_mcp import draft_builder, server
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
 from apple_mail_fast_mcp.raw_message import MailRawMessageLimitError, MailRawMessageReadError
+from tests.attachment_fixtures import selected_payloads_from_raw
 
 
 @pytest.fixture
@@ -30,6 +31,7 @@ def connector(monkeypatch, raw):
     monkeypatch.setattr(connector, "_run_applescript", MagicMock())
     with patch("apple_mail_fast_mcp.mail_connector.ImapConnector") as imap:
         imap.return_value.fetch_raw_message.return_value = raw
+        imap.return_value.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         imap.return_value.fetch_raw_draft.return_value = raw
         yield connector, imap.return_value
 
@@ -77,6 +79,7 @@ def test_empty_save_selection_decodes_nothing(connector, tmp_path, indices):
 def test_raw_failure_never_reaches_native_or_decode(connector, tmp_path, failure, operation):
     connector, imap = connector
     imap.fetch_raw_message.side_effect = failure
+    imap.fetch_attachment_payloads.side_effect = failure
     imap.fetch_raw_draft.side_effect = failure
     with patch.object(draft_builder, "_attachment_payload_bytes") as decode:
         with pytest.raises(type(failure)) as caught:
@@ -191,7 +194,7 @@ def test_named_save_keeps_no_clobber_and_selected_payload(connector, monkeypatch
 
 def test_predispatch_transport_failure_keeps_native_fallback(connector, monkeypatch):
     connector, imap = connector
-    imap.fetch_raw_message.side_effect = OSError("connection failed before retrieval")
+    imap.fetch_attachment_payloads.side_effect = OSError("connection failed before retrieval")
     native = MagicMock(return_value={"payload": b"fixture"})
     monkeypatch.setattr(connector, "_get_attachment_content_applescript", native)
     assert connector.get_attachment_content("fixture@example.test", 0, account="Fixture", mailbox="INBOX") == {"payload": b"fixture"}

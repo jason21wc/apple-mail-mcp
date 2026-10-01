@@ -41,7 +41,8 @@ from imapclient import DRAFT, IMAPClient
 from imapclient.exceptions import IMAPClientError, LoginError
 from imapclient.response_types import Envelope
 
-from .draft_builder import ForwardedAttachment, extract_attachment_payloads
+from .attachment_parts import decode_attachment_part, describe_attachment_parts
+from .draft_builder import ForwardedAttachment, count_attachment_parts, extract_attachment_payloads
 from .exceptions import (
     MailAnchorProbeIncompleteError,
     MailImapMoveUnsupportedError,
@@ -55,7 +56,9 @@ from .raw_message import (
     MailRawMessageLimitError,
     MailRawMessageReadError,
     fetch_bounded_message,
+    fetch_bounded_section,
     guarded_fetch,
+    preflight_message_size,
     raw_message_budget,
 )
 from .utils import parse_rfc822_ids
@@ -631,189 +634,67 @@ def _format_address_list(addrs: Any) -> str:
     return ", ".join(x for x in formatted if x)
 
 
-def _bodystructure_extract_attachments(
-    structure: Any,
-) -> list[dict[str, Any]]:
-    """Walk a BODYSTRUCTURE tuple and emit attachment metadata.
-
-    A part counts as an attachment if any of:
-    - Its disposition is ``attachment``.
-    - Its disposition is ``inline`` AND it has a ``filename`` param.
-    - It's a ``message/rfc822`` part (forwarded email — conventionally
-      an attachment per RFC 2046 §5.2.1, and the case Mail.app's
-      AppleScript surface sometimes silently drops).
-
-    Returns dicts with keys: ``name``, ``mime_type``, ``size``,
-    ``downloaded``. ``downloaded`` is always False on the IMAP path —
-    BODYSTRUCTURE returns metadata only, not body bytes, and Mail.app's
-    local cache state isn't observable from the protocol. Callers that
-    need the bytes invoke ``save_attachments`` (which fetches on demand).
-
-    The byte-fetch path (``get_attachment_content`` / ``save_attachments``)
-    indexes into this list by position, so its enumerator
-    (``draft_builder.extract_attachment_payloads``) MUST apply the SAME
-    inclusion predicate and document order as the ``_walk`` below
-    (attachment-disposition, inline-with-filename, or message/rfc822). Keep
-    the two in sync; the live integration test asserts they agree.
-    """
-    out: list[dict[str, Any]] = []
-
-    def _filename_from_params(params: Any, key_name: bytes) -> str | None:
-        """Pull a value out of a flat (k, v, k, v, ...) param tuple."""
-        if not isinstance(params, tuple):
-            return None
-        for i in range(0, len(params) - 1, 2):
-            k = params[i]
-            if isinstance(k, bytes) and k.lower() == key_name:
-                v = params[i + 1]
-                if isinstance(v, (bytes, bytearray)):
-                    return _decode(v)
-        return None
-
-    def _walk(s: Any) -> None:
-        if not isinstance(s, tuple) or not s:
-            return
-
-        # Multipart: IMAPClient groups the child parts in a LIST at
-        # position 0 — ``([child1, child2, ...], subtype, params, ...)``.
-        # (Real iCloud/Gmail BODYSTRUCTUREs take this shape; missing it
-        # silently dropped attachments on every multipart message.)
-        if isinstance(s[0], list):
-            for child in s[0]:
-                _walk(child)
-            return
-        # Defensive: some inputs nest children as direct tuple elements.
-        if isinstance(s[0], tuple):
-            for child in s:
-                if isinstance(child, tuple):
-                    _walk(child)
-            return
-
-        # Leaf. Spec positions: type, subtype, params, id, desc, encoding,
-        # size, [type-specific extras...], [disposition]. The disposition
-        # tuple, if present, sits at the trailing end — but its exact index
-        # varies (text has 'lines', message/rfc822 has envelope+body+lines,
-        # etc.). Scan trailing elements for a tuple whose head is one of
-        # the disposition keywords.
-        leaf = s
-        type_ = leaf[0] if isinstance(leaf[0], bytes) else b""
-        subtype = (
-            leaf[1] if len(leaf) > 1 and isinstance(leaf[1], bytes) else b""
-        )
-        ct_params = leaf[2] if len(leaf) > 2 else ()
-        size_field = leaf[6] if len(leaf) > 6 else 0
-
-        disp_kind: bytes | None = None
-        disp_filename: str | None = None
-        for elem in leaf:
-            if (
-                isinstance(elem, tuple)
-                and elem
-                and isinstance(elem[0], bytes)
-                and elem[0].lower() in (b"attachment", b"inline")
-            ):
-                disp_kind = elem[0].lower()
-                disp_params = elem[1] if len(elem) > 1 else ()
-                disp_filename = _filename_from_params(disp_params, b"filename")
-                break
-
-        is_rfc822 = (
-            type_.lower() == b"message" and subtype.lower() == b"rfc822"
-        )
-        is_attachment = (
-            disp_kind == b"attachment"
-            or (disp_kind == b"inline" and disp_filename is not None)
-            or is_rfc822
-        )
-        if not is_attachment:
-            return
-
-        # Filename precedence: disposition's filename → content-type's
-        # `name` param (legacy mailers) → empty string.
-        name = disp_filename or _filename_from_params(ct_params, b"name") or ""
-        mime_type = f"{_decode(type_)}/{_decode(subtype)}"
-
-        out.append({
-            "name": name,
-            "mime_type": mime_type,
-            "size": int(size_field) if isinstance(size_field, int) else 0,
-            "downloaded": False,
-        })
-
-    _walk(structure)
-    return out
+def _bodystructure_extract_attachments(structure: Any) -> list[dict[str, Any]]:
+    """Strict metadata only; incomplete structure never proves no attachments."""
+    return [part.metadata for part in describe_attachment_parts(structure)]
 
 
-def _disposition_marks_attachment(elem: Any) -> bool:
-    """True if a BODYSTRUCTURE element is a disposition tuple that marks an
-    attachment — ``attachment``, or ``inline`` carrying a ``filename`` param.
-
-    Disposition tuples look like ``(b"attachment", (b"filename", b"x.pdf"))``;
-    the params are a flat ``(key, value, key, value, ...)`` tuple.
-    """
-    if not (isinstance(elem, tuple) and elem and isinstance(elem[0], bytes)):
-        return False
-    disp = elem[0].lower()
-    if disp == b"attachment":
-        return True
-    if disp != b"inline":
-        return False
-    params = elem[1] if len(elem) > 1 else ()
-    if not isinstance(params, tuple):
-        return False
-    return any(
-        isinstance(params[i], bytes) and params[i].lower() == b"filename"
-        for i in range(0, len(params) - 1, 2)
-    )
+def _selected_attachment_indices(count: int, indices: list[int] | None) -> list[int]:
+    if indices is None:
+        return list(range(count))
+    return sorted({i for i in indices if type(i) is int and 0 <= i < count})
 
 
-def _leaf_has_attachment(structure: tuple[Any, ...]) -> bool:
-    """True if a leaf BODYSTRUCTURE part is an attachment.
+def _canonical_attachment_fallback(
+    client: Any, uid: int, indices: list[int] | None, limit: int, transfer: LiteralBudget,
+) -> tuple[int, dict[int, ForwardedAttachment]]:
+    raw = fetch_bounded_message(client, uid, budget=limit, transfer=transfer)
+    if indices is None:
+        payloads = extract_attachment_payloads(raw)
+        return len(payloads), dict(enumerate(payloads))
+    count = count_attachment_parts(raw)
+    selected = _selected_attachment_indices(count, indices)
+    return count, dict(zip(selected, extract_attachment_payloads(raw, indices=selected), strict=True))
 
-    A ``message/rfc822`` (forwarded email) part counts, matching
-    ``_bodystructure_extract_attachments`` — otherwise the has_attachment
-    search filter and the attachment list disagree (a forwarded-only message
-    would be filtered out yet report an attachment). Otherwise, any element
-    that is an attachment/inline-filename disposition tuple qualifies.
-    """
-    type_ = structure[0] if isinstance(structure[0], bytes) else b""
-    subtype = (
-        structure[1]
-        if len(structure) > 1 and isinstance(structure[1], bytes)
-        else b""
-    )
-    if type_.lower() == b"message" and subtype.lower() == b"rfc822":
-        return True
-    return any(_disposition_marks_attachment(elem) for elem in structure)
+
+def _fetch_attachment_payloads(
+    client: Any, uid: int, indices: list[int] | None,
+) -> tuple[int, dict[int, ForwardedAttachment]]:
+    limit = raw_message_budget()
+    transfer = LiteralBudget(limit)
+    # Preserve the whole-message ceiling even if only a tiny part is requested.
+    size = preflight_message_size(client, uid, limit, transfer)
+    rows = guarded_fetch(client, uid, [b"BODYSTRUCTURE"], transfer.remaining, transfer)
+    entry = rows.get(uid)
+    if not isinstance(entry, dict):
+        raise MailRawMessageReadError("IMAP omitted the selected UID from attachment metadata")
+    try:
+        parts = describe_attachment_parts(entry.get(b"BODYSTRUCTURE"))
+    except MailMessageReadIncompleteError:
+        if indices == []:
+            raise  # Cannot report a count, and empty selection forbids payload reads.
+        return _canonical_attachment_fallback(client, uid, indices, limit, transfer)
+    selected = _selected_attachment_indices(len(parts), indices)
+    if any(not parts[index].optimized for index in selected):
+        return _canonical_attachment_fallback(client, uid, indices, limit, transfer)
+    encoded_total = sum(parts[index].encoded_size for index in selected)
+    if encoded_total > size:
+        raise MailRawMessageReadError("Attachment sizes exceed the advertised message size")
+    if encoded_total > transfer.remaining:
+        raise MailRawMessageLimitError("Selected attachments exceed the remaining transfer allowance")
+    payloads: dict[int, ForwardedAttachment] = {}
+    for index in selected:
+        part = parts[index]
+        encoded = fetch_bounded_section(client, uid, part.section, part.encoded_size,
+                                        budget=limit, transfer=transfer)
+        payloads[index] = (part.filename or "attachment", part.maintype, part.subtype,
+                           decode_attachment_part(part, encoded))
+    return len(parts), payloads
 
 
 def _bodystructure_has_attachment(structure: Any) -> bool:
-    """Walk an IMAPClient-parsed BODYSTRUCTURE tree and detect attachments.
-
-    IMAPClient represents multipart as a tuple ``(part_tuple, ..., subtype)``
-    where each ``part_tuple`` is either another multipart (starts with a
-    tuple) or a leaf (starts with bytes like ``b"text"``, ``b"application"``).
-
-    A message "has an attachment" if any leaf carries a disposition of
-    ``attachment`` or ``inline`` with a ``filename`` parameter (see
-    ``_leaf_has_attachment``).
-    """
-    if not isinstance(structure, tuple) or not structure:
-        return False
-
-    # Multipart — children grouped in a list at position 0 (IMAPClient).
-    if isinstance(structure[0], list):
-        return any(
-            _bodystructure_has_attachment(child) for child in structure[0]
-        )
-    # Defensive: children nested as direct tuple elements.
-    if isinstance(structure[0], tuple):
-        return any(
-            isinstance(child, tuple) and _bodystructure_has_attachment(child)
-            for child in structure
-        )
-
-    return _leaf_has_attachment(structure)
+    """Use the same strict membership as metadata; unknown is never false."""
+    return bool(describe_attachment_parts(structure))
 
 
 def _envelope_to_dict(
@@ -1320,6 +1201,26 @@ class ImapConnector:
                 )
             return fetch_bounded_message(client, uids[0])
 
+    def fetch_attachment_payloads(
+        self, message_id: str, mailbox: str = "INBOX", *, indices: list[int] | None = None,
+    ) -> tuple[int, dict[int, ForwardedAttachment]]:
+        """Return total count and only selected canonical attachment indices.
+
+        Out-of-range indices are ignored for save compatibility. Selection is
+        unique and in MIME order. Full-message fallback is chosen solely from
+        pre-download metadata, never after a range, budget, or decoding failure.
+        """
+        bracketed = _bracket_message_id(message_id)
+        _reject_control_chars(mailbox, "mailbox")
+        with self._session() as client:
+            client.select_folder(mailbox, readonly=True)
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if not uids:
+                raise MailMessageNotFoundError(
+                    f"Message-ID {message_id!r} not found in mailbox {mailbox!r} on {self._host}."
+                )
+            return _fetch_attachment_payloads(client, uids[0], indices)
+
     def get_attachments(
         self,
         message_id: str,
@@ -1371,11 +1272,12 @@ class ImapConnector:
                     f"{mailbox!r} on {self._host}."
                 )
 
-            fetched = client.fetch(uids[:1], [b"BODYSTRUCTURE"])
-            entry = next(iter(fetched.values()))
-            return _bodystructure_extract_attachments(
-                entry.get(b"BODYSTRUCTURE")
-            )
+            limit = raw_message_budget()
+            fetched = guarded_fetch(client, uids[0], [b"BODYSTRUCTURE"], limit, LiteralBudget(limit))
+            entry = fetched.get(uids[0])
+            if not isinstance(entry, dict):
+                raise MailMessageReadIncompleteError("IMAP omitted the selected UID from attachment metadata")
+            return _bodystructure_extract_attachments(entry.get(b"BODYSTRUCTURE"))
 
     def locate_message(
         self, message_id: str, mailbox: str | None = None

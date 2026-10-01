@@ -40,10 +40,20 @@ IMAP fetch or AppleScript fallback.
 This applies to message-body/raw reads, attachment retrieval, reply/forward
 source reads, and IMAP draft attachment preservation. Headers-only reads do not
 fetch the raw body. The budget is separate from the response-body, decoded
-inline attachment, and disk-save caps. It bounds transferred literals, **not
-process memory**: MIME parsing and payload decoding can allocate additional
-copies. Attachment tools decode only selected payloads; the bounded fallback
-still retrieves the enclosing raw message.
+inline attachment, and disk-save caps. It bounds payload/literal transfer,
+**not protocol framing or process memory**: MIME parsing and payload decoding
+can allocate additional copies.
+
+For unambiguous MIME structures, attachment tools retrieve only the selected
+part sections using bounded partial `BODY.PEEK` requests and decode only those
+parts. The server-reported enclosing message size must still pass the raw-message
+ceiling, and selected transfers share a cumulative allowance. Each selected
+section is checked against its reported size and end-of-section; this does not
+verify the size of unrequested sections. Forwarded `.eml` attachments,
+unsupported encodings, and ambiguous structures use the bounded canonical MIME
+path before any selected payload is fetched. A transfer, size, or decoding error
+does not trigger another retrieval path. Metadata-only requests never download
+payloads; incomplete structure metadata is an explicit error, not an empty list.
 
 A failed draft-preservation read keeps the original draft and reports
 `original_draft_id` on `update_draft`. Fix the source/read problem or deliberately
@@ -227,7 +237,7 @@ Retrieve full details of one or more messages, with bodies. Returns a list (alwa
 
 **Performance note (path-dependent cost):**
 
-For accounts configured with IMAP (via `apple-mail-fast-mcp setup-imap --account <name>`), `include_attachments` is essentially free — `BODYSTRUCTURE` bundles into the existing FETCH. For accounts without IMAP, the AppleScript fallback enumerates attachments per message — fine for small id lists (1-10) but can be slow on cold caches for larger lists. If you have a mix of IMAP-configured and non-IMAP accounts, expect variance. To opt out: pass `include_attachments=False`.
+For accounts configured with IMAP (via `apple-mail-fast-mcp setup-imap --account <name>`), metadata-only reads use `BODYSTRUCTURE` without fetching attachment payloads. For accounts without IMAP, the AppleScript fallback enumerates attachments per message — fine for small id lists (1-10) but can be slow on cold caches for larger lists. If you have a mix of IMAP-configured and non-IMAP accounts, expect variance. To opt out: pass `include_attachments=False`.
 
 **Returns:**
 

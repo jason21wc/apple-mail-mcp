@@ -12,6 +12,7 @@ from apple_mail_fast_mcp.exceptions import (
     MailKeychainEntryNotFoundError,
 )
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+from tests.attachment_fixtures import selected_payloads_from_raw
 
 pytestmark = pytest.mark.real_account_fallback
 ACCOUNT_ID = "12345678-1234-1234-1234-123456789abc"
@@ -338,7 +339,7 @@ def test_numeric_and_rfc_payload_paths_return_and_save_identical_bytes(
         payload, maintype="application", subtype="octet-stream", filename="report.bin"
     )
     imap = Mock()
-    imap.fetch_raw_message.return_value = message.as_bytes()
+    imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(message.as_bytes())
     imap_class = Mock(return_value=imap)
     monkeypatch.setattr(mail_connector, "ImapConnector", imap_class)
     monkeypatch.setattr(mail_connector, "get_imap_password", Mock(return_value="test-password"))
@@ -376,7 +377,7 @@ def test_numeric_and_rfc_payload_paths_return_and_save_identical_bytes(
             "payload": payload,
         }
     )
-    imap.fetch_raw_message.assert_called_once_with("fixture@example.com", "Archive/Receipts")
+    imap.fetch_attachment_payloads.assert_called_once_with("fixture@example.com", "Archive/Receipts", indices=[0])
 
     native_dir = tmp_path / "native"
     native_dir.mkdir()

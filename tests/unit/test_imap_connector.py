@@ -609,7 +609,7 @@ class TestLimitWithHasAttachmentFilter:
 # BODYSTRUCTURE shapes below match what IMAPClient returns: either a flat
 # leaf tuple (type, subtype, params, id, desc, encoding, size, [type-specific], [disposition])
 # or a multipart tuple ((child1,), (child2,), ..., subtype).
-_LEAF_TEXT = (b"text", b"plain", (), None, None, b"7bit", 100, 5)
+_LEAF_TEXT = (b"text", b"plain", None, None, None, b"7bit", 100, 5, None, None)
 _LEAF_PDF_ATTACHMENT = (
     b"application",
     b"pdf",
@@ -617,10 +617,10 @@ _LEAF_PDF_ATTACHMENT = (
     None,
     None,
     b"base64",
-    2048,
+    2048, None,
     (b"attachment", (b"filename", b"x.pdf")),
 )
-_MULTIPART_WITH_ATTACHMENT = (_LEAF_TEXT, _LEAF_PDF_ATTACHMENT, b"mixed")
+_MULTIPART_WITH_ATTACHMENT = ([_LEAF_TEXT, _LEAF_PDF_ATTACHMENT], b"mixed", None, None)
 
 
 class TestHasAttachment:
@@ -643,7 +643,7 @@ class TestHasAttachment:
             3: {
                 b"ENVELOPE": _fake_envelope(message_id=b"<3@e.com>"),
                 b"FLAGS": (),
-                b"BODYSTRUCTURE": (b"text", b"html", (), None, None, b"7bit", 456, 10),
+                b"BODYSTRUCTURE": (b"text", b"html", None, None, None, b"7bit", 456, 10, None, None),
             },
         }
 
@@ -1390,13 +1390,13 @@ class TestGetMessage:
 # Disposition tuple is (kind, params) where params is flat (k,v,k,v,...).
 
 # Plain body — should never be reported as an attachment.
-_BS_PLAIN_TEXT = (b"text", b"plain", (), None, None, b"7bit", 100, 5)
+_BS_PLAIN_TEXT = (b"text", b"plain", None, None, None, b"7bit", 100, 5, None, None)
 
 # PDF attachment — disposition = attachment, filename in disposition params.
 _BS_PDF_ATTACHMENT = (
     b"application", b"pdf",
     (b"name", b"report.pdf"),
-    None, None, b"base64", 524288,
+    None, None, b"base64", 524288, None,
     (b"attachment", (b"filename", b"report.pdf")),
 )
 
@@ -1404,7 +1404,7 @@ _BS_PDF_ATTACHMENT = (
 _BS_JPEG_ATTACHMENT = (
     b"image", b"jpeg",
     (b"name", b"photo.jpg"),
-    None, None, b"base64", 4096,
+    None, None, b"base64", 4096, None,
     (b"attachment", (b"filename", b"photo.jpg")),
 )
 
@@ -1412,7 +1412,7 @@ _BS_JPEG_ATTACHMENT = (
 _BS_INLINE_IMAGE_WITH_FILENAME = (
     b"image", b"png",
     (b"name", b"sig.png"),
-    b"<sig@local>", None, b"base64", 2048,
+    b"<sig@local>", None, b"base64", 2048, None,
     (b"inline", (b"filename", b"sig.png")),
 )
 
@@ -1420,8 +1420,8 @@ _BS_INLINE_IMAGE_WITH_FILENAME = (
 _BS_INLINE_BODY_NO_FILENAME = (
     b"text", b"html",
     (b"charset", b"utf-8"),
-    None, None, b"7bit", 200, 10,
-    (b"inline", ()),
+    None, None, b"7bit", 200, 10, None,
+    (b"inline", None),
 )
 
 # Forwarded email (message/rfc822). Per RFC 2046 §5.2.1, the leaf for
@@ -1430,30 +1430,30 @@ _BS_INLINE_BODY_NO_FILENAME = (
 # AppleScript path silently drops these — IMAP must still surface them.
 _BS_FORWARDED_EMAIL_NO_DISP = (
     b"message", b"rfc822",
-    (), None, None, b"7bit", 8192,
-    None, None, 250,  # envelope, body, lines (None'd; we don't inspect them)
+    None, None, None, b"7bit", 8192,
+    (None,) * 10, _BS_PLAIN_TEXT, 250, None, None,  # envelope, body, lines, MD5, disposition
 )
 
 # Legacy: filename in content-type's `name` param, no disposition at all.
 _BS_LEGACY_NAME_PARAM_ONLY = (
     b"application", b"zip",
     (b"name", b"old.zip"),
-    None, None, b"base64", 1024,
+    None, None, b"base64", 1024, None, None,
 )
 
 # Unicode filename via UTF-8 bytes.
 _BS_UNICODE_FILENAME = (
     b"application", b"pdf",
-    (),
-    None, None, b"base64", 100,
+    None,
+    None, None, b"base64", 100, None,
     (b"attachment", (b"filename", b"r\xc3\xa9sum\xc3\xa9.pdf")),
 )
 
 # Mangled bytes that aren't valid UTF-8.
 _BS_MANGLED_FILENAME = (
     b"application", b"pdf",
-    (),
-    None, None, b"base64", 100,
+    None,
+    None, None, b"base64", 100, None,
     (b"attachment", (b"filename", b"\xff\xfe\xff.pdf")),
 )
 
@@ -1570,7 +1570,7 @@ class TestGetAttachments:
     def test_single_pdf_attachment(
         self, mock_cls: MagicMock
     ) -> None:
-        bs = (_BS_PLAIN_TEXT, _BS_PDF_ATTACHMENT, b"mixed")
+        bs = ([_BS_PLAIN_TEXT, _BS_PDF_ATTACHMENT, ], b"mixed", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
@@ -1588,7 +1588,7 @@ class TestGetAttachments:
     def test_multiple_attachments(
         self, mock_cls: MagicMock
     ) -> None:
-        bs = (_BS_PLAIN_TEXT, _BS_PDF_ATTACHMENT, _BS_JPEG_ATTACHMENT, b"mixed")
+        bs = ([_BS_PLAIN_TEXT, _BS_PDF_ATTACHMENT, _BS_JPEG_ATTACHMENT, ], b"mixed", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
@@ -1606,7 +1606,7 @@ class TestGetAttachments:
         """Multipart/related inline image (e.g. signature PNG) — the case
         where Mail.app's AppleScript surface drops it silently. IMAP must
         surface it."""
-        bs = (_BS_PLAIN_TEXT, _BS_INLINE_IMAGE_WITH_FILENAME, b"related")
+        bs = ([_BS_PLAIN_TEXT, _BS_INLINE_IMAGE_WITH_FILENAME, ], b"related", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
@@ -1623,7 +1623,7 @@ class TestGetAttachments:
     ) -> None:
         """`Content-Disposition: inline` with no filename is a regular
         body part (e.g. the message's HTML body) — not an attachment."""
-        bs = (_BS_PLAIN_TEXT, _BS_INLINE_BODY_NO_FILENAME, b"alternative")
+        bs = ([_BS_PLAIN_TEXT, _BS_INLINE_BODY_NO_FILENAME, ], b"alternative", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
@@ -1640,7 +1640,7 @@ class TestGetAttachments:
         surfaced even when no Content-Disposition is set, per RFC 2046
         §5.2.1. This is the silent-failure case the issue calls out for
         the AppleScript path."""
-        bs = (_BS_PLAIN_TEXT, _BS_FORWARDED_EMAIL_NO_DISP, b"mixed")
+        bs = ([_BS_PLAIN_TEXT, _BS_FORWARDED_EMAIL_NO_DISP, ], b"mixed", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
@@ -1663,7 +1663,7 @@ class TestGetAttachments:
         helper's behavior (which only triggers on disposition). Skipping
         this case keeps both helpers consistent — if we want to broaden
         attachment detection, we do it for both at once."""
-        bs = (_BS_PLAIN_TEXT, _BS_LEGACY_NAME_PARAM_ONLY, b"mixed")
+        bs = ([_BS_PLAIN_TEXT, _BS_LEGACY_NAME_PARAM_ONLY, ], b"mixed", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
@@ -1676,7 +1676,7 @@ class TestGetAttachments:
     def test_unicode_filename_is_decoded(
         self, mock_cls: MagicMock
     ) -> None:
-        bs = (_BS_PLAIN_TEXT, _BS_UNICODE_FILENAME, b"mixed")
+        bs = ([_BS_PLAIN_TEXT, _BS_UNICODE_FILENAME, ], b"mixed", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
@@ -1687,22 +1687,16 @@ class TestGetAttachments:
         assert result[0]["name"] == "résumé.pdf"
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
-    def test_mangled_filename_does_not_crash(
+    def test_mangled_filename_reports_incomplete(
         self, mock_cls: MagicMock
     ) -> None:
-        """Bytes that aren't valid UTF-8 must not raise; replacement-char
-        decoding gives the user something they can see and rename."""
-        bs = (_BS_PLAIN_TEXT, _BS_MANGLED_FILENAME, b"mixed")
+        """Malformed names cannot silently become a different attachment name."""
+        from apple_mail_fast_mcp.exceptions import MailMessageReadIncompleteError
+
+        bs = ([_BS_PLAIN_TEXT, _BS_MANGLED_FILENAME], b"mixed", None, None)
         self._setup_client(mock_cls, bodystructure=bs)
-
-        result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(
-            "abc@x", mailbox="INBOX",
-        )
-
-        assert len(result) == 1
-        # Replacement character means we got SOMETHING back, no crash.
-        assert "�" in result[0]["name"]
-        assert result[0]["name"].endswith(".pdf")
+        with pytest.raises(MailMessageReadIncompleteError):
+            ImapConnector("h", 993, "u@e.com", "pw").get_attachments("abc@x", mailbox="INBOX")
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
     def test_nested_multipart_attachments_are_surfaced(
@@ -1711,8 +1705,8 @@ class TestGetAttachments:
         """A multipart/alternative inside a multipart/mixed — common shape
         for "HTML + plain text + attachment" emails. The walk must
         recurse, not stop at the first multipart boundary."""
-        inner = (_BS_PLAIN_TEXT, _BS_INLINE_BODY_NO_FILENAME, b"alternative")
-        outer = (inner, _BS_PDF_ATTACHMENT, b"mixed")
+        inner = ([_BS_PLAIN_TEXT, _BS_INLINE_BODY_NO_FILENAME, ], b"alternative", None, None)
+        outer = ([inner, _BS_PDF_ATTACHMENT], b"mixed", None, None)
         self._setup_client(mock_cls, bodystructure=outer)
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_attachments(

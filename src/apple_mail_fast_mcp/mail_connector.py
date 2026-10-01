@@ -27,7 +27,6 @@ from .draft_builder import (
     build_draft_mime,
     build_forward_body,
     build_reply_body,
-    count_attachment_parts,
     derive_reply_recipients,
     extract_attachment_payloads,
     forward_subject,
@@ -2847,26 +2846,16 @@ class AppleMailConnector:
         message_id: str,
         attachment_index: int,
     ) -> dict[str, Any]:
-        """IMAP path for get_attachment_content: fetch the raw message and
-        decode the selected attachment part. Reuses ``fetch_raw_message`` +
-        ``parse_original_message`` (the same machinery the clean
-        reply/forward draft path uses), so no new IMAP byte-fetch code.
-
-        Propagates ``_IMAP_FALLBACK_EXCS`` unchanged for the caller's
-        fallback.
-        """
+        """Read only the selected canonical IMAP attachment within transfer limits."""
         host, port, email = self._resolve_imap_config(account)
         password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
-        raw = imap.fetch_raw_message(message_id, mailbox)
-        # Enumerate to match the BODYSTRUCTURE metadata list get_attachments
-        # reports — NOT iter_attachments, which diverges and broke the
-        # 0-based attachment_index contract (wrong/missing part).
-        # Validate and decode only this original MIME index. Unselected parts
-        # may be large or malformed and must not enter the payload decoder.
-        filename, maintype, subtype, payload = extract_attachment_payloads(
-            raw, indices=[attachment_index],
-        )[0]
+        count, parsed = imap.fetch_attachment_payloads(message_id, mailbox, indices=[attachment_index])
+        if attachment_index not in parsed:
+            raise MailAttachmentIndexError(
+                f"attachment_index {attachment_index} out of range: message has {count} attachment(s)."
+            )
+        filename, maintype, subtype, payload = parsed[attachment_index]
         self._enforce_inline_cap(len(payload), filename)
         return {
             "name": filename,
@@ -4056,30 +4045,13 @@ class AppleMailConnector:
         save_directory: Path,
         attachment_indices: list[int] | None,
     ) -> dict[str, Any]:
-        """IMAP path for save_attachments (#371): fetch the raw message once
-        and write the selected attachment bytes to disk. Reuses
-        ``fetch_raw_message`` + ``parse_original_message`` (same machinery as
-        ``_imap_get_attachment_content``) and the same #236 byte-cap /
-        path-safety helpers as the AppleScript path — the only new step is
-        the direct ``write_bytes``.
-
-        Propagates ``_IMAP_FALLBACK_EXCS`` unchanged for the caller's
-        fallback.
-        """
+        """Read selected IMAP attachment payloads, then apply save/path byte caps."""
         host, port, email = self._resolve_imap_config(account)
         password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
-        raw = imap.fetch_raw_message(message_id, mailbox)
         # Keep original slots and caller order for filtering, aggregate caps,
-        # and collision suffixes, while decoding each selected payload once.
-        if attachment_indices is None:
-            parsed_all = extract_attachment_payloads(raw)
-            count = len(parsed_all)
-            parsed = dict(enumerate(parsed_all))
-        else:
-            count = count_attachment_parts(raw)
-            selected = sorted({i for i in attachment_indices if 0 <= i < count})
-            parsed = dict(zip(selected, extract_attachment_payloads(raw, indices=selected), strict=True))
+        # and collision suffixes, while downloading each selected payload once.
+        count, parsed = imap.fetch_attachment_payloads(message_id, mailbox, indices=attachment_indices)
         attachments: list[dict[str, Any]] = [{} for _ in range(count)]
         for index, (filename, maintype, subtype, payload) in parsed.items():
             attachments[index] = {
