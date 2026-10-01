@@ -5488,7 +5488,8 @@ class TestNonJsonPathsThreadTimeout:
     ) -> None:
         connector = AppleMailConnector(timeout=126)
         mock_get.return_value = [{"name": "a.pdf"}]
-        mock_run.return_value = MagicMock(returncode=0, stdout="1", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"saved_positions":[0],"failures":[]}', stderr="")
+        (tmp_path / "a.pdf").write_bytes(b"fixture")
         connector.save_attachments("123", tmp_path)
         assert "with timeout of 126 seconds" in self._script_from(mock_run)
 

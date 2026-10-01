@@ -116,9 +116,10 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"document.pdf","mime_type":"application/pdf",'
             '"size":1,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
 
+        (tmp_path / "document.pdf").write_bytes(b"x")
         result = connector.save_attachments(
             message_id="12345",
             save_directory=tmp_path,
@@ -139,9 +140,12 @@ class TestSaveAttachments:
             '[{"name":"a.pdf","mime_type":"application/pdf","size":1,"downloaded":true},'
             '{"name":"b.pdf","mime_type":"application/pdf","size":2,"downloaded":true},'
             '{"name":"c.pdf","mime_type":"application/pdf","size":3,"downloaded":true}]',
-            "3",
+            '{"saved_positions":[0,1,2],"failures":[]}',
         ]
 
+        (tmp_path / "a.pdf").write_bytes(b"x")
+        (tmp_path / "b.pdf").write_bytes(b"x")
+        (tmp_path / "c.pdf").write_bytes(b"x")
         result = connector.save_attachments(
             message_id="12345",
             save_directory=tmp_path
@@ -183,8 +187,9 @@ class TestSaveAttachments:
             '"size":100,"downloaded":true},'
             '{"name":"b.bin","mime_type":"application/octet-stream",'
             '"size":100,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "a.bin").write_bytes(b"x")
         result = connector.save_attachments("12345", tmp_path)
         assert result["saved"] == 1
         assert [r["reason"] for r in result["rejected"]] == ["aggregate_cap"]
@@ -200,8 +205,9 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"unknown.bin","mime_type":"application/octet-stream",'
             '"size":0,"downloaded":false}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "unknown.bin").write_bytes(b"x")
         result = connector.save_attachments("12345", tmp_path)
         assert result["saved"] == 1
         assert result["rejected"] == []
@@ -218,7 +224,7 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"big.bin","mime_type":"application/octet-stream",'
             '"size":5,"downloaded":false}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
         # ...but the actual written file is 100 bytes (> 10-byte cap).
         written = tmp_path / "big.bin"
@@ -253,8 +259,9 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"../../outside.pdf","mime_type":"application/pdf",'
             '"size":3,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "outside.pdf").write_bytes(b"x")
         result = connector.save_attachments("12345", tmp_path)
         script = mock_run.call_args.args[0]
         assert result["saved"] == 1
@@ -368,8 +375,9 @@ class TestSaveAttachmentsPathTraversal:
         mock_run.side_effect = [
             '[{"name":"../../../../tmp/evil.sh","mime_type":"x",'
             '"size":1,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "evil.sh").write_bytes(b"x")
         result = connector.save_attachments(message_id="123", save_directory=tmp_path)
 
         assert result["saved"] == 1

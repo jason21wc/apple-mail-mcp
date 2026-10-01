@@ -17,6 +17,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.server.elicitation import AcceptedElicitation
 from pydantic import BeforeValidator
 
+from .attachment_saves import MailAttachmentSaveIncompleteError, incomplete_response, save_response
 from .drafts import DraftStateStore, SeedRecord
 from .exceptions import (
     MailAccountNotFoundError,
@@ -2146,12 +2147,9 @@ def save_attachments(
                 )
                 if result["saved"] == 1:
                     saved_files = list(tmp_path.iterdir())
-                    if not saved_files:
-                        return {
-                            "success": False,
-                            "error": "Attachment reported saved but file not found",
-                            "error_type": "unknown",
-                        }
+                    if len(saved_files) != 1 or not saved_files[0].is_file():
+                        raise MailAttachmentSaveIncompleteError("staging_receipt", 1)
+
                     destination = save_path.resolve() / output_filename
                     # A directory at the destination is never a valid target:
                     # shutil.move would nest the file INSIDE it and report
@@ -2164,6 +2162,7 @@ def save_attachments(
                                 f"{destination}"
                             ),
                             "error_type": "invalid_destination",
+                            "saved": 0,
                             "filename": output_filename,
                             "directory": str(save_path),
                         }
@@ -2187,9 +2186,12 @@ def save_attachments(
                                 f"replace it."
                             ),
                             "error_type": "already_exists",
+                            "saved": 0,
                             "filename": output_filename,
                             "directory": str(save_path),
                         }
+                    except OSError as exc:
+                        raise MailAttachmentSaveIncompleteError("final_commit", 1) from exc
                     final_filename = output_filename
         else:
             result = mail.save_attachments(
@@ -2200,28 +2202,25 @@ def save_attachments(
                 mailbox=mailbox,
             )
 
-        operation_logger.log_operation(
-            "save_attachments",
-            {
-                "message_id": message_id,
-                "directory": save_directory,
-                "indices": attachment_indices,
-                "output_filename": output_filename,
-            },
-            "success"
-        )
-
-        response: dict[str, Any] = {
-            "success": True,
-            "saved": result["saved"],
-            "directory": save_directory,
-            # Attachments skipped/removed by the byte caps (#236), if any.
-            "rejected": result["rejected"],
-        }
+        response = save_response(result, save_directory)
+        try:
+            operation_logger.log_operation(
+                "save_attachments",
+                {"message_id": message_id, "directory": save_directory,
+                 "indices": attachment_indices, "output_filename": output_filename},
+                "success" if response["success"] else "failed",
+            )
+        except Exception:
+            response["audit_log_failed"] = True
+            response.setdefault("warnings", []).append(
+                "Attachment save results are known, but audit logging failed."
+            )
         if final_filename:
             response["filename"] = final_filename
         return response
 
+    except MailAttachmentSaveIncompleteError as e:
+        return incomplete_response(e)
     except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
         return _bounded_read_error_response(e)
     except (FileNotFoundError, ValueError) as e:

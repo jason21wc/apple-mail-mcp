@@ -718,7 +718,7 @@ Save attachments from a message to a directory.
 |-----------|------|----------|---------|-------------|
 | `message_id` | string | Yes | - | Message ID to save attachments from |
 | `save_directory` | string | Yes | - | Directory path to save attachments. `~` is expanded. Must already exist — the tool does not create it (`directory_not_found` otherwise). |
-| `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
+| `attachment_indices` | list[int] | No | None | Specific zero-based attachment indices (None = all) |
 | `output_filename` | string | No | None | **Fork extension.** Save under this exact (sanitized) name instead of the attachment's own. Requires exactly one entry in `attachment_indices`. |
 | `overwrite` | bool | No | `false` | Only meaningful with `output_filename`. Default is **no-clobber**: an existing destination is left untouched and the call returns `error_type: "already_exists"`. `true` replaces it atomically. |
 | `account` | string | No | None | Mail.app account name or UUID. With `mailbox`, enables IMAP for RFC Message-IDs; numeric Mail.app IDs use scoped native lookup. Pass the same scope used to read the message. |
@@ -727,7 +727,8 @@ Save attachments from a message to a directory.
 **Overwrite behavior:** the no-clobber guarantee applies to the `output_filename` path only, where the commit is an atomic `os.link` (so two concurrent saves cannot both win). The **bulk path** — no `output_filename`, saving attachments under their own names — writes through the connector and *does* overwrite same-named files in the destination. Save one attachment per call with `output_filename` when that matters. A directory at the destination is rejected with `error_type: "invalid_destination"` rather than nested into.
 
 **IMAP retrieval:** pass `account` + `mailbox` with an RFC Message-ID to use
-bounded raw-message retrieval. Only requested attachment payloads are decoded;
+bounded selected-part retrieval where the MIME structure is unambiguous, otherwise
+bounded full-message retrieval. Only requested attachment payloads are decoded;
 original indices, caller selection order, collision filenames, and cap priority
 are preserved. Invalid save indices are ignored as before; an empty selection
 saves nothing. The raw-message budget can reject the enclosing message even
@@ -740,15 +741,45 @@ when the requested attachment is small. See [raw retrieval limits](#raw-message-
   "success": true,
   "saved": 2,
   "directory": "/Users/me/Downloads",
-  "rejected": []
+  "rejected": [],
+  "attachments_found": 2,
+  "selected": 2,
+  "attempted": 2,
+  "failed": 0,
+  "failures": [],
+  "partial": false,
+  "reason": null
 }
 ```
 
-`saved` is the number of attachments written. `rejected` lists any attachments skipped by the byte
+`saved` is the number of acknowledged writes retained after size checks. `rejected` lists any attachments skipped by the byte
 caps (per-attachment default 100 MB, aggregate 500 MB per call — disk-fill DoS protection, #236),
 each as `{"name", "size", "reason"}` where reason is `per_attachment_cap` / `aggregate_cap` (pre-check)
 or `*_postwrite` (an oversized file deleted after writing). Override the caps with
 `APPLE_MAIL_MCP_MAX_ATTACHMENT_BYTES` / `APPLE_MAIL_MCP_MAX_TOTAL_ATTACHMENT_BYTES`.
+
+`attachments_found` counts canonical attachment slots; `selected` counts valid
+selection entries before caps (including repeated indices). `attempted` counts
+save targets. `failed` counts targets without a save acknowledgment, and
+`failures` identifies their original indices, names, and available error codes.
+A failed save can leave partial bytes; it does not establish that the file is
+unchanged. Local write failures never trigger a retry through another transport.
+Postwrite cleanup checks only acknowledged writes, protecting pre-existing files
+at destinations whose saves failed.
+
+Confirmed empty results distinguish `no_attachments`, `no_valid_selection`, and
+`all_rejected`. Cap-only exclusions preserve `success: true` and set `partial`.
+Any acknowledged per-target failure returns `success: false`,
+`error_type: "attachment_save_failed"`, `partial: true`, and `retry_safe: false`.
+An interrupted operation or malformed receipt instead returns
+`attachment_save_incomplete`, with `phase`, `targets`, and any known
+`acknowledged_writes`; unknown counts are omitted. Inspect the destination before
+retrying either failure. Metadata such as `downloaded: false` is not a diagnosis
+of why a save failed.
+
+With `output_filename`, a temporary save is counted only after the final atomic
+commit succeeds. A name collision preserves the destination. Cleanup or audit
+logging errors cannot replace an already established save result.
 
 **Examples:**
 
@@ -763,7 +794,7 @@ save_attachments(
 save_attachments(
     message_id="12345",
     save_directory="/Users/me/Downloads",
-    attachment_indices=[1, 3]  # Save 1st and 3rd only
+    attachment_indices=[0, 2]  # Save 1st and 3rd only
 )
 ```
 

@@ -50,7 +50,8 @@ def test_save_decodes_selected_parts_once_preserving_index_collision_names(conne
     connector, _ = connector
     with patch.object(draft_builder, "_attachment_payload_bytes", wraps=draft_builder._attachment_payload_bytes) as decode:
         result = connector.save_attachments("fixture@example.test", tmp_path, [2, 0], account="Fixture", mailbox="INBOX")
-    assert result == {"saved": 2, "rejected": []}
+    assert result["saved"] == 2 and result["rejected"] == []
+    assert result["attempted"] == 2 and result["failed"] == 0
     assert (tmp_path / "same.txt").read_bytes() == b"ccc"
     assert (tmp_path / "0_same.txt").read_bytes() == b"aaaaa"
     assert decode.call_count == 2
@@ -62,7 +63,9 @@ def test_save_selection_order_controls_aggregate_cap(connector, tmp_path):
     connector.max_attachment_bytes = 10
     connector.max_total_attachment_bytes = 6
     result = connector.save_attachments("fixture@example.test", tmp_path, [2, 0], account="Fixture", mailbox="INBOX")
-    assert result == {"saved": 1, "rejected": [{"name": "same.txt", "size": 5, "reason": "aggregate_cap"}]}
+    assert result["saved"] == 1
+    assert result["rejected"] == [{"name": "same.txt", "size": 5, "reason": "aggregate_cap"}]
+    assert result["attempted"] == 1 and result["partial"] is True
     assert (tmp_path / "same.txt").read_bytes() == b"ccc"
 
 
@@ -70,7 +73,9 @@ def test_save_selection_order_controls_aggregate_cap(connector, tmp_path):
 def test_empty_save_selection_decodes_nothing(connector, tmp_path, indices):
     connector, _ = connector
     with patch.object(draft_builder, "_attachment_payload_bytes") as decode:
-        assert connector.save_attachments("fixture@example.test", tmp_path, indices, account="Fixture", mailbox="INBOX") == {"saved": 0, "rejected": []}
+        result = connector.save_attachments("fixture@example.test", tmp_path, indices, account="Fixture", mailbox="INBOX")
+        assert result["saved"] == result["attempted"] == result["failed"] == 0
+        assert result["reason"] == "no_valid_selection"
     decode.assert_not_called()
 
 

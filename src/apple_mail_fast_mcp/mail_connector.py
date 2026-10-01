@@ -5,6 +5,7 @@ AppleScript-based connector for Apple Mail.
 import logging
 import re
 import smtplib
+import stat
 import subprocess
 import tempfile
 import time
@@ -23,6 +24,10 @@ from typing import Any, ParamSpec, TypeVar, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
+from .attachment_saves import (
+    MailAttachmentSaveIncompleteError, SaveReceipt, completed_save_result,
+    parse_save_receipt, write_payloads,
+)
 from .draft_builder import (
     build_draft_mime,
     build_forward_body,
@@ -385,16 +390,18 @@ def _prune_oversized_written(
     After the AppleScript save, stat each written file and delete (and report)
     any that exceed ``per_cap`` on disk or push the actual running total over
     ``total_cap`` — covering the case where Mail under-reported size before the
-    write. Only acts on paths that exist, so it is inert under mocked
-    AppleScript (no real files). Returns ``(removed_count, rejected_records)``.
+    write. Every acknowledged path must remain a regular file; missing or
+    uninspectable paths invalidate the final retained count. Returns
+    ``(removed_count, rejected_records)``.
     """
     removed = 0
     rejected: list[dict[str, Any]] = []
     running = 0
     for _as_idx, path in targets:
-        if not path.is_file():
-            continue
-        actual = path.stat().st_size
+        status = path.stat()
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError("Acknowledged attachment target is not a regular file")
+        actual = status.st_size
         if actual > per_cap:
             path.unlink(missing_ok=True)
             removed += 1
@@ -3969,7 +3976,10 @@ class AppleMailConnector:
                     save_directory=save_directory,
                     attachment_indices=attachment_indices,
                 )
-                self._imap_clear_breaker(account)
+                try:
+                    self._imap_clear_breaker(account)
+                except Exception:
+                    pass  # Bookkeeping cannot replay already completed local writes.
                 return imap_result
             except _IMAP_FALLBACK_EXCS as exc:
                 self._log_imap_fallback(account, exc)
@@ -3985,16 +3995,17 @@ class AppleMailConnector:
             per_cap=self.max_attachment_bytes,
             total_cap=self.max_total_attachment_bytes,
         )
+        selected = len(allowed) + len(rejected)
         if not allowed:
-            return {"saved": 0, "rejected": rejected}
+            return self._completed_attachment_save(attachments, selected, [], SaveReceipt((), ()), rejected)
 
         targets = _compute_attachment_save_targets(
             [str(a.get("name", "")) for a in attachments],
             save_directory,
             allowed,
         )
-        if not targets:
-            return {"saved": 0, "rejected": rejected}
+        if len(targets) != len(allowed):
+            raise ValueError("A selected attachment has an unsafe destination")
 
         self._reject_rfc_id_scan(message_id)
         lookup = _message_lookup_applescript(message_id, self._native_account(account), mailbox)
@@ -4003,38 +4014,48 @@ class AppleMailConnector:
             f'"{escape_applescript_string(str(path))}"' for _, path in targets
         )
 
-        script = _MAILBOX_RESOLVER_HANDLERS + "\n" + _wrap_with_timeout(
-            f"""tell application "Mail"
+        script = _wrap_as_json_script(
+            f"""set savedPositions to current application's NSMutableArray's array()
+set failedSaves to current application's NSMutableArray's array()
+tell application "Mail"
 {lookup}
             set theAtts to mail attachments of msg
             set idxList to {{{idx_list}}}
             set pathList to {{{path_list}}}
-            set saveCount to 0
             repeat with k from 1 to count of idxList
                 set ai to item k of idxList
                 set tp to item k of pathList
                 try
                     save (item ai of theAtts) in (POSIX file tp)
-                    set saveCount to saveCount + 1
+                    savedPositions's addObject:(k - 1)
+                on error errMessage number errNumber
+                    failedSaves's addObject:{{|position|:(k - 1), |error_code|:errNumber}}
                 end try
             end repeat
-            return saveCount
-        end tell""",
-            timeout=self.timeout,
+        end tell
+set resultData to {{|saved_positions|:savedPositions, |failures|:failedSaves}}""",
+            timeout=self.timeout, handlers=_MAILBOX_RESOLVER_HANDLERS,
         )
+        try:
+            result = self._run_applescript(script)
+        except (MailAccountNotFoundError, MailMailboxNotFoundError, MailMessageNotFoundError):
+            raise  # The scoped lookup fails before the save loop.
+        except Exception as exc:
+            raise MailAttachmentSaveIncompleteError("native_execution", len(targets)) from exc
+        receipt = parse_save_receipt(result, len(targets))
+        return self._completed_attachment_save(attachments, selected, targets, receipt, rejected)
 
-        result = self._run_applescript(script)
-        saved = int(result) if result.isdigit() else 0
-
-        # Post-write net (#236): delete any file that landed over the cap
-        # (e.g. Mail under-reported size pre-download) and report it.
-        removed, post_rejected = _prune_oversized_written(
-            targets,
-            per_cap=self.max_attachment_bytes,
-            total_cap=self.max_total_attachment_bytes,
+    def _completed_attachment_save(
+        self, attachments: list[dict[str, Any]], selected: int,
+        targets: list[tuple[int, Path]], receipt: SaveReceipt, rejected: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return completed_save_result(
+            attachments, selected, targets, receipt, rejected,
+            prune=lambda acknowledged: _prune_oversized_written(
+                acknowledged, per_cap=self.max_attachment_bytes,
+                total_cap=self.max_total_attachment_bytes,
+            ),
         )
-        rejected.extend(post_rejected)
-        return {"saved": max(0, saved - removed), "rejected": rejected}
 
     def _imap_save_attachments(
         self,
@@ -4065,27 +4086,17 @@ class AppleMailConnector:
             per_cap=self.max_attachment_bytes,
             total_cap=self.max_total_attachment_bytes,
         )
+        selected = len(allowed) + len(rejected)
         if not allowed:
-            return {"saved": 0, "rejected": rejected}
+            return self._completed_attachment_save(attachments, selected, [], SaveReceipt((), ()), rejected)
 
         targets = _compute_attachment_save_targets(
             [str(a.get("name", "")) for a in attachments], save_directory, allowed
         )
-        saved = 0
-        for as_idx, path in targets:
-            # _compute_attachment_save_targets returns 1-based indices.
-            path.write_bytes(parsed[as_idx - 1][3])
-            saved += 1
-
-        # Post-write net for symmetry with the AppleScript path (inert here —
-        # IMAP sizes are exact, so nothing should exceed the pre-check).
-        removed, post_rejected = _prune_oversized_written(
-            targets,
-            per_cap=self.max_attachment_bytes,
-            total_cap=self.max_total_attachment_bytes,
-        )
-        rejected.extend(post_rejected)
-        return {"saved": max(0, saved - removed), "rejected": rejected}
+        if len(targets) != len(allowed):
+            raise ValueError("A selected attachment has an unsafe destination")
+        receipt = write_payloads(targets, {index: value[3] for index, value in parsed.items()})
+        return self._completed_attachment_save(attachments, selected, targets, receipt, rejected)
 
     @_account_operation
     def move_messages(
