@@ -4706,3 +4706,18 @@ class TestConnectorCreateDraftEdgeCase:
             connector.create_draft(
                 seed="reply", seed_id="160000", body="x"
             )
+
+
+@pytest.mark.parametrize("fetched", [{7: {b"FLAGS": ()}}, {7: {b"ENVELOPE": None}}])
+def test_incomplete_imap_metadata_is_not_reported_as_absence(mock_mail, fetched):
+    from apple_mail_fast_mcp.imap_connector import ImapConnector
+
+    with patch("apple_mail_fast_mcp.imap_connector.IMAPClient") as factory:
+        factory.return_value.search.return_value = [7]
+        factory.return_value.fetch.return_value = fetched
+        connector = ImapConnector("imap.example.org", 993, "user@example.org", "fixture")
+        mock_mail.get_message.side_effect = lambda message_id, **kw: connector.get_message(message_id)
+        result = get_messages(["fixture@example.org"], account="Fixture", mailbox="INBOX")
+    assert result["success"] is False
+    assert result["error_type"] == "message_read_incomplete"
+    assert "not_found" not in result

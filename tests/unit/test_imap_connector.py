@@ -3900,7 +3900,7 @@ class TestEnvelopeVanishRobustness:
         assert len(result) == 2
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
-    def test_get_message_vanished_raises_not_found(
+    def test_get_message_missing_envelope_is_incomplete(
         self, mock_cls: MagicMock
     ) -> None:
         mock_client = MagicMock()
@@ -3910,7 +3910,8 @@ class TestEnvelopeVanishRobustness:
         mock_client.fetch.return_value = {5: {b"FLAGS": ()}}
 
         conn = ImapConnector("imap.example.com", 993, "u@e.com", "pw")
-        with pytest.raises(MailMessageNotFoundError):
+        from apple_mail_fast_mcp.exceptions import MailMessageReadIncompleteError
+        with pytest.raises(MailMessageReadIncompleteError):
             conn.get_message("<gone@example.com>")
 
 

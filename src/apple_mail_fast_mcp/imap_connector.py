@@ -46,6 +46,7 @@ from .exceptions import (
     MailImapMoveUnsupportedError,
     MailImapTrashNotFoundError,
     MailMessageNotFoundError,
+    MailMessageReadIncompleteError,
 )
 from .utils import parse_rfc822_ids
 
@@ -1194,14 +1195,18 @@ class ImapConnector:
                 )
 
             fetched = client.fetch(uids[:1], fetch_keys)
-            entry = next(iter(fetched.values()), None)
+            entry = fetched.get(uids[0])
             # The message matched SEARCH but vanished before FETCH (expunged
             # or moved by a concurrent change) — treat as not-found rather
             # than crashing on the missing ENVELOPE. (#314)
-            if entry is None or b"ENVELOPE" not in entry:
+            if entry is None:
                 raise MailMessageNotFoundError(
                     f"Message-ID {message_id!r} vanished from mailbox "
                     f"{mailbox!r} between SEARCH and FETCH."
+                )
+            if entry.get(b"ENVELOPE") is None:
+                raise MailMessageReadIncompleteError(
+                    "IMAP returned a message without its required ENVELOPE metadata"
                 )
 
             return _build_get_message_result(

@@ -31,6 +31,7 @@ from .exceptions import (
     MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailMessageReadIncompleteError,
     MailRuleNotFoundError,
     MailSafetyError,
     MailTemplateError,
@@ -1475,6 +1476,8 @@ def get_messages(
         # include_content=False — sender/subject are attacker-controlled too).
         return _mark_untrusted(response, bool(messages))
 
+    except MailMessageReadIncompleteError as e:
+        return {"success": False, "error": str(e), "error_type": "message_read_incomplete"}
     except MailAppleScriptError as e:
         logger.error(f"Error reading messages through AppleScript: {e}")
         return {

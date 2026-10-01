@@ -91,6 +91,13 @@ class MailMessageNotFoundError(MailError):
     pass
 
 
+class MailMessageReadIncompleteError(MailError):
+    """A message matched, but the server did not return required metadata.
+
+    This is neither evidence of absence nor a reason to broaden the lookup.
+    """
+
+
 class MailAnchorProbeIncompleteError(MailError):
     """One or more folder probes failed while resolving an anchor, so absence
     was not established for THAT ACCOUNT.
