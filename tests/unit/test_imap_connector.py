@@ -3900,7 +3900,7 @@ class TestEnvelopeVanishRobustness:
         assert len(result) == 2
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
-    def test_get_message_vanished_raises_not_found(
+    def test_get_message_missing_envelope_is_incomplete(
         self, mock_cls: MagicMock
     ) -> None:
         mock_client = MagicMock()
@@ -3910,7 +3910,8 @@ class TestEnvelopeVanishRobustness:
         mock_client.fetch.return_value = {5: {b"FLAGS": ()}}
 
         conn = ImapConnector("imap.example.com", 993, "u@e.com", "pw")
-        with pytest.raises(MailMessageNotFoundError):
+        from apple_mail_fast_mcp.exceptions import MailMessageReadIncompleteError
+        with pytest.raises(MailMessageReadIncompleteError):
             conn.get_message("<gone@example.com>")
 
 
@@ -4244,3 +4245,63 @@ class TestScopedLocateMessage:
         assert c.locate_message("a@example.com", mailbox="Archive") is None
         client.select_folder.assert_called_once_with("Archive", readonly=True)
         client.fetch.assert_not_called()
+
+
+class TestFoldedMessageIdHeader:
+    """A folded Message-ID header must not poison the id (#458).
+
+    RFC 5322 §2.2.3 permits folding a header onto a continuation line, and
+    Exchange Online does it routinely: ``Message-ID:\\r\\n\\t<id@host>``.
+    Some IMAP servers return that ENVELOPE field without unfolding, so the
+    value arrives as ``b"\\t<id@host>"``. The fold whitespace is not part of
+    the id — but it survived into ``rfc_message_id``, and every later
+    ``SEARCH HEADER "Message-ID"`` on that value was then refused by the
+    control-character guard, leaving the message permanently unfetchable.
+
+    The AppleScript path already strips (``_bare_message_id``).
+    """
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"\t<msg-1@example.com>",
+            b"\r\n\t<msg-1@example.com>",
+            b" <msg-1@example.com>",
+            b"<msg-1@example.com>\r\n",
+        ],
+        ids=["tab", "crlf-tab", "space", "trailing"],
+    )
+    def test_fold_whitespace_is_not_part_of_the_id(self, raw: bytes) -> None:
+        from apple_mail_fast_mcp.imap_connector import _envelope_to_dict
+
+        row = _envelope_to_dict(_fake_envelope(message_id=raw), (b"\\Seen",))
+
+        assert row["rfc_message_id"] == "msg-1@example.com"
+        assert row["id"] == "msg-1@example.com"
+
+    def test_bracketing_tolerates_surrounding_fold_whitespace(self) -> None:
+        from apple_mail_fast_mcp.imap_connector import _bracket_message_id
+
+        assert _bracket_message_id("\t<msg-1@example.com>") == (
+            "<msg-1@example.com>"
+        )
+        assert _bracket_message_id("  msg-1@example.com  ") == (
+            "<msg-1@example.com>"
+        )
+
+    @pytest.mark.parametrize(
+        "hostile",
+        [
+            'msg\r\nA001 DELETE "INBOX"',
+            "msg\x00id@example.com",
+            "msg\tid@example.com",
+        ],
+        ids=["crlf-injection", "nul", "inner-tab"],
+    )
+    def test_control_characters_inside_the_id_are_still_rejected(
+        self, hostile: str
+    ) -> None:
+        from apple_mail_fast_mcp.imap_connector import _bracket_message_id
+
+        with pytest.raises(ValueError, match="control character"):
+            _bracket_message_id(hostile)

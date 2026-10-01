@@ -203,7 +203,7 @@ ids) to fetch bodies for specific messages.
 
 **Parameters:**
 
-- `message_ids` (list[string], required): List of message ids to fetch. May include the literal token ``"SELECTED"``, which the server resolves at call time to Mail.app's current UI selection (zero-or-more messages). Mixed lists like ``["SELECTED", "12345"]`` are valid. Empty list is a no-op (returns empty result, no error). Missing ids drop out silently (partial-results convention) — the response contains whatever was found.
+- `message_ids` (list[string], required): List of message ids to fetch. May include the literal token ``"SELECTED"``, which the server resolves at call time to Mail.app's current UI selection (zero-or-more messages). Mixed lists like ``["SELECTED", "12345"]`` are valid. Empty list is a no-op (returns empty result, no error). Ids that cannot be resolved drop out of ``messages`` (partial-results convention) and are listed in ``not_found``.
 - `include_content` (boolean, optional) (default: True): Include message bodies (default: True).
 - `headers_only` (boolean, optional) (default: False): Skip body fetch on the IMAP path for explicit ids (default: False). Silently ignored on the AppleScript fallback.
 - `account` (string, optional): Mail.app account name or UUID. Restricts numeric-ID AppleScript lookup. Together with ``mailbox``, enables the IMAP fast path for RFC Message-IDs. Ignored for the ``"SELECTED"`` sentinel (selection is global).
