@@ -9,14 +9,17 @@ import subprocess
 import tempfile
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from email.utils import parseaddr
+from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ParamSpec, TypeVar, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
@@ -56,9 +59,8 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
 from .imap_overrides import (
-    get_host_override,
     get_login_override,
-    get_port_override,
+    get_server_override,
 )
 from .imap_providers import detect_provider
 from .keychain import get_imap_password
@@ -1016,6 +1018,33 @@ def _bulk_repeat_block(
 
 
 @dataclass(frozen=True)
+class _AccountIdentity:
+    """Canonical account identity; names key configuration, IDs key runtime state."""
+
+    name: str
+    id: str
+
+
+@dataclass
+class _AccountSnapshot:
+    accounts: list[dict[str, Any]] | None = None
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _account_operation(method: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Reuse a lazy account snapshot for one nested connector operation."""
+    @wraps(method)
+    def _wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        connector = cast("AppleMailConnector", args[0])
+        with connector._account_identity_scope():
+            return method(*args, **kwargs)
+    return _wrapped
+
+
+@dataclass(frozen=True)
 class _DraftSenderIdentity:
     """Per-request sender selection; authentication stays on the account."""
 
@@ -1071,24 +1100,66 @@ class AppleMailConnector:
         # Subsequent failures for the same account are demoted to DEBUG per
         # invariant 5 in docs/research/imap-auth-options-decision.md.
         self._imap_failures: set[str] = set()
-        # Issue #118: per-account circuit breaker state. Maps account name
+        # Issue #118: per-account circuit breaker state. Maps account UUID
         # to the monotonic deadline before which IMAP is skipped entirely
         # (the orchestrator goes straight to the AppleScript path without
         # paying the connect/login round trip).
         self._imap_failure_until: dict[str, float] = {}
+        self._account_snapshot: ContextVar[_AccountSnapshot | None] = ContextVar(
+            "mail_account_snapshot", default=None,
+        )
+
+    @contextmanager
+    def _account_identity_scope(self) -> Iterator[None]:
+        """Share account reads only within this operation, including nested calls."""
+        if self._account_snapshot.get() is not None:
+            yield
+            return
+        token = self._account_snapshot.set(_AccountSnapshot())
+        try:
+            yield
+        finally:
+            self._account_snapshot.reset(token)
+
+    def _account_records(self) -> list[dict[str, Any]]:
+        snapshot = self._account_snapshot.get()
+        if snapshot is None:
+            return self.list_accounts()
+        if snapshot.accounts is None:
+            snapshot.accounts = self.list_accounts()
+        return snapshot.accounts
+
+    def _resolve_account_identity(self, account: str) -> _AccountIdentity:
+        """Resolve exactly one name/UUID; never guess through missing/ambiguous data."""
+        accounts = self._account_records()
+        matches = [acc for acc in accounts
+                   if account in (acc.get("name"), acc.get("id"))]
+        if not matches:
+            raise MailAccountNotFoundError(f"Account {account!r} not found in Mail.app")
+        if len(matches) != 1:
+            raise ValueError(f"Account {account!r} is ambiguous in Mail.app")
+        name, uid = matches[0].get("name"), matches[0].get("id")
+        if not isinstance(name, str) or not name or not isinstance(uid, str) or not uid:
+            raise ValueError(f"Account {account!r} has incomplete identity metadata")
+        if sum(acc.get("name") == name for acc in accounts) != 1:
+            raise ValueError(f"Account name {name!r} is ambiguous in Mail.app")
+        return _AccountIdentity(name=name, id=uid)
+
+    def _native_account(self, account: str | None) -> str | None:
+        return self._resolve_account_identity(account).id if account is not None else None
 
     def _imap_breaker_open(self, account: str) -> bool:
         """True if a recent IMAP failure on this account is still cooling
         down. Callers consult this *before* attempting IMAP — when True,
         skip IMAP entirely for this call (issue #118)."""
-        deadline = self._imap_failure_until.get(account)
+        deadline = self._imap_failure_until.get(self._resolve_account_identity(account).id)
         return deadline is not None and time.monotonic() < deadline
 
     def _imap_clear_breaker(self, account: str) -> None:
         """Reset the cooldown for an account. Called after every
         successful IMAP call so a transient blip doesn't leave the
         breaker open longer than necessary."""
-        self._imap_failure_until.pop(account, None)
+        self._imap_failure_until.pop(self._resolve_account_identity(account).id, None)
 
     def _log_imap_fallback(self, account: str, exc: Exception) -> None:
         """Log an IMAP fallback event AND open the circuit breaker.
@@ -1148,6 +1219,7 @@ class AppleMailConnector:
             return
 
         # Non-benign failure: open the breaker.
+        account = self._resolve_account_identity(account).id
         self._imap_failure_until[account] = (
             time.monotonic() + self._IMAP_BREAKER_TTL_S
         )
@@ -1317,7 +1389,7 @@ class AppleMailConnector:
             or any(ord(char) < 33 or ord(char) == 127 for char in sender_email)
         ):
             raise ValueError("sender_email must be a single bare email address")
-        for acc in self.list_accounts():
+        for acc in self._account_records():
             if acc.get("id") == account or acc.get("name") == account:
                 emails = acc.get("email_addresses") or []
                 if not emails:
@@ -1851,51 +1923,24 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
+    @_account_operation
     def _get_imap_password_with_fallback(
         self, account: str, email: str
     ) -> str:
-        """Look up the IMAP Keychain password, retrying with the alternative
-        account-identifier form (name ↔ UUID) on a NotFound miss. (#243)
+        """Try the canonical name, then UUID only on credential NotFound.
 
-        Keychain entries are written by ``setup-imap`` keyed on whatever
-        string the user typed — typically the Mail.app account NAME.
-        Callers (including the MCP layer) may legitimately pass either the
-        name or the UUID per the documented stability story on
-        ``search_messages.account``. This wrapper bridges the gap: try the
-        caller-supplied form first; on NotFound, resolve UUID↔name via
-        ``list_accounts()`` and retry. Other Keychain errors (AccessDenied,
-        generic Keychain errors) are NOT retried — they're explicit signals
-        from macOS and falling back would mask them.
+        Each lookup preserves get_imap_password's environment, current Keychain,
+        then legacy Keychain order. Access denial and other errors never retry.
         """
+        identity = self._resolve_account_identity(account)
         try:
-            return get_imap_password(account, email)
+            return get_imap_password(identity.name, email)
         except MailKeychainEntryNotFoundError:
-            alt = self._alternative_account_identifier(account)
-            if alt is None:
+            if identity.id == identity.name:
                 raise
-            return get_imap_password(alt, email)
+            return get_imap_password(identity.id, email)
 
-    def _alternative_account_identifier(self, account: str) -> str | None:
-        """Given a Mail.app account name OR UUID, return the other form.
-
-        Returns ``None`` if the input doesn't match any account or if the
-        account list can't be retrieved. Used by
-        ``_get_imap_password_with_fallback`` to bridge the
-        name-vs-UUID Keychain key mismatch.
-        """
-        try:
-            accounts = self.list_accounts()
-        except Exception:
-            return None
-        for acc in accounts:
-            name = acc.get("name")
-            uid = acc.get("id")
-            if name == account and uid:
-                return cast(str, uid)
-            if uid == account and name:
-                return cast(str, name)
-        return None
-
+    @_account_operation
     def _resolve_imap_config(self, account: str) -> tuple[str, int, str]:
         """Query Mail.app for the IMAP connection details of an account.
 
@@ -1937,7 +1982,12 @@ class AppleMailConnector:
         Raises:
             MailAccountNotFoundError: If the account doesn't exist.
         """
-        account_clause = applescript_account_clause(account)
+        identity = self._resolve_account_identity(account)
+        account_clause = applescript_account_clause(identity.id)
+        server_override = get_server_override(identity.name)
+        if server_override is None:
+            server_override = get_server_override(identity.id)
+        server_override = server_override or {}
         tell_body = f'''
         tell application "Mail"
             set acctRef to {account_clause}
@@ -1965,7 +2015,7 @@ class AppleMailConnector:
         # (#405) An explicit host override (setup-imap --host) wins over the
         # Mail.app-reported server name. Applied *before* the #299 iCloud
         # alias logic below so that logic keys off the intended host.
-        host_override = get_host_override(account)
+        host_override = server_override.get("host")
         if host_override:
             host = host_override
         # (#299) iCloud IMAP (*.mail.me.com) authenticates the account's own
@@ -1988,14 +2038,14 @@ class AppleMailConnector:
         # derived from the account properties — e.g. an iCloud account with a
         # third-party Apple ID and an empty `email addresses` list, where the
         # #299 apple-alias rule has nothing to choose from.
-        override = get_login_override(account)
+        override = get_login_override(identity.name) or get_login_override(identity.id)
         if override:
             email = override
         # (#405) An explicit port override (setup-imap --port) wins over the
         # Mail.app-reported port — the fix for accounts whose Mail.app
         # scriptably misreports the IMAP port (e.g. a Zimbra account that
         # returns 143 for a server actually on 993/implicit-TLS).
-        port = get_port_override(account) or cast(int, parsed.get("port") or 0)
+        port = server_override.get("port") or cast(int, parsed.get("port") or 0)
         return (host, port, email)
 
     def _imap_search(
@@ -2047,6 +2097,7 @@ class AppleMailConnector:
             text_contains=text_contains,
         )
 
+    @_account_operation
     def search_messages(
         self,
         account: str,
@@ -2378,6 +2429,7 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
+    @_account_operation
     def get_message(
         self,
         message_id: str,
@@ -2518,7 +2570,7 @@ class AppleMailConnector:
         except MailMessageNotFoundError as exc:
             # Refusing an unsafe scan does not prove that the message is absent.
             raise MailAppleScriptError(str(exc)) from exc
-        lookup = _message_lookup_applescript(message_id, account, mailbox)
+        lookup = _message_lookup_applescript(message_id, self._native_account(account), mailbox)
         content_clause = (
             'set msgContent to content of msg'
             if include_content
@@ -2572,6 +2624,7 @@ class AppleMailConnector:
         out["original_subject"] = str(msg.get("subject") or "")
         return out
 
+    @_account_operation
     def mark_as_read(
         self,
         message_ids: list[str],
@@ -2637,6 +2690,7 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
 
+    @_account_operation
     def get_attachments(
         self,
         message_id: str,
@@ -2731,6 +2785,7 @@ class AppleMailConnector:
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         return imap.get_attachments(message_id, mailbox=mailbox)
 
+    @_account_operation
     def get_attachment_content(
         self,
         message_id: str,
@@ -2764,7 +2819,8 @@ class AppleMailConnector:
             MailAttachmentTooLargeError: attachment exceeds the inline cap.
         """
         if (
-            account is not None
+            not message_id.strip().isdigit()
+            and account is not None
             and mailbox is not None
             and not self._imap_breaker_open(account)
         ):
@@ -2781,9 +2837,11 @@ class AppleMailConnector:
                 self._log_imap_fallback(account, exc)
                 # fall through to AppleScript
 
-        return self._get_attachment_content_applescript(
-            message_id, attachment_index
-        )
+        if account is not None or mailbox is not None:
+            return self._get_attachment_content_applescript(
+                message_id, attachment_index, account=account, mailbox=mailbox,
+            )
+        return self._get_attachment_content_applescript(message_id, attachment_index)
 
     def _imap_get_attachment_content(
         self,
@@ -2824,11 +2882,13 @@ class AppleMailConnector:
         }
 
     def _get_attachment_content_applescript(
-        self, message_id: str, attachment_index: int
+        self, message_id: str, attachment_index: int, *,
+        account: str | None = None, mailbox: str | None = None,
     ) -> dict[str, Any]:
         """AppleScript path: enumerate metadata, validate index + size, then
         save the one attachment to a temp dir and read it back."""
-        attachments = self._get_attachments_applescript(message_id)
+        scope = {"account": account, "mailbox": mailbox} if account is not None or mailbox is not None else {}
+        attachments = self._get_attachments_applescript(message_id, **scope)
         if not 0 <= attachment_index < len(attachments):
             raise MailAttachmentIndexError(
                 f"attachment_index {attachment_index} out of range: message "
@@ -2845,7 +2905,7 @@ class AppleMailConnector:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / (sanitize_filename(name) or "attachment")
             self._save_one_attachment_applescript(
-                message_id, attachment_index + 1, dest
+                message_id, attachment_index + 1, dest, **scope
             )
             if not dest.is_file():
                 raise MailMessageNotFoundError(
@@ -2862,30 +2922,22 @@ class AppleMailConnector:
         }
 
     def _save_one_attachment_applescript(
-        self, message_id: str, one_based_index: int, dest_path: Path
+        self, message_id: str, one_based_index: int, dest_path: Path, *,
+        account: str | None = None, mailbox: str | None = None,
     ) -> None:
         """Save a single attachment (1-based AppleScript index) to
         ``dest_path`` via Mail.app's ``save`` command. Factored out so the
         byte-read path is unit-testable without a real Mail.app save.
         """
         self._reject_rfc_id_scan(message_id)
-        # Accept either the numeric AppleScript id or the RFC Message-ID from
-        # the IMAP read path so a search-result id resolves either way (F2).
-        id_match_clause = _message_id_match_clause(message_id)
+        lookup = _message_lookup_applescript(message_id, self._native_account(account), mailbox)
         dest_safe = escape_applescript_string(str(dest_path))
-        script = _wrap_with_timeout(
+        script = _MAILBOX_RESOLVER_HANDLERS + "\n" + _wrap_with_timeout(
             f"""tell application "Mail"
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set msg to first message of mb whose ({id_match_clause})
-                        set theAtts to mail attachments of msg
-                        save (item {one_based_index} of theAtts) in (POSIX file "{dest_safe}")
-                        return "OK"
-                    end try
-                end repeat
-            end repeat
-            error "Message not found"
+{lookup}
+            set theAtts to mail attachments of msg
+            save (item {one_based_index} of theAtts) in (POSIX file "{dest_safe}")
+            return "OK"
         end tell""",
             timeout=self.timeout,
         )
@@ -2908,7 +2960,7 @@ class AppleMailConnector:
     ) -> list[dict[str, Any]]:
         """Read all attachment metadata, failing explicitly if any read fails."""
         self._reject_rfc_id_scan(message_id)
-        lookup = _message_lookup_applescript(message_id, account, mailbox)
+        lookup = _message_lookup_applescript(message_id, self._native_account(account), mailbox)
         tell_body = f'''
         tell application "Mail"
 {lookup}
@@ -2922,6 +2974,7 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
+    @_account_operation
     def get_thread(
         self,
         message_id: str,
@@ -2969,6 +3022,7 @@ class AppleMailConnector:
         """
         return self._get_thread_with_status(message_id, account, mailbox)[0]
 
+    @_account_operation
     def _get_thread_with_status(
         self,
         message_id: str,
@@ -3091,7 +3145,7 @@ class AppleMailConnector:
         # An account hint skips the fan-out entirely: probe the one account the
         # caller named instead of every configured account in turn.
         candidates = (
-            [{"name": account}] if account else self.list_accounts()
+            [{"name": account}] if account else self._account_records()
         )
         for acct in candidates:
             account_name = cast(str, acct.get("name") or "")
@@ -3849,6 +3903,7 @@ class AppleMailConnector:
 
         return thread
 
+    @_account_operation
     def save_attachments(
         self,
         message_id: str,
@@ -3918,7 +3973,8 @@ class AppleMailConnector:
         # IMAP fast path (#371): one fetch instead of the AppleScript
         # cross-scan. Mirrors get_attachment_content's dispatch.
         if (
-            account is not None
+            not message_id.strip().isdigit()
+            and account is not None
             and mailbox is not None
             and not self._imap_breaker_open(account)
         ):
@@ -3936,7 +3992,8 @@ class AppleMailConnector:
                 self._log_imap_fallback(account, exc)
                 # fall through to AppleScript
 
-        attachments = self._get_attachments_applescript(message_id)
+        scope = {"account": account, "mailbox": mailbox} if account is not None or mailbox is not None else {}
+        attachments = self._get_attachments_applescript(message_id, **scope)
 
         # Pre-check byte caps (#236): drop oversized attachments before saving.
         allowed, rejected = _select_attachments_within_caps(
@@ -3956,46 +4013,29 @@ class AppleMailConnector:
         if not targets:
             return {"saved": 0, "rejected": rejected}
 
-        # Accept BOTH id spaces so a row from the IMAP search path pipes
         self._reject_rfc_id_scan(message_id)
-        # straight in (issue F2): the IMAP path returns `id` = the RFC 5322
-        # Message-ID (bracketless), while the AppleScript path returns Mail's
-        # internal numeric id. Match on either `id` (numeric) or `message id`
-        # (RFC, bare or bracketed) in one `whose` clause so the caller never
-        # has to know which path produced the id.
-        id_match_clause = _message_id_match_clause(message_id)
+        lookup = _message_lookup_applescript(message_id, self._native_account(account), mailbox)
         idx_list = ", ".join(str(idx) for idx, _ in targets)
         path_list = ", ".join(
             f'"{escape_applescript_string(str(path))}"' for _, path in targets
         )
 
-        script = _wrap_with_timeout(
+        script = _MAILBOX_RESOLVER_HANDLERS + "\n" + _wrap_with_timeout(
             f"""tell application "Mail"
-            -- Search all accounts for message
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set msg to first message of mb whose ({id_match_clause})
-                        set theAtts to mail attachments of msg
-                        set idxList to {{{idx_list}}}
-                        set pathList to {{{path_list}}}
-                        set saveCount to 0
-
-                        repeat with k from 1 to count of idxList
-                            set ai to item k of idxList
-                            set tp to item k of pathList
-                            try
-                                save (item ai of theAtts) in (POSIX file tp)
-                                set saveCount to saveCount + 1
-                            end try
-                        end repeat
-
-                        return saveCount
-                    end try
-                end repeat
+{lookup}
+            set theAtts to mail attachments of msg
+            set idxList to {{{idx_list}}}
+            set pathList to {{{path_list}}}
+            set saveCount to 0
+            repeat with k from 1 to count of idxList
+                set ai to item k of idxList
+                set tp to item k of pathList
+                try
+                    save (item ai of theAtts) in (POSIX file tp)
+                    set saveCount to saveCount + 1
+                end try
             end repeat
-
-            error "Message not found"
+            return saveCount
         end tell""",
             timeout=self.timeout,
         )
@@ -4080,6 +4120,7 @@ class AppleMailConnector:
         rejected.extend(post_rejected)
         return {"saved": max(0, saved - removed), "rejected": rejected}
 
+    @_account_operation
     def move_messages(
         self,
         message_ids: list[str],
@@ -4202,6 +4243,7 @@ class AppleMailConnector:
             )
         return moved
 
+    @_account_operation
     def flag_message(
         self,
         message_ids: list[str],
@@ -4276,6 +4318,7 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
 
+    @_account_operation
     def update_message(
         self,
         message_ids: list[str],
@@ -4452,6 +4495,7 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return int(result) if result.isdigit() else 0
 
+    @_account_operation
     def update_mailbox(
         self,
         account: str,
@@ -4596,6 +4640,7 @@ class AppleMailConnector:
             raise
         return True
 
+    @_account_operation
     def delete_mailbox(
         self,
         account: str,
@@ -4666,6 +4711,7 @@ class AppleMailConnector:
                 ) from e
             raise
 
+    @_account_operation
     def create_mailbox(
         self,
         account: str,
@@ -4722,6 +4768,7 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return result == "success"
 
+    @_account_operation
     def delete_messages(
         self,
         message_ids: list[str],
@@ -5017,6 +5064,7 @@ class AppleMailConnector:
             return True
         raise MailDraftNotFoundError(f"no draft with id {draft_id!r}")
 
+    @_account_operation
     def find_message_by_message_id(
         self,
         rfc5322_message_id: str,
@@ -5128,7 +5176,7 @@ class AppleMailConnector:
             return found
 
         last_exc: Exception | None = None
-        for acct in self.list_accounts():
+        for acct in self._account_records():
             account = cast(str, acct.get("name") or "")
             if not account or self._imap_breaker_open(account):
                 continue
@@ -5283,6 +5331,7 @@ class AppleMailConnector:
             )
         return result
 
+    @_account_operation
     def get_draft_state(self, draft_id: str) -> dict[str, Any]:
         """Read recipients, subject, body, threading headers, and
         attachment names from a saved draft.
@@ -5915,7 +5964,7 @@ class AppleMailConnector:
         Raises:
             MailAccountNotFoundError: If the account doesn't exist.
         """
-        account_clause = applescript_account_clause(account)
+        account_clause = applescript_account_clause(self._resolve_account_identity(account).id)
         tell_body = f"""
         tell application "Mail"
             set acctRef to {account_clause}
@@ -5949,6 +5998,7 @@ class AppleMailConnector:
         port = cast(int, parsed.get("port") or 0)
         return host, port
 
+    @_account_operation
     def _resolve_smtp_config(self, account: str) -> tuple[str, int, str]:
         """Resolve ``(smtp_host, smtp_port, login_email)`` for an account.
 
@@ -6360,6 +6410,7 @@ class AppleMailConnector:
             self._log_imap_fallback(from_account, exc)
         return None
 
+    @_account_operation
     def create_draft(
         self,
         *,
@@ -6936,7 +6987,7 @@ class AppleMailConnector:
         caller keeps Mail's default (AppleScript) behavior.
         """
         try:
-            accounts = self.list_accounts()
+            accounts = self._account_records()
         except Exception:
             return None
         enabled = [a for a in accounts if a.get("enabled")]
@@ -6945,6 +6996,7 @@ class AppleMailConnector:
         name = enabled[0].get("name")
         return cast(str, name) if name else None
 
+    @_account_operation
     def extract_draft_attachments(
         self,
         draft_id: str,

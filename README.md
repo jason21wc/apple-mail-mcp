@@ -169,7 +169,9 @@ APPLE_MAIL_MCP_IMAP_PASSWORD_<SUFFIX>
 | `Yahoo!` | `APPLE_MAIL_MCP_IMAP_PASSWORD_YAHOO` |
 | `My Gmail` | `APPLE_MAIL_MCP_IMAP_PASSWORD_MY_GMAIL` |
 
-When set to a non-empty value, the env var is used **in preference to** any Keychain entry for that account (it's checked first, with no `security` shell-out). An empty or whitespace-only value is ignored and the Keychain path is used. The lookup composes with the name↔UUID fallback, so an env var keyed on the account name is still found when a caller passes the account's UUID.
+When set to a non-empty value, the env var is used **in preference to** any Keychain entry for that account (it's checked first, with no `security` shell-out). An empty or whitespace-only value is ignored and the Keychain path is used. Callers can supply the current account name or UUID: both resolve the same current name first, then the UUID only if credentials are absent. Access denial and authentication failure do not select another credential. Duplicate account names are rejected rather than guessed.
+
+Login and server overrides likewise prefer the current name, then the UUID. A server override is selected as a whole record, so host and port cannot come from different records. Each operation uses one account snapshot; circuit breakers use the stable UUID. Renaming an account does not search historical names for configuration or credentials.
 
 > ⚠️ **Security tradeoff.** Environment variables are far less private than the Keychain — they're visible via `ps -E`, `launchctl getenv`, `/proc`-style introspection, and process crash dumps, and they're easy to leak into logs or shell history. **Use this only when the Keychain genuinely isn't an option** (uvx, Docker, CI, headless). For Claude Desktop and standard local installs, stick with `setup-imap` + Keychain.
 >

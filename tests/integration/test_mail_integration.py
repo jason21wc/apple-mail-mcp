@@ -3139,6 +3139,48 @@ class TestTimeoutWrappingCompiles:
         assert result.isdigit()
 
 
+class TestScopedAttachmentScriptCompilation:
+    """Compile generated scoped payload scripts without executing a Mail save."""
+
+    @pytest.mark.parametrize("operation", ["single", "batch"])
+    def test_generated_payload_script_compiles(
+        self, connector: AppleMailConnector, monkeypatch: MonkeyPatch,
+        tmp_path: Path, operation: str,
+    ) -> None:
+        import subprocess
+
+        scripts: list[str] = []
+        monkeypatch.setattr(connector, "_native_account", lambda account: "12345678-1234-1234-1234-123456789abc")
+        monkeypatch.setattr(connector, "_run_applescript", lambda script: scripts.append(script) or "1")
+        monkeypatch.setattr(connector, "_get_attachments_applescript", lambda *args, **kwargs: [{"name": "fixture.txt", "size": 1}])
+        scope = {"account": "Fixture Account", "mailbox": 'Archive/Receipts "2026"'}
+        if operation == "single":
+            connector._save_one_attachment_applescript("42", 1, tmp_path / "fixture.txt", **scope)
+        else:
+            connector.save_attachments("42", tmp_path, **scope)
+        assert len(scripts) == 1
+        # A restricted compiler process may not resolve "Mail" via Launch
+        # Services, silently losing its terminology before reporting syntax
+        # errors on valid properties such as "unread count". Bind the same
+        # generated source to the installed bundle for deterministic parsing;
+        # this compiles only and does not change production application targets.
+        bundle = next((path for path in (
+            Path("/System/Applications/Mail.app"), Path("/Applications/Mail.app"),
+        ) if path.is_dir()), None)
+        if bundle is None:
+            pytest.skip("Mail.app must be installed for source compilation")
+        source = scripts[0].replace(
+            'application "Mail"', f'application "{escape_applescript_string(str(bundle))}"',
+        )
+        source_path = tmp_path / "payload.applescript"
+        source_path.write_text(source, encoding="utf-8")
+        compiled = subprocess.run(
+            ["/usr/bin/osacompile", "-o", str(tmp_path / "payload.scpt"), str(source_path)],
+            text=True, capture_output=True, timeout=30,
+        )
+        assert compiled.returncode == 0, compiled.stderr
+
+
 class TestResolveImapConfigAppleScript:
     """#267 / #272 — _resolve_imap_config coerces `server name` / `port`
     for `missing value` so accounts without an IMAP server don't drop those

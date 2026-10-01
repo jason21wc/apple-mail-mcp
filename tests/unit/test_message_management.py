@@ -10,6 +10,8 @@ from apple_mail_fast_mcp.exceptions import (
 )
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
 
+pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
+
 
 class TestMoveMessages:
     """Tests for moving messages between mailboxes."""

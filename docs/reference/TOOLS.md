@@ -654,7 +654,7 @@ Save attachments from a message to a directory.
 | `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
 | `output_filename` | string | No | None | **Fork extension.** Save under this exact (sanitized) name instead of the attachment's own. Requires exactly one entry in `attachment_indices`. |
 | `overwrite` | bool | No | `false` | Only meaningful with `output_filename`. Default is **no-clobber**: an existing destination is left untouched and the call returns `error_type: "already_exists"`. `true` replaces it atomically. |
-| `account` | string | No | None | Mail.app account name or UUID. With `mailbox`, takes the IMAP fast path (one fetch). Pass the same values you read the message with so attachment ordering matches. |
+| `account` | string | No | None | Mail.app account name or UUID. With `mailbox`, enables IMAP for RFC Message-IDs; numeric Mail.app IDs use scoped native lookup. Pass the same scope used to read the message. |
 | `mailbox` | string | No | None | Folder the message lives in (e.g. "INBOX"), used with `account` for the IMAP fast path. |
 
 **Overwrite behavior:** the no-clobber guarantee applies to the `output_filename` path only, where the commit is an atomic `os.link` (so two concurrent saves cannot both win). The **bulk path** — no `output_filename`, saving attachments under their own names — writes through the connector and *does* overwrite same-named files in the destination. Save one attachment per call with `output_filename` when that matters. A directory at the destination is rejected with `error_type: "invalid_destination"` rather than nested into.
@@ -713,7 +713,7 @@ Read **one** attachment's content inline, without writing it to disk — for "tr
 |-----------|------|----------|---------|-------------|
 | `message_id` | string | Yes | - | Message id as returned by `search_messages` / `get_messages` (RFC 5322 Message-ID on the IMAP path, Mail's internal id on the AppleScript path). |
 | `attachment_index` | integer | Yes | - | **0-based** index into the message's attachments, in the same order `get_attachments` / `get_messages(include_attachments=True)` report. |
-| `account` | string \| null | No | null | Mail.app account name or UUID. Supply it (with `mailbox`) for the faster IMAP path; pass the same value you read the message with so ordering matches. |
+| `account` | string \| null | No | null | Mail.app account name or UUID. With `mailbox`, enables IMAP for RFC Message-IDs; numeric Mail.app IDs retain native account/mailbox scope. Pass the same scope used to read the message. |
 | `mailbox` | string \| null | No | null | Folder the message lives in (for the IMAP path). |
 
 **Returns:**
@@ -1397,7 +1397,7 @@ List all configured email accounts in Apple Mail, with identity, type, and enabl
 
 **Field notes:**
 
-- `id`: Account UUID. Stable across display-name changes; future tools may accept this in place of `name`.
+- `id`: Account UUID. Stable across display-name changes; account-scoped tools accept it in place of `name`. Name and UUID resolve the same current configuration and credentials; ambiguous names are rejected.
 - `account_type`: One of `imap`, `pop`, `iCloud`, `hotmail`, `iCal`, `smtp`. Derived from Mail's internal type constant.
 - `enabled`: `false` for accounts the user has disabled in Mail.app preferences.
 

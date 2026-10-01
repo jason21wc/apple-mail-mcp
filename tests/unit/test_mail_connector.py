@@ -35,6 +35,8 @@ from apple_mail_fast_mcp.mail_connector import (
     _wrap_with_timeout,
 )
 
+pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
+
 
 class TestMessageIdMatchClause:
     """#415: the AppleScript match clause. A numeric (all-digit) id matches by
@@ -7720,18 +7722,16 @@ class TestKeychainDualFormLookup:
     """Keychain entries are written under whatever string the user typed at
     setup-imap time (typically the account NAME). Callers may legitimately
     pass either the name or the UUID (per the docstring's stability claim).
-    The wrapper retries with the alternative form on initial NotFound.
+    The wrapper resolves the account first and always tries name then UUID.
 
-    Opts out of the conftest ``_alternative_account_identifier`` stub via the
-    ``real_account_fallback`` marker — these tests exercise the real fallback
-    against an instance-mocked ``list_accounts`` (no AppleScript).
+    Opts out of the conftest identity stub via ``real_account_fallback``;
+    these tests supply an account snapshot without AppleScript.
     """
 
     def test_primary_lookup_succeeds_no_fallback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When the caller-supplied form matches the Keychain entry, the
-        wrapper returns the password without touching list_accounts."""
+        """Resolve the canonical account once, then use its name credential."""
         from apple_mail_fast_mcp import mail_connector
         from apple_mail_fast_mcp.mail_connector import AppleMailConnector
 
@@ -7743,13 +7743,11 @@ class TestKeychainDualFormLookup:
         c = AppleMailConnector()
         monkeypatch.setattr(
             c, "list_accounts",
-            lambda: list_accounts_called.append(1) or [],
+            lambda: list_accounts_called.append(1) or [{"name": "Gmail", "id": "04E9E040-D5C2-4B6B-8FFA-5AAF3DCCAB16"}],
         )
         result = c._get_imap_password_with_fallback("Gmail", "alice@gmail.com")
         assert result == "PRIMARY-PW"
-        assert list_accounts_called == [], (
-            "list_accounts must not be called on the happy path"
-        )
+        assert list_accounts_called == [1]
 
     def test_uuid_lookup_falls_back_to_name(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7778,8 +7776,8 @@ class TestKeychainDualFormLookup:
             "04E9E040-D5C2-4B6B-8FFA-5AAF3DCCAB16", "alice@gmail.com"
         )
         assert result == "FALLBACK-PW"
-        # Order: UUID first, then name
-        assert attempts == ["04E9E040-D5C2-4B6B-8FFA-5AAF3DCCAB16", "Gmail"]
+        # Canonical name wins even when the caller supplies the UUID.
+        assert attempts == ["Gmail"]
 
     def test_name_lookup_falls_back_to_uuid(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7842,10 +7840,10 @@ class TestKeychainDualFormLookup:
 
         monkeypatch.setattr(mail_connector, "get_imap_password", fake_get)
         c = AppleMailConnector()
-        # list_accounts must not be consulted; assert via failure if called
+        # Resolve identity first; a denied name credential must not try UUID.
         monkeypatch.setattr(
             c, "list_accounts",
-            lambda: (_ for _ in ()).throw(AssertionError("should not be called")),
+            lambda: [{"name": "Gmail", "id": "04E9E040-D5C2-4B6B-8FFA-5AAF3DCCAB16"}],
         )
         with pytest.raises(MailKeychainAccessDeniedError):
             c._get_imap_password_with_fallback("Gmail", "alice@gmail.com")
@@ -7866,7 +7864,7 @@ class TestKeychainDualFormLookup:
         monkeypatch.setattr(mail_connector, "get_imap_password", always_missing)
         c = AppleMailConnector()
         monkeypatch.setattr(c, "list_accounts", lambda: [])
-        with pytest.raises(MailKeychainEntryNotFoundError):
+        with pytest.raises(MailAccountNotFoundError):
             c._get_imap_password_with_fallback("Unknown", "alice@example.com")
 
     def test_env_var_keyed_on_name_found_when_caller_passes_uuid(
@@ -7903,15 +7901,8 @@ class TestKeychainDualFormLookup:
             "04E9E040-D5C2-4B6B-8FFA-5AAF3DCCAB16", "alice@gmail.com"
         )
         assert result == "ENV-PW"
-        # Only the UUID form shelled out to `security`; the name form was
-        # satisfied by the env var without a Keychain call. The UUID form
-        # probes both prefixes (new, then legacy on the NotFound miss — #337).
-        assert len(run_calls) == 2
-        services = [cmd[cmd.index("-s") + 1] for cmd in run_calls]
-        assert services == [
-            "apple-mail-fast-mcp.imap.04E9E040-D5C2-4B6B-8FFA-5AAF3DCCAB16",
-            "apple-mail-mcp.imap.04E9E040-D5C2-4B6B-8FFA-5AAF3DCCAB16",
-        ]
+        # Name resolution finds the environment entry before any Keychain read.
+        assert run_calls == []
 
 
 # =============================================================================

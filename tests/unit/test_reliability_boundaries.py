@@ -8,6 +8,8 @@ from apple_mail_fast_mcp.drafts import DraftStateStore, SeedRecord
 from apple_mail_fast_mcp.exceptions import MailDraftError
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
 
+pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
+
 
 @pytest.fixture
 def draft_mail(monkeypatch, tmp_path):
