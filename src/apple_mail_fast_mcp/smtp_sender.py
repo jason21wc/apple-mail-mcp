@@ -10,8 +10,9 @@ submits a clean RFC 822 message (built by
 direct send never touches the AppleScript ``content`` setter.
 
 Credential model: the account's IMAP app-password (see :mod:`keychain`) is
-reused. For every provider we support (iCloud, Gmail, Yahoo, Outlook) the
-same app-specific password authenticates both IMAP and SMTP submission, so
+reused for providers supporting password authentication (such as iCloud).
+Microsoft's OAuth flow is not implemented. The same configured credential
+authenticates IMAP and SMTP submission where the provider permits it, so
 we deliberately reuse the existing Keychain entry rather than building a
 parallel SMTP credential store (issue #322 "extend the keychain module").
 

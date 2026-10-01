@@ -31,7 +31,7 @@ class TestDetectByHost:
         # Email is deliberately unrelated — host must win.
         p = detect_provider(host, "someone@example.org")
         assert p.key == expected_key
-        assert p.app_password_url  # every known provider has a URL
+        assert bool(p.app_password_url) == p.password_auth_supported
 
     def test_host_is_case_insensitive(self):
         assert detect_provider("IMAP.GMAIL.COM", "").key == "gmail"
@@ -76,11 +76,13 @@ class TestProviderTable:
         for p in PROVIDERS.values():
             assert isinstance(p, Provider)
             assert p.key and p.name and p.steps
-        # Generic is the only one without a URL.
+        # Microsoft has no usable app-password setup route in this connector.
         assert GENERIC.app_password_url is None
         assert all(
-            p.app_password_url for k, p in PROVIDERS.items() if k != "generic"
+            p.app_password_url for k, p in PROVIDERS.items() if k not in {"generic", "outlook"}
         )
+        assert PROVIDERS["outlook"].app_password_url is None
+        assert not PROVIDERS["outlook"].password_auth_supported
 
 
 class TestSmtpSavesSentCopy:
