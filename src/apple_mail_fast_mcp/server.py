@@ -315,6 +315,39 @@ def list_accounts() -> dict[str, Any]:
 @_tool(
     {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
+def check_account(account: str, mailbox: str = "INBOX") -> dict[str, Any]:
+    """Diagnose one account without fetching or changing mail.
+
+    Accepts the current Mail.app name or UUID. Uses production configuration
+    and credential precedence, but a fresh unpooled IMAP connection. Reports
+    endpoint, credential-source label, Mail availability, authentication,
+    capabilities, read-only mailbox access, and circuit-breaker state without
+    changing that state. Keychain and network operations have individual
+    timeouts; there is no hard overall deadline. An unhealthy completed probe
+    returns success:true with component errors; invalid/unresolved input is
+    success:false. This does not certify sends or every other mail operation.
+    """
+    try:
+        safety_err = check_test_mode_safety("check_account", account=account)
+        if safety_err:
+            return safety_err
+        rate_err = check_rate_limit("check_account", {"account": account})
+        if rate_err:
+            return rate_err
+        result = mail.check_account(account, mailbox)
+        operation_logger.log_operation("check_account", {"account": account}, "success")
+        return result
+    except MailAccountNotFoundError:
+        return {"success": False, "error_type": "account_not_found", "error": "Account could not be resolved in Mail.app."}
+    except ValueError as exc:
+        return {"success": False, "error_type": "validation_error", "error": str(exc)}
+    except Exception:
+        return {"success": False, "error_type": "account_diagnostic_unavailable", "error": "Account discovery or the diagnostic could not complete. Check Mail.app and local access permissions."}
+
+
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
+)
 def list_rules() -> dict[str, Any]:
     """
     List all Mail.app rules (read-only).

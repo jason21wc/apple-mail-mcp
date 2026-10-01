@@ -4,7 +4,7 @@ Complete reference for all MCP tools provided by the Apple Mail MCP server.
 
 ## Overview
 
-**Total Tools:** 25 (11 read-only, 14 mutating — see Classification below). See the [CHANGELOG](../../CHANGELOG.md) for the version history.
+See Classification below and the [CHANGELOG](../../CHANGELOG.md) for the version history.
 
 ## Tool annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`)
 
@@ -19,7 +19,7 @@ Every tool ships with the per-tool annotations the MCP 2025-03 spec defines so h
 
 **Classification:**
 
-- **Read-only:** `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
+- **Read-only:** `check_account`, `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
 - **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`, `save_template`. All have `destructiveHint=true`, `idempotentHint=true`. `save_attachments` and `save_template` are here because `overwrite=true` can replace state the caller did not create — the annotation describes capability, not the default path, which refuses to clobber.
 - **Mutating additive:** `create_mailbox`, `create_draft`, `create_rule`. All have `destructiveHint=false`. Idempotent except `create_draft` and `create_rule` (each call may create a new entity).
 
@@ -28,6 +28,34 @@ Counts are deliberately omitted — they are derivable and go stale. `make eval-
 **Host doesn't honor annotations?** Use the split-server config in the [README](../../README.md#optional-split-read--write-servers). Pass `--read-only` to one connector entry to expose only the read-only tools; pair with a second non-read-only entry. Claude Desktop's per-server permission UI then naturally groups them. The two approaches compose: annotations describe the model, the split-server flag enforces it client-side.
 
 ## Phase 1 Tools (v0.1.0) - Core Foundation
+
+### check_account
+
+Diagnose one configured account without fetching messages or changing mail.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `account` | string | Yes | - | Current Mail.app account name or UUID; ambiguous names are rejected. |
+| `mailbox` | string | No | `INBOX` | Exact folder to examine read-only. |
+
+Uses the same account, endpoint, login, and credential precedence as normal
+operations. Opens a fresh unpooled connection for authentication, capabilities,
+and read-only mailbox examination. It does not search or fetch messages, update
+configuration, or alter the circuit breaker, even if that breaker is open.
+
+Returns `account`, `endpoint` (host/port), `credential` (source label and whether
+the name or UUID matched), `mail`, `imap`, `mailbox`, and `breaker` components.
+Credentials and raw server/Keychain errors are never returned. Capability output
+is limited to features relevant to this server. A missing credential, rejected
+login, or unavailable mailbox is a completed diagnostic: `success:true` with
+component `status`, `error_type`, and corrective `guidance`. Invalid input or an
+unresolved account returns `success:false`.
+
+Each diagnostic Keychain subprocess is bounded to 30 seconds. Network operations
+retain the production timeout settings. These limits do not establish a hard
+overall deadline, including DNS/TLS setup and multiple credential lookups. A
+successful diagnostic proves only the listed checks; it does not certify sends,
+attachments, mutations, or every client installation.
 
 ### search_messages
 

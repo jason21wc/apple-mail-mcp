@@ -121,6 +121,7 @@ TIER_LIMITS: dict[str, tuple[int, float]] = {
 }
 
 OPERATION_TIERS: dict[str, str] = {
+    "check_account": "expensive_ops",
     "list_accounts": "cheap_reads",
     "list_rules": "cheap_reads",
     "list_mailboxes": "cheap_reads",
@@ -396,6 +397,7 @@ RESERVED_TEST_DOMAINS = {"example.com", "example.net", "example.org"}
 RESERVED_TEST_TLDS = {".example", ".test", ".invalid", ".localhost"}
 
 ACCOUNT_GATED_OPERATIONS = {
+    "check_account",
     "list_mailboxes",
     "search_messages",
     "update_message",

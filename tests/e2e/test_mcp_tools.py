@@ -29,6 +29,7 @@ from apple_mail_fast_mcp.templates import Template, TemplateStore
 pytestmark = pytest.mark.e2e
 
 EXPECTED_TOOLS = {
+    "check_account",
     # Discovery
     "list_accounts",
     "list_mailboxes",
@@ -136,6 +137,10 @@ _TMP_FILE = "__TMP_FILE__"
 
 # (tool_name, call_args, connector_method, connector_return_value)
 INVOCATION_CASES: list[tuple[str, dict[str, Any], str | None, Any]] = [
+    (
+        "check_account", {"account": "TestAccount"}, "check_account",
+        {"success": True, "imap": {"status": "available"}},
+    ),
     (
         "list_accounts",
         {},

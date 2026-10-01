@@ -1913,13 +1913,26 @@ class AppleMailConnector:
         Each lookup preserves get_imap_password's environment, current Keychain,
         then legacy Keychain order. Access denial and other errors never retry.
         """
+        return self._get_account_credential(account, email, get_imap_password)[0]
+
+    def _get_account_credential(
+        self, account: str, email: str, reader: Callable[[str, str], _R],
+    ) -> tuple[_R, str]:
+        """One name/UUID precedence rule for runtime and source-aware diagnostics."""
         identity = self._resolve_account_identity(account)
         try:
-            return get_imap_password(identity.name, email)
+            return reader(identity.name, email), "name"
         except MailKeychainEntryNotFoundError:
             if identity.id == identity.name:
                 raise
-            return get_imap_password(identity.id, email)
+            return reader(identity.id, email), "uuid"
+
+    @_account_operation
+    def check_account(self, account: str, mailbox: str = "INBOX") -> dict[str, Any]:
+        """Probe one account without fetching mail, changing configuration, or pooling."""
+        from .account_diagnostics import check_account
+
+        return check_account(self, account, mailbox)
 
     @_account_operation
     def _resolve_imap_config(self, account: str) -> tuple[str, int, str]:

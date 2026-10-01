@@ -130,7 +130,12 @@ On first run, macOS will prompt for Automation access. Grant permission in:
 
 `search_messages` works out of the box via AppleScript. For large mailboxes (thousands of messages), AppleScript's `whose` clause can take 1–5 seconds per query. If you want faster server-side search, you can enable IMAP delegation per account by adding a Keychain entry.
 
-**How it works.** If credentials exist for an account, the server uses IMAP (fast, server-side SEARCH). Otherwise — or on any IMAP failure (offline, wrong password, timeout) — it silently falls back to AppleScript. You never lose functionality; you only gain speed when IMAP is configured and reachable. The normal opt-in is a Keychain entry (below); an environment-variable fallback ([further down](#environment-variable-fallback-uvx--headless--ci)) covers contexts where the Keychain isn't usable.
+Use `check_account(account, mailbox="INBOX")` to diagnose the selected endpoint,
+credential source, authentication, mailbox access, and circuit breaker. It uses
+a fresh connection and reads no messages. Completed unhealthy checks return
+component guidance; they do not change configuration or reset the breaker.
+
+**How it works.** Configured server-hosted accounts prefer IMAP. Native features and eligible pre-dispatch failures use AppleScript. Incomplete reads, resource-limit failures, and uncertain mutations are reported explicitly; fallback does not guarantee identical behavior or latency. The normal opt-in is a Keychain entry (below); an environment-variable fallback ([further down](#environment-variable-fallback-uvx--headless--ci)) covers contexts where the Keychain isn't usable.
 
 **One-time setup per account — the `setup-imap` subcommand walks you through it:**
 

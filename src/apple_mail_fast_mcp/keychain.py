@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import subprocess
+from dataclasses import dataclass, field
 from typing import NoReturn
 
 from apple_mail_fast_mcp.exceptions import (
@@ -70,7 +71,7 @@ def _env_var_name(mail_app_account: str) -> str | None:
     return IMAP_PASSWORD_ENV_PREFIX + suffix
 
 
-def _run_security(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_security(args: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     """Invoke ``security`` capturing output; map a missing binary to
     ``MailKeychainError`` (the only failure not signalled via exit code)."""
     try:
@@ -79,7 +80,10 @@ def _run_security(args: list[str]) -> subprocess.CompletedProcess[str]:
             capture_output=True,
             text=True,
             check=False,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise MailKeychainError("Keychain lookup timed out") from exc
     except FileNotFoundError as exc:
         raise MailKeychainError(f"`security` binary not found: {exc}") from exc
 
@@ -107,7 +111,7 @@ def _raise_security_failure(
     )
 
 
-def _find_password(service: str, email: str) -> str:
+def _find_password(service: str, email: str, *, timeout: float | None = None) -> str:
     """Read one Keychain entry for an exact service name. Raises
     ``MailKeychainEntryNotFoundError`` on a miss (lets the caller fall back to
     the legacy prefix), or AccessDenied / generic errors via
@@ -121,7 +125,8 @@ def _find_password(service: str, email: str) -> str:
             service,
             "-a",
             email,
-        ]
+        ],
+        **({"timeout": timeout} if timeout is not None else {}),
     )
     if result.returncode == 0:
         return result.stdout.rstrip("\n")
@@ -155,7 +160,22 @@ def _delete_password(service: str, email: str) -> None:
     _raise_security_failure(result, service, email, "delete-generic-password")
 
 
+@dataclass(frozen=True)
+class ImapCredential:
+    """Resolved secret and a non-secret source label; never log the secret."""
+
+    password: str = field(repr=False)
+    source: str
+
+
 def get_imap_password(mail_app_account: str, email: str) -> str:
+    """Compatibility accessor using the same resolution as diagnostics."""
+    return get_imap_credential(mail_app_account, email).password
+
+
+def get_imap_credential(
+    mail_app_account: str, email: str, *, timeout: float | None = None,
+) -> ImapCredential:
     """Return the app-specific password stored in Keychain.
 
     Args:
@@ -189,16 +209,22 @@ def get_imap_password(mail_app_account: str, email: str) -> str:
             # commonly append a trailing newline, and sending it as part of
             # the password fails LOGIN. Mirrors the Keychain path's rstrip.
             # (#349)
-            return env_pw.strip()
+            return ImapCredential(env_pw.strip(), "environment")
     # Read-through fallback (#337): prefer the new prefix, retry the legacy one
     # only on a NotFound miss. AccessDenied / generic errors propagate from the
     # first attempt — they're explicit macOS signals, not "wrong prefix".
     try:
-        return _find_password(SERVICE_NAME_PREFIX + mail_app_account, email)
-    except MailKeychainEntryNotFoundError:
-        return _find_password(
-            _LEGACY_SERVICE_NAME_PREFIX + mail_app_account, email
+        password = _find_password(
+            SERVICE_NAME_PREFIX + mail_app_account, email,
+            **({"timeout": timeout} if timeout is not None else {}),
         )
+        return ImapCredential(password, "keychain")
+    except MailKeychainEntryNotFoundError:
+        password = _find_password(
+            _LEGACY_SERVICE_NAME_PREFIX + mail_app_account, email,
+            **({"timeout": timeout} if timeout is not None else {}),
+        )
+        return ImapCredential(password, "legacy_keychain")
 
 
 def set_imap_password(
