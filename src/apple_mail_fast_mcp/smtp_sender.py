@@ -31,6 +31,8 @@ from email.message import Message
 from email.policy import default as _default_policy
 from email.utils import parseaddr
 
+from .exceptions import MailError
+
 logger = logging.getLogger(__name__)
 
 # Implicit-TLS submission port (RFC 8314). Anything else (587 submission,
@@ -38,6 +40,34 @@ logger = logging.getLogger(__name__)
 _SMTP_SSL_PORT = 465
 
 _DEFAULT_TIMEOUT_S = 30.0
+
+
+class MailSmtpSendOutcomeUnknownError(MailError):
+    """Submission started but its outcome is unknown; never resend via fallback."""
+
+    def __init__(self, requested: int, candidate_message_id: str | None) -> None:
+        super().__init__(
+            "SMTP submission may have delivered the message, but no conclusive "
+            "response was received. Do not resend without checking delivery."
+        )
+        self.requested = requested
+        self.candidate_message_id = candidate_message_id
+        self.phase = "submission"
+
+
+class MailSmtpSendRejectedError(MailError):
+    """Explicit SMTP rejection; switching transport must not override it."""
+
+    def __init__(self, cause: smtplib.SMTPException, requested: int) -> None:
+        super().__init__("The SMTP server rejected the submission; it was not resent.")
+        self.requested = requested
+        self.smtp_code: int | None = getattr(cause, "smtp_code", None)
+        self.refused_recipients: dict[str, tuple[int, bytes]] = getattr(cause, "recipients", {})
+        self.phase = (
+            "sender" if isinstance(cause, smtplib.SMTPSenderRefused)
+            else "recipients" if isinstance(cause, smtplib.SMTPRecipientsRefused)
+            else "data"
+        )
 
 
 class SmtpSender:
@@ -106,15 +136,11 @@ class SmtpSender:
         is ``None`` the address is taken from the message ``From:`` header —
         the same address the recipient sees.
 
-        Once the server accepts the message (``send_message`` returns), any
-        error raised while tearing the session down is swallowed rather than
-        propagated. The notable case is a non-221 reply to ``QUIT``: on
-        exiting the ``with`` block ``smtplib.SMTP.__exit__`` issues ``QUIT``
-        and raises ``SMTPResponseException`` for any non-221 reply. Sending
-        is non-idempotent, so letting that propagate would make the caller's
-        AppleScript fallback deliver a *second* copy (PR #404 review). Errors
-        *before* acceptance (connect, AUTH, refused recipient, rejected DATA)
-        still propagate so the caller can fall back safely.
+        Only failures before submission remain eligible for another transport.
+        An explicit sender/recipient/DATA rejection is returned as a typed
+        rejection; a lost response after submission starts is an unknown
+        outcome, not permission to send again. Cleanup cannot replace either
+        an acknowledged result or the primary submission error.
 
         Returns:
             Refused recipients and SMTP status; an empty mapping means all
@@ -132,12 +158,11 @@ class SmtpSender:
         Raises:
             ValueError: ``recipients`` is empty, or no envelope-from address
                 could be resolved (no override and no parseable ``From:``).
-            smtplib.SMTPException: An SMTP-level failure *before* the message
-                was accepted (auth, refused recipient, protocol error).
-                Callers that want graceful AppleScript fallback catch this
-                plus ``OSError``.
-            OSError: Connection failure (host unreachable, TLS error,
-                timeout) before acceptance.
+            smtplib.SMTPException: Setup/authentication failed before submission.
+            OSError: Connection failure before submission.
+            MailSmtpSendRejectedError: Explicit sender, recipient, or DATA rejection.
+            MailSmtpSendOutcomeUnknownError: Submission was dispatched but its
+                outcome is uncertain. Neither typed error permits native replay.
         """
         if not recipients:
             raise ValueError("SMTP send requires at least one recipient")
@@ -150,40 +175,33 @@ class SmtpSender:
         env_from = self._resolve_envelope_from(msg, envelope_from)
 
         context = ssl.create_default_context()
-        accepted = False
-        refused: dict[str, tuple[int, bytes]] = {}
-        try:
-            if self._port == _SMTP_SSL_PORT:
-                with smtplib.SMTP_SSL(
-                    self._host, self._port, timeout=self._timeout, context=context
-                ) as client:
-                    refused = self._authenticate_and_send(client, msg, recipients, env_from)
-                    accepted = True
-            else:
-                with smtplib.SMTP(
-                    self._host, self._port, timeout=self._timeout
-                ) as client:
-                    client.ehlo()
-                    client.starttls(context=context)
-                    client.ehlo()
-                    refused = self._authenticate_and_send(client, msg, recipients, env_from)
-                    accepted = True
-        except (smtplib.SMTPException, OSError):
-            # Not yet accepted → a real send failure; propagate so the caller
-            # falls back to AppleScript. Already accepted → the message is
-            # out; the only thing left to fail is session teardown (e.g. a
-            # non-221 QUIT surfaced by ``SMTP.__exit__``). Swallow it — a
-            # duplicate AppleScript send would otherwise follow (PR #404).
-            if not accepted:
-                raise
-            logger.warning(
-                "SMTP message accepted by %s but session teardown failed; "
-                "not retrying, to avoid a duplicate send",
-                self._host,
-                exc_info=True,
+        client = (
+            smtplib.SMTP_SSL(
+                self._host, self._port, timeout=self._timeout, context=context,
+            ) if self._port == _SMTP_SSL_PORT else smtplib.SMTP(
+                self._host, self._port, timeout=self._timeout,
             )
+        )
+        try:
+            if self._port != _SMTP_SSL_PORT:
+                client.ehlo()
+                client.starttls(context=context)
+                client.ehlo()
+            return self._authenticate_and_send(client, msg, recipients, env_from)
+        finally:
+            self._finish_session(client)
 
-        return refused
+    @staticmethod
+    def _finish_session(client: smtplib.SMTP) -> None:
+        """Never let QUIT/close or cleanup logging replace a submission outcome."""
+        for action in (client.quit, client.close):
+            try:
+                action()
+            except Exception:
+                try:
+                    logger.warning("SMTP cleanup failed; preserving the submission outcome")
+                except Exception:
+                    pass
 
     def _resolve_envelope_from(self, msg: Message, override: str | None) -> str:
         """Resolve the envelope ``MAIL FROM`` address (issue #322 / PR #404).
@@ -231,12 +249,13 @@ class SmtpSender:
         caller-supplied recipient list.
         """
         client.login(self._email, self._password)
-        refused = client.send_message(msg, from_addr=envelope_from, to_addrs=recipients)
-        logger.debug(
-            "SMTP send via %s:%d as %s to %d recipient(s)",
-            self._host,
-            self._port,
-            envelope_from,
-            len(recipients),
-        )
-        return refused
+        candidate = str(msg.get("Message-ID", "")).strip().strip("<>") or None
+        # Entering send_message is the conservative dispatch boundary. A
+        # disconnect can occur after DATA was accepted but before its reply.
+        try:
+            return client.send_message(msg, from_addr=envelope_from, to_addrs=recipients)
+        except (smtplib.SMTPSenderRefused, smtplib.SMTPRecipientsRefused,
+                smtplib.SMTPDataError) as exc:
+            raise MailSmtpSendRejectedError(exc, len(recipients)) from exc
+        except (smtplib.SMTPException, OSError) as exc:
+            raise MailSmtpSendOutcomeUnknownError(len(recipients), candidate) from exc

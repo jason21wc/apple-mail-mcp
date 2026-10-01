@@ -8868,11 +8868,10 @@ class TestSmtpSendPath:
         with patch(
             "apple_mail_fast_mcp.smtp_sender.smtplib.SMTP"
         ) as mock_smtp:
-            client = mock_smtp.return_value.__enter__.return_value
+            client = mock_smtp.return_value
             client.send_message.return_value = {}
-            # send_message succeeds (message accepted); QUIT on `with` exit
-            # returns non-221, which SMTP.__exit__ raises.
-            mock_smtp.return_value.__exit__.side_effect = (
+            # send_message succeeds; a subsequent QUIT failure cannot erase it.
+            mock_smtp.return_value.quit.side_effect = (
                 smtplib.SMTPResponseException(421, b"4.7.0 try later")
             )
             result = connector.create_draft(
@@ -10068,16 +10067,16 @@ def test_smtp_partial_acceptance_does_not_fall_back_to_applescript(monkeypatch):
     TestSmtpSendPath()._configure_smtp(connector, monkeypatch)
     with patch.object(connector, "_run_applescript") as applescript, \
          patch("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP") as smtp:
-        client = smtp.return_value.__enter__.return_value
+        client = smtp.return_value
         client.send_message.return_value = {"refused@example.com": (550, b"No mailbox")}
-        smtp.return_value.__exit__.side_effect = smtplib.SMTPResponseException(421, b"bye")
+        smtp.return_value.quit.side_effect = smtplib.SMTPResponseException(421, b"bye")
         result = connector.create_draft(
             to=["accepted@example.com", "refused@example.com"], subject="test", body="body",
             from_account="TestAccount", send_now=True,
         )
     assert result["delivery"] == {
         "accepted_recipients": ["accepted@example.com"], "partial": True,
-        "refused_recipients": {"refused@example.com": {"code": 550, "message": "No mailbox"}},
+        "refused_recipients": {"refused@example.com": {"code": 550}},
     }
     applescript.assert_not_called()
     client.send_message.assert_called_once()

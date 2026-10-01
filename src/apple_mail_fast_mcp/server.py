@@ -57,6 +57,7 @@ from .security import (
     validate_bulk_operation,
     validate_send_operation,
 )
+from .smtp_sender import MailSmtpSendOutcomeUnknownError, MailSmtpSendRejectedError
 from .templates import Template, TemplateStore
 from .utils import (
     DEFAULT_MAX_BODY_BYTES,
@@ -3114,6 +3115,48 @@ def _mutation_error_response(
     return response
 
 
+def _smtp_error_response(
+    error: MailSmtpSendOutcomeUnknownError | MailSmtpSendRejectedError,
+    *, original_draft_id: str | None = None,
+) -> dict[str, Any]:
+    """Expose submission status without leaking arbitrary SMTP response text."""
+    response: dict[str, Any] = {
+        "success": False, "error": str(error), "operation": "smtp_send",
+        "phase": error.phase, "requested": error.requested, "retry_safe": False,
+    }
+    if isinstance(error, MailSmtpSendOutcomeUnknownError):
+        response.update(error_type="mutation_outcome_unknown", partial=True,
+                        partial_reason="submission_unconfirmed")
+        if error.candidate_message_id is not None:
+            response["candidate_message_id"] = error.candidate_message_id
+    else:
+        response.update(error_type="smtp_rejected", partial=False)
+        if type(error.smtp_code) is int:
+            response["smtp_code"] = error.smtp_code
+        if error.refused_recipients:
+            response["refused_recipients"] = {
+                recipient: {"code": code}
+                for recipient, (code, _reason) in error.refused_recipients.items()
+                if type(code) is int
+            }
+    if original_draft_id is not None:
+        response["original_draft_id"] = original_draft_id
+    return response
+
+
+def _record_completed_draft(
+    response: dict[str, Any], operation: str, params: dict[str, Any], status: str,
+) -> None:
+    """A failed audit sink must not erase an already acknowledged mutation."""
+    try:
+        operation_logger.log_operation(operation, params, status)
+    except Exception:
+        response["audit_log_failed"] = True
+        response.setdefault("warnings", []).append(
+            "The operation completed but audit logging failed. Do not repeat a send."
+        )
+
+
 def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
     """Map a draft exception to {success, error, error_type}."""
     if isinstance(e, MailDraftNotFoundError):
@@ -3136,6 +3179,8 @@ def _draft_action_error(
     fall through to a generic ``unknown`` mapping). Centralizing this
     keeps the per-tool exception handling small enough to stay under
     the cyclomatic-complexity threshold."""
+    if isinstance(e, (MailSmtpSendOutcomeUnknownError, MailSmtpSendRejectedError)):
+        return _smtp_error_response(e, original_draft_id=original_draft_id)
     if isinstance(e, MailMutationOutcomeUnknownError):
         return _mutation_error_response(e, original_draft_id=original_draft_id)
     if isinstance(e, MailMessageNotFoundError):
@@ -3729,16 +3774,6 @@ async def create_draft(
             draft_id, seed_kind, seed_id, reply_all, send_now,
         )
 
-        operation_logger.log_operation(
-            "create_draft",
-            {
-                "seed_kind": seed_kind,
-                "seed_id": seed_id,
-                "send_now": send_now,
-                "draft_id": draft_id,
-            },
-            "success",
-        )
         response: dict[str, Any] = {
             "success": True,
             "draft_id": draft_id,
@@ -3754,6 +3789,10 @@ async def create_draft(
             response["delivery"] = result["delivery"]
         if warnings:
             response["warnings"] = warnings
+        _record_completed_draft(
+            response, "create_draft", {"seed_kind": seed_kind, "seed_id": seed_id,
+                                       "send_now": send_now, "draft_id": draft_id}, "success",
+        )
         return response
 
     except Exception as e:
@@ -3811,8 +3850,8 @@ def _finish_draft_replacement(
                        "Inspect both drafts before cleanup; do not repeat a send.")
     if warning:
         response.update(partial=True, original_draft_id=draft_id, warnings=[warning])
-    operation_logger.log_operation(
-        "update_draft", {"old_draft_id": draft_id, "new_draft_id": new_draft_id,
+    _record_completed_draft(
+        response, "update_draft", {"old_draft_id": draft_id, "new_draft_id": new_draft_id,
                          "send_now": send_now}, "partial" if warning else "success",
     )
     return response

@@ -1079,12 +1079,35 @@ that account has SMTP + IMAP credentials, `create_draft` now submits a clean,
 wrapper-free RFC 822 message (the same `build_draft_mime` output as the draft
 path) directly over the account's **SMTP** server, reusing the account's IMAP
 app-password (no separate SMTP credential). It falls back to the AppleScript
-send when SMTP isn't configured/reachable. In test mode (`MAIL_TEST_MODE`),
+send when SMTP is unavailable before submission starts (configuration, connection,
+or authentication failure). Once submission starts, rejection or uncertainty
+never triggers a send through another transport. In test mode (`MAIL_TEST_MODE`),
 the SMTP path re-verifies every **resolved** recipient — including reply-all
 recipients derived inside the connector — against the reserved-domain
 allowlist at the transport boundary and refuses the send
 (`error_type: "safety_violation"`) on a violation, closing the #175 class of
 bypass for the new transport.
+
+**SMTP outcomes:** a connection/protocol failure after submission begins returns
+`error_type: "mutation_outcome_unknown"`, `operation: "smtp_send"`,
+`phase: "submission"`, `partial: true`, and `retry_safe: false`.
+`requested` is the number of envelope recipients. `candidate_message_id`, when
+available, identifies the submitted MIME message for reconciliation; it does
+not prove delivery. Inspect delivery before retrying. SMTP acceptance itself
+means acceptance by the submission server, not final inbox delivery.
+
+Explicit sender, recipient, or DATA rejection returns `smtp_rejected`, the
+rejection `phase`, and status codes (`smtp_code` or per-recipient
+`refused_recipients` codes), without arbitrary server rejection text.
+`retry_safe: false` means correct the rejection before a new explicit send;
+the server does not switch transports to override it. Both failures preserve
+and report `original_draft_id` when sending an existing draft through
+`update_draft`.
+
+QUIT/close, Sent-copy, and post-send audit failures cannot erase accepted
+submission or trigger resend. An audit failure adds `audit_log_failed: true`
+and a warning while preserving the result. Partial recipient acceptance keeps
+its existing `delivery` details and retains the original draft on update.
 
 **Examples:**
 
@@ -1126,6 +1149,8 @@ create_draft(
 - `file_not_found`: An attachment path doesn't exist.
 - `html_requires_imap`: `body_html` was set but the clean IMAP path couldn't engage (no Keychain opt-in / IMAP credentials). HTML drafts are never silently downgraded to plain text.
 - `cancelled`: User declined the elicitation prompt (when `send_now=True`).
+- `mutation_outcome_unknown`: SMTP submission or draft APPEND may have applied but its acknowledgment is uncertain; inspect before retrying.
+- `smtp_rejected`: Explicit SMTP rejection; status codes are provided, and no native resend occurs.
 - `applescript_error`, `unknown`: Lower-level failures.
 
 ---
@@ -1576,7 +1601,10 @@ Breaking changes will only occur in major versions (1.0.0, 2.0.0, etc.).
   create another draft or send again. A partial SMTP send retains the original
   draft and names it in the result for recovery.
 - SMTP sends return `delivery.accepted_recipients`, `refused_recipients` (SMTP
-  code and message), and `partial`. Acceptance means the submission server
+  status codes only), and `partial`. Acceptance means the submission server
   accepted the recipient, not proof of final inbox delivery. A partial result
   must never be retried for the original full recipient list. SMTP teardown
-  errors do not discard an already accepted result.
+  errors do not discard an already accepted result. Lost submission replies return
+  `mutation_outcome_unknown`; explicit rejection returns `smtp_rejected`. Neither
+  permits automatic native resend. Audit failures preserve delivery details and
+  add `audit_log_failed: true`.

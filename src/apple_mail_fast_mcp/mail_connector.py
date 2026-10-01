@@ -6064,8 +6064,9 @@ class AppleMailConnector:
         Raises:
             MailSafetyError: A recipient is not on a reserved test domain
                 while ``MAIL_TEST_MODE`` is set.
-            OSError / smtplib.SMTPException: Connection / SMTP failures (the
-                caller catches these to fall back to AppleScript).
+            OSError / smtplib.SMTPException: Failures before SMTP submission;
+                the caller may fall back to AppleScript. Typed SMTP rejection
+                and unknown-outcome errors never permit native replay.
         """
         violation = send_recipients_test_violation(recipients)
         if violation:
@@ -6078,11 +6079,18 @@ class AppleMailConnector:
         return {
             "accepted_recipients": [r for r in recipients if r not in refused],
             "refused_recipients": {
-                recipient: {"code": code, "message": reason.decode("utf-8", errors="replace")}
-                for recipient, (code, reason) in refused.items()
+                recipient: {"code": code}
+                for recipient, (code, _reason) in refused.items()
             },
             "partial": bool(refused),
         }
+
+    def _clear_breaker_after_submission(self, account: str) -> None:
+        """Local bookkeeping cannot turn an accepted send into a replay."""
+        try:
+            self._imap_clear_breaker(account)
+        except Exception:
+            pass
 
     def _send_new_via_smtp(
         self,
@@ -6117,7 +6125,7 @@ class AppleMailConnector:
         )
         recipients = list(to) + list(cc or []) + list(bcc or [])
         delivery = self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
-        self._imap_clear_breaker(from_account)
+        self._clear_breaker_after_submission(from_account)
         self._save_sent_copy(
             from_account, raw, answered=False, smtp_config=smtp_config
         )
@@ -6171,7 +6179,7 @@ class AppleMailConnector:
             attachment_paths=attachment_paths,
         )
         delivery = self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
-        self._imap_clear_breaker(from_account)
+        self._clear_breaker_after_submission(from_account)
         # Reuse the connector already built for the original fetch — a reply
         # carries \\Answered in Sent.
         self._save_sent_copy(
@@ -6239,16 +6247,16 @@ class AppleMailConnector:
                 reply/forward path already built one to fetch the original);
                 ``None`` means build one from the account's resolved config.
         """
-        smtp_host, _port, login_email = smtp_config
-        if detect_provider(smtp_host, login_email).smtp_saves_sent_copy:
-            logger.debug(
-                "Skipping Sent-copy APPEND for %r: provider auto-saves "
-                "SMTP-submitted mail to Sent server-side (an APPEND would "
-                "duplicate it). (#406)",
-                from_account,
-            )
-            return
         try:
+            smtp_host, _port, login_email = smtp_config
+            if detect_provider(smtp_host, login_email).smtp_saves_sent_copy:
+                logger.debug(
+                    "Skipping Sent-copy APPEND for %r: provider auto-saves "
+                    "SMTP-submitted mail to Sent server-side (an APPEND would "
+                    "duplicate it). (#406)",
+                    from_account,
+                )
+                return
             if imap is None:
                 host, port, email = self._resolve_imap_config(from_account)
                 password = self._get_imap_password_with_fallback(
@@ -6262,14 +6270,14 @@ class AppleMailConnector:
                 "Saved Sent copy to %r for account %r", folder, from_account
             )
         except Exception as exc:  # best-effort — must never fail the send
-            logger.warning(
-                "SMTP send for account %r succeeded but saving a "
-                "Sent-mailbox copy failed; the message was delivered, so not "
-                "retrying (a retry could duplicate the send). Cause: %s",
-                from_account,
-                exc,
-                exc_info=True,
-            )
+            try:
+                logger.warning(
+                    "SMTP submission for account %r was accepted but saving a "
+                    "Sent-mailbox copy failed; not retrying. Cause: %s",
+                    from_account, exc, exc_info=True,
+                )
+            except Exception:
+                pass  # A failing log sink cannot undo accepted submission.
 
     def _try_clean_create_or_send(
         self,
@@ -6371,8 +6379,8 @@ class AppleMailConnector:
 
         Engages only for ``send_now`` with a known account, no open circuit
         breaker, and a configured SMTP server. On the usual degradation
-        signals (SMTP not configured, no Keychain opt-in, network/protocol
-        failure, or a reply/forward folder-guess miss) it logs and returns
+        signals (SMTP not configured, no Keychain opt-in, setup/authentication
+        failure before submission, or a reply/forward folder-guess miss) it logs and returns
         ``None``. A test-mode reserved-domain violation is NOT a degradation
         signal — it propagates as ``MailSafetyError`` (#322/#175).
         """

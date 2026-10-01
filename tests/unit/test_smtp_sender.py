@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from apple_mail_fast_mcp.smtp_sender import SmtpSender
+from apple_mail_fast_mcp.smtp_sender import MailSmtpSendRejectedError, SmtpSender
 
 
 def _raw_with_bcc() -> bytes:
@@ -49,7 +49,7 @@ class TestStartTls:
     def test_port_587_uses_starttls_then_login_and_send(
         self, mock_smtp: MagicMock
     ) -> None:
-        client = mock_smtp.return_value.__enter__.return_value
+        client = mock_smtp.return_value
         sender = SmtpSender("smtp.example.com", 587, "u@example.com", "pw")
 
         sender.send(_raw_with_bcc(), ["alice@example.net", "secret@example.com"])
@@ -70,7 +70,7 @@ class TestStartTls:
         sender is what made custom-domain iCloud reject the send with
         ``550 5.7.0 From address is not one of your addresses``. ``RCPT TO``
         is the caller's explicit recipient list."""
-        client = mock_smtp.return_value.__enter__.return_value
+        client = mock_smtp.return_value
         sender = SmtpSender("smtp.example.com", 587, "u@example.com", "pw")
         recipients = ["alice@example.net", "carol@example.org", "secret@example.com"]
 
@@ -89,7 +89,7 @@ class TestStartTls:
     ) -> None:
         """A ``Display Name <addr>`` From header yields the bare address for
         the envelope (``_resolve_account_to_sender`` may return that form)."""
-        client = mock_smtp.return_value.__enter__.return_value
+        client = mock_smtp.return_value
         raw = (
             b"From: Fred Masi <fred@example.com>\r\n"
             b"To: alice@example.net\r\n"
@@ -106,7 +106,7 @@ class TestStartTls:
         self, mock_smtp: MagicMock
     ) -> None:
         """An explicit ``envelope_from`` wins over the ``From:`` header."""
-        client = mock_smtp.return_value.__enter__.return_value
+        client = mock_smtp.return_value
         sender = SmtpSender("smtp.example.com", 587, "u@example.com", "pw")
 
         sender.send(
@@ -128,7 +128,7 @@ class TestStartTls:
     def test_bcc_header_stripped_from_wire_message(
         self, mock_smtp: MagicMock
     ) -> None:
-        client = mock_smtp.return_value.__enter__.return_value
+        client = mock_smtp.return_value
         sender = SmtpSender("smtp.example.com", 587, "u@example.com", "pw")
 
         sender.send(_raw_with_bcc(), ["alice@example.net", "secret@example.com"])
@@ -145,7 +145,7 @@ class TestSsl:
     def test_port_465_uses_ssl_no_starttls(
         self, mock_smtp: MagicMock, mock_ssl: MagicMock
     ) -> None:
-        client = mock_ssl.return_value.__enter__.return_value
+        client = mock_ssl.return_value
         sender = SmtpSender("smtp.example.com", 465, "u@example.com", "pw")
 
         sender.send(_raw_with_bcc(), ["alice@example.net"])
@@ -167,7 +167,7 @@ class TestValidation:
     def test_wire_message_is_parseable(self, mock_smtp: MagicMock) -> None:
         """Regression guard: the object handed to send_message is a real
         parsed EmailMessage, not the raw bytes."""
-        client = mock_smtp.return_value.__enter__.return_value
+        client = mock_smtp.return_value
         sender = SmtpSender("h", 587, "u@example.com", "p")
 
         sender.send(_raw_with_bcc(), ["alice@example.net"])
@@ -181,9 +181,9 @@ class TestValidation:
 class TestTeardownAfterAccept:
     """PR #404: once the server has accepted the message (``send_message``
     returned), a failure during session teardown — most notably a non-221
-    reply to ``QUIT`` that ``SMTP.__exit__`` raises as ``SMTPResponseException``
-    — must NOT propagate, or the caller would fall back to AppleScript and
-    send a duplicate. Failures *before* acceptance must still propagate."""
+    reply to ``QUIT`` — must NOT propagate, or the caller would fall back
+    to AppleScript and send a duplicate. Setup failures still propagate;
+    submission failures have typed rejection or uncertain outcomes."""
 
     @patch("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP")
     def test_non_221_quit_after_accept_is_swallowed(
@@ -191,10 +191,9 @@ class TestTeardownAfterAccept:
     ) -> None:
         """DATA→250 then a non-221 QUIT: ``send`` returns normally (no
         exception surfaces), so the caller never retries via AppleScript."""
-        client = mock_smtp.return_value.__enter__.return_value
-        # Exiting the `with` (post-accept) raises, as real __exit__ does on a
-        # non-221 QUIT reply.
-        mock_smtp.return_value.__exit__.side_effect = smtplib.SMTPResponseException(
+        client = mock_smtp.return_value
+        # Explicit cleanup fails after the server acknowledged submission.
+        mock_smtp.return_value.quit.side_effect = smtplib.SMTPResponseException(
             421, b"4.7.0 closing transmission channel"
         )
         sender = SmtpSender("smtp.example.com", 587, "u@example.com", "pw")
@@ -210,8 +209,8 @@ class TestTeardownAfterAccept:
         self, mock_smtp: MagicMock, mock_ssl: MagicMock
     ) -> None:
         """Same guarantee on the implicit-TLS (:465) path."""
-        client = mock_ssl.return_value.__enter__.return_value
-        mock_ssl.return_value.__exit__.side_effect = smtplib.SMTPResponseException(
+        client = mock_ssl.return_value
+        mock_ssl.return_value.quit.side_effect = smtplib.SMTPResponseException(
             421, b"4.7.0 closing transmission channel"
         )
         sender = SmtpSender("smtp.example.com", 465, "u@example.com", "pw")
@@ -221,18 +220,17 @@ class TestTeardownAfterAccept:
         client.send_message.assert_called_once()
 
     @patch("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP")
-    def test_send_message_failure_before_accept_propagates(
+    def test_submission_rejection_is_typed_and_not_replayable(
         self, mock_smtp: MagicMock
     ) -> None:
-        """A pre-acceptance failure (DATA rejected) must propagate so the
-        caller can fall back to AppleScript — the message was never sent."""
-        client = mock_smtp.return_value.__enter__.return_value
+        """Explicit rejection must not be bypassed with a native resend."""
+        client = mock_smtp.return_value
         client.send_message.side_effect = smtplib.SMTPRecipientsRefused(
             {"alice@example.net": (550, b"5.1.1 no such user")}
         )
         sender = SmtpSender("smtp.example.com", 587, "u@example.com", "pw")
 
-        with pytest.raises(smtplib.SMTPException):
+        with pytest.raises(MailSmtpSendRejectedError):
             sender.send(_raw_with_bcc(), ["alice@example.net"])
 
     @patch("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP")
@@ -240,7 +238,7 @@ class TestTeardownAfterAccept:
         self, mock_smtp: MagicMock
     ) -> None:
         """An AUTH failure is pre-acceptance and must propagate."""
-        client = mock_smtp.return_value.__enter__.return_value
+        client = mock_smtp.return_value
         client.login.side_effect = smtplib.SMTPAuthenticationError(
             535, b"bad creds"
         )
@@ -257,10 +255,10 @@ def test_partial_refusals_survive_teardown(port, quit_fails):
     cls = "SMTP_SSL" if port == 465 else "SMTP"
     refused = {"secret@example.com": (550, b"Mailbox unavailable")}
     with patch(f"apple_mail_fast_mcp.smtp_sender.smtplib.{cls}") as smtp:
-        client = smtp.return_value.__enter__.return_value
+        client = smtp.return_value
         client.send_message.return_value = refused
         if quit_fails:
-            smtp.return_value.__exit__.side_effect = smtplib.SMTPResponseException(421, b"bye")
+            smtp.return_value.quit.side_effect = smtplib.SMTPResponseException(421, b"bye")
         result = SmtpSender("smtp.example.com", port, "login@example.com", "pw").send(
             _raw_with_bcc(), ["alice@example.net", "secret@example.com"]
         )
@@ -270,11 +268,11 @@ def test_partial_refusals_survive_teardown(port, quit_fails):
 
 def test_all_recipients_refused_propagates():
     with patch("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP") as smtp:
-        client = smtp.return_value.__enter__.return_value
+        client = smtp.return_value
         client.send_message.side_effect = smtplib.SMTPRecipientsRefused(
             {"alice@example.net": (550, b"No mailbox")}
         )
-        with pytest.raises(smtplib.SMTPRecipientsRefused):
+        with pytest.raises(MailSmtpSendRejectedError):
             SmtpSender("smtp.example.com", 587, "login@example.com", "pw").send(
                 _raw_with_bcc(), ["alice@example.net"]
             )

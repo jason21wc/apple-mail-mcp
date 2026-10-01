@@ -257,7 +257,7 @@ def test_reply_all_excludes_aliases_without_explicit_sender(connector, monkeypat
 
 def test_smtp_envelope_uses_alias_while_authentication_uses_login(connector, monkeypatch):
     smtp_class = MagicMock()
-    smtp = smtp_class.return_value.__enter__.return_value
+    smtp = smtp_class.return_value
     smtp.send_message.return_value = {}
     monkeypatch.setattr("apple_mail_fast_mcp.smtp_sender.smtplib.SMTP", smtp_class)
     result = connector.create_draft(
