@@ -313,8 +313,15 @@ def run_setup_imap(
     port = cli_port or port
 
     print(f"Found Mail.app account {account_name!r} (email: {email}).")
+    # A login's domain does not establish a custom endpoint's auth policy.
+    provider = detect_provider(host, "" if host else email)
+    if not provider.password_auth_supported:
+        print(f"Provider detected: {provider.name}", file=sys.stderr)
+        for step in provider.steps:
+            print(f"  • {step}", file=sys.stderr)
+        return 1
     _offer_app_password_page(
-        detect_provider(host, email),
+        provider,
         open_url_fn=open_url_fn or webbrowser.open,
         input_fn=input_fn or input,
     )

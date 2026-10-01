@@ -28,6 +28,7 @@ class Provider:
     # appending would produce a duplicate. Verified live against Gmail during
     # the PR #404 review.
     smtp_saves_sent_copy: bool = False
+    password_auth_supported: bool = True
 
 
 ICLOUD = Provider(
@@ -66,12 +67,15 @@ YAHOO = Provider(
 OUTLOOK = Provider(
     key="outlook",
     name="Outlook / Microsoft",
-    app_password_url="https://account.microsoft.com/security",
+    app_password_url=None,
     steps=(
-        "Advanced security options → App passwords → Create.",
-        "App passwords require two-step verification to be on, and are "
-        "unavailable on some managed/work accounts.",
+        "Outlook.com and Exchange Online require OAuth for IMAP.",
+        "This server's direct IMAP connector does not implement OAuth. "
+        "An app password cannot enable this connection.",
+        "Mail.app operations may still be available through AppleScript; "
+        "direct IMAP features remain unavailable.",
     ),
+    password_auth_supported=False,
 )
 
 FASTMAIL = Provider(

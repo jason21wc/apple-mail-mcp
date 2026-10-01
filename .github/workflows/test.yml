@@ -36,6 +36,10 @@ jobs:
       - name: Complexity check
         run: ./scripts/check_complexity.sh
 
+      - name: Offline MCP tool smoke tests
+        run: make smoke
+        timeout-minutes: 3
+
       - name: Version sync check
         run: ./scripts/check_version_sync.sh
 

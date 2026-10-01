@@ -69,6 +69,45 @@ def mock_imap_client() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
+def test_microsoft_setup_does_not_prompt_or_store_credentials(mock_connector, monkeypatch, capsys):
+    """Unsupported authentication must stop before collecting a password."""
+    mock_connector._resolve_imap_config.return_value = (
+        "outlook.office365.com", 993, "alice@example.com",
+    )
+    prompt = MagicMock()
+    write = MagicMock()
+    connect = MagicMock()
+    monkeypatch.setattr("apple_mail_fast_mcp.cli.set_imap_password", write)
+    rc = run_setup_imap(
+        account_name="iCloud", cli_email=None, uninstall=False,
+        connector_factory=lambda: mock_connector,
+        getpass_fn=prompt, imap_factory=connect,
+    )
+    assert rc == 1
+    assert "require OAuth" in capsys.readouterr().err
+    prompt.assert_not_called()
+    write.assert_not_called()
+    connect.assert_not_called()
+
+
+def test_custom_endpoint_with_microsoft_login_can_use_password(mock_connector, monkeypatch):
+    """An email-domain hint cannot prohibit a custom server's authentication."""
+    mock_connector._resolve_imap_config.return_value = (
+        "imap.example.org", 993, "alice@outlook.com",
+    )
+    prompt = MagicMock(return_value="fixture-password")
+    write = MagicMock()
+    monkeypatch.setattr("apple_mail_fast_mcp.cli.set_imap_password", write)
+    rc = run_setup_imap(
+        account_name="iCloud", cli_email=None, uninstall=False,
+        connector_factory=lambda: mock_connector, getpass_fn=prompt,
+        imap_factory=lambda *args: MagicMock(), input_fn=lambda _: "n",
+    )
+    assert rc == 0
+    prompt.assert_called_once()
+    write.assert_called_once()
+
+
 class TestAccountValidation:
     def test_unknown_account_lists_available_and_returns_1(
         self,
