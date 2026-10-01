@@ -27,6 +27,7 @@ from .draft_builder import (
     build_draft_mime,
     build_forward_body,
     build_reply_body,
+    count_attachment_parts,
     derive_reply_recipients,
     extract_attachment_payloads,
     forward_subject,
@@ -2793,7 +2794,8 @@ class AppleMailConnector:
         Dispatch mirrors :meth:`get_attachments`: the IMAP path is used when
         both ``account`` and ``mailbox`` are supplied and the breaker is
         closed (it fetches the raw message and decodes the part — never
-        touches disk), falling back to AppleScript on any IMAP failure. The
+        touches disk), falling back on setup/network failures before bounded
+        retrieval. Raw limits or incomplete retrieval never fall back. The
         AppleScript path can't read attachment bytes directly, so it saves
         the selected attachment to a private temp dir, reads it, and deletes
         it (the temp file is internal — no caller-managed file). (#250)
@@ -2860,13 +2862,11 @@ class AppleMailConnector:
         # Enumerate to match the BODYSTRUCTURE metadata list get_attachments
         # reports — NOT iter_attachments, which diverges and broke the
         # 0-based attachment_index contract (wrong/missing part).
-        atts = extract_attachment_payloads(raw)
-        if not 0 <= attachment_index < len(atts):
-            raise MailAttachmentIndexError(
-                f"attachment_index {attachment_index} out of range: message "
-                f"has {len(atts)} attachment(s)."
-            )
-        filename, maintype, subtype, payload = atts[attachment_index]
+        # Validate and decode only this original MIME index. Unselected parts
+        # may be large or malformed and must not enter the payload decoder.
+        filename, maintype, subtype, payload = extract_attachment_payloads(
+            raw, indices=[attachment_index],
+        )[0]
         self._enforce_inline_cap(len(payload), filename)
         return {
             "name": filename,
@@ -4070,21 +4070,22 @@ class AppleMailConnector:
         password = self._get_imap_password_with_fallback(account, email)
         imap = ImapConnector(host, port, email, password, pool=self._imap_pool)
         raw = imap.fetch_raw_message(message_id, mailbox)
-        # Match the BODYSTRUCTURE metadata list (see _imap_get_attachment_content).
-        parsed = extract_attachment_payloads(raw)
-
-        # Shape the parsed parts like _get_attachments_applescript output so
-        # the shared cap/target helpers apply unchanged. Exact byte sizes
-        # here (not Mail's pre-download estimate) make the pre-check precise.
-        attachments: list[dict[str, Any]] = [
-            {
-                "name": filename,
-                "mime_type": f"{maintype}/{subtype}",
-                "size": len(payload),
-                "downloaded": True,
+        # Keep original slots and caller order for filtering, aggregate caps,
+        # and collision suffixes, while decoding each selected payload once.
+        if attachment_indices is None:
+            parsed_all = extract_attachment_payloads(raw)
+            count = len(parsed_all)
+            parsed = dict(enumerate(parsed_all))
+        else:
+            count = count_attachment_parts(raw)
+            selected = sorted({i for i in attachment_indices if 0 <= i < count})
+            parsed = dict(zip(selected, extract_attachment_payloads(raw, indices=selected), strict=True))
+        attachments: list[dict[str, Any]] = [{} for _ in range(count)]
+        for index, (filename, maintype, subtype, payload) in parsed.items():
+            attachments[index] = {
+                "name": filename, "mime_type": f"{maintype}/{subtype}",
+                "size": len(payload), "downloaded": True,
             }
-            for (filename, maintype, subtype, payload) in parsed
-        ]
 
         allowed, rejected = _select_attachments_within_caps(
             attachments,
@@ -4096,7 +4097,7 @@ class AppleMailConnector:
             return {"saved": 0, "rejected": rejected}
 
         targets = _compute_attachment_save_targets(
-            [a["name"] for a in attachments], save_directory, allowed
+            [str(a.get("name", "")) for a in attachments], save_directory, allowed
         )
         saved = 0
         for as_idx, path in targets:

@@ -432,12 +432,12 @@ def test_parse_original_serializes_forwarded_rfc822_attachment():
     assert "report body" in sub.get_content()
 
 
-def test_parse_original_rfc822_base64_degrades_to_empty_not_corrupt():
+def test_parse_original_rfc822_base64_reports_incomplete():
     """A non-conformant base64-encoded ``message/rfc822`` part (RFC 2046
     §5.2.1 permits only 7bit/8bit/binary for message/*) is parsed by the
     stdlib from its *still-encoded* text, so the sub-message is garbage. We
-    must degrade to empty bytes — an honest "couldn't extract" — rather than
-    hand back corrupt content masquerading as the forwarded message.
+    must raise an explicit incomplete error rather than report a successful
+    zero-byte attachment or return corrupt forwarded-message content.
     """
     import base64
     from email.message import EmailMessage
@@ -458,13 +458,10 @@ def test_parse_original_rfc822_base64_degrades_to_empty_not_corrupt():
         f"{b64}\r\n--BB--\r\n"
     ).encode("ascii")
 
-    fwd = [
-        a for a in parse_original_message(wire).attachments
-        if (a[1], a[2]) == ("message", "rfc822")
-    ]
-    assert len(fwd) == 1
-    # Honest-empty, NOT 265 bytes of re-serialized base64 garbage.
-    assert fwd[0][3] == b""
+    from apple_mail_fast_mcp.exceptions import MailMessageReadIncompleteError
+
+    with pytest.raises(MailMessageReadIncompleteError):
+        parse_original_message(wire)
 
 
 def test_forwarded_rfc822_attachment_round_trips_through_build():

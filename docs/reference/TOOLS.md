@@ -27,6 +27,28 @@ Counts are deliberately omitted — they are derivable and go stale. `make eval-
 
 **Host doesn't honor annotations?** Use the split-server config in the [README](../../README.md#optional-split-read--write-servers). Pass `--read-only` to one connector entry to expose only the read-only tools; pair with a second non-read-only entry. Claude Desktop's per-server permission UI then naturally groups them. The two approaches compose: annotations describe the model, the split-server flag enforces it client-side.
 
+## Raw-message retrieval limits
+
+IMAP raw MIME retrieval uses size preflight and bounded `BODY.PEEK` ranges.
+`APPLE_MAIL_MCP_MAX_RAW_MESSAGE_BYTES` sets a positive integer byte budget;
+the default is **500 MiB (524,288,000 bytes)**. A missing or inconsistent size,
+short/inconsistent range, or interrupted transfer is an explicit
+`message_read_incomplete` error. A declared or observed transfer beyond the
+budget returns `raw_message_too_large`. Neither error triggers an unbounded
+IMAP fetch or AppleScript fallback.
+
+This applies to message-body/raw reads, attachment retrieval, reply/forward
+source reads, and IMAP draft attachment preservation. Headers-only reads do not
+fetch the raw body. The budget is separate from the response-body, decoded
+inline attachment, and disk-save caps. It bounds transferred literals, **not
+process memory**: MIME parsing and payload decoding can allocate additional
+copies. Attachment tools decode only selected payloads; the bounded fallback
+still retrieves the enclosing raw message.
+
+A failed draft-preservation read keeps the original draft and reports
+`original_draft_id` on `update_draft`. Fix the source/read problem or deliberately
+adjust the budget before retrying; a limit failure is not evidence of absence.
+
 ## Phase 1 Tools (v0.1.0) - Core Foundation
 
 ### check_account
@@ -694,7 +716,12 @@ Save attachments from a message to a directory.
 
 **Overwrite behavior:** the no-clobber guarantee applies to the `output_filename` path only, where the commit is an atomic `os.link` (so two concurrent saves cannot both win). The **bulk path** — no `output_filename`, saving attachments under their own names — writes through the connector and *does* overwrite same-named files in the destination. Save one attachment per call with `output_filename` when that matters. A directory at the destination is rejected with `error_type: "invalid_destination"` rather than nested into.
 
-**Performance (#371):** pass `account` + `mailbox` to fetch the message once over IMAP and write the bytes straight to disk. Without them, `save_attachments` falls back to an O(accounts × mailboxes) AppleScript scan whose unindexed `message id` lookup is ~20s/mailbox — on Gmail (dozens of labels) that can run for minutes and time out. Mirrors `get_attachment_content`'s fast path.
+**IMAP retrieval:** pass `account` + `mailbox` with an RFC Message-ID to use
+bounded raw-message retrieval. Only requested attachment payloads are decoded;
+original indices, caller selection order, collision filenames, and cap priority
+are preserved. Invalid save indices are ignored as before; an empty selection
+saves nothing. The raw-message budget can reject the enclosing message even
+when the requested attachment is small. See [raw retrieval limits](#raw-message-retrieval-limits).
 
 **Returns:**
 
@@ -766,6 +793,11 @@ Read **one** attachment's content inline, without writing it to disk — for "tr
 
 - **Encoding:** text-like types (`text/*`, `application/json`, `application/xml`, and `+json`/`+xml` suffixes) are returned as a UTF-8 string with `encoding: "text"`. Everything else — and any text type whose bytes aren't valid UTF-8 — is base64 with `encoding: "base64"`.
 - **No disk:** the IMAP path fetches and decodes the part in memory; the AppleScript fallback saves to a private temp dir, reads, and deletes it (no caller-managed file).
+
+**Raw retrieval:** IMAP decodes only the requested attachment index. The
+separate [raw-message transfer budget](#raw-message-retrieval-limits) applies
+before decoding; `raw_message_too_large` and `message_read_incomplete` do not
+fall back to AppleScript.
 
 **Size limit:** attachments over ~25 MB are rejected (`error_type: "attachment_too_large"`) — use `save_attachments` for large files. Override with `APPLE_MAIL_MCP_MAX_INLINE_ATTACHMENT_BYTES`.
 

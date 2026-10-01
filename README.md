@@ -257,6 +257,7 @@ dual-emit message-ID scheme, the drafts lifecycle, and the IMAP thread tiers.
 - All inputs sanitized and AppleScript-escaped (defense against AppleScript injection)
 - Destructive operations require user confirmation via MCP elicitation; rate limits + audit logging on top
 - `save_attachments` is byte-capped (per-attachment + aggregate) against disk-fill DoS
+- IMAP raw-message reads have a separate 500 MiB transfer budget (`APPLE_MAIL_MCP_MAX_RAW_MESSAGE_BYTES`, positive integer bytes). Oversized or incomplete reads fail explicitly without unbounded fallback. This is a transfer limit, not a process-memory limit; see [raw retrieval limits](docs/reference/TOOLS.md#raw-message-retrieval-limits).
 
 Docs:
 - [SECURITY.md](SECURITY.md) — vulnerability-reporting policy

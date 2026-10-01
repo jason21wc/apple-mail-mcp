@@ -50,6 +50,14 @@ from .exceptions import (
     MailMessageReadIncompleteError,
     MailMutationOutcomeUnknownError,
 )
+from .raw_message import (
+    LiteralBudget,
+    MailRawMessageLimitError,
+    MailRawMessageReadError,
+    fetch_bounded_message,
+    guarded_fetch,
+    raw_message_budget,
+)
 from .utils import parse_rfc822_ids
 
 logger = logging.getLogger(__name__)
@@ -136,6 +144,8 @@ _POOL_INVALIDATE_EXCS: tuple[type[BaseException], ...] = (
     LoginError,
     IMAPClientError,
     OSError,
+    MailRawMessageLimitError,
+    MailRawMessageReadError,
 )
 
 
@@ -1208,12 +1218,8 @@ class ImapConnector:
                 ``"raw"`` preserves the legacy behavior: ``content`` is the
                 undecoded ``BODY[TEXT]`` (the entire multipart body with
                 base64 attachments inlined) — kept only as an escape hatch.
-            headers_only: When True, fetches ``BODY[HEADER]`` instead of
-                ``BODY[TEXT]`` — useful for preview-style callers who
-                don't want the body. ``content`` is always returned as
-                the empty string in this mode (the headers themselves
-                are reflected via the envelope dict; we don't expose the
-                raw RFC 822 header block).
+            headers_only: When True, fetches only envelope metadata.
+                ``content`` is empty and no body payload is downloaded.
 
         Returns:
             Dict with the same keys as the AppleScript ``get_message``
@@ -1232,18 +1238,9 @@ class ImapConnector:
         fetch_keys: list[bytes] = [b"ENVELOPE", b"FLAGS"]
         want_body = include_content and not headers_only
         text_mode = body_format != "raw"
-        # text mode parses the whole message server-side, so fetch BODY[] (full
-        # RFC822); raw mode keeps the legacy header-less BODY[TEXT].
+        # Both content formats share the bounded raw transfer. Raw format
+        # returns only the MIME body after removing the outer header block.
         body_key = b"BODY[]" if text_mode else b"BODY[TEXT]"
-        if want_body:
-            fetch_keys.append(body_key)
-        elif headers_only:
-            # We don't currently use the raw header block for anything in
-            # the response (envelope already gives us subject/sender/date),
-            # but requesting BODY[HEADER] is the spec-correct way to ask
-            # the server for headers without paying for the body. Some
-            # servers send less data this way; some don't care.
-            fetch_keys.append(b"BODY[HEADER]")
         # When we parse the full body (text mode), attachment metadata comes
         # from that parse — more reliable than BODYSTRUCTURE, which yields a
         # false-empty list on some real messages. Only pay for BODYSTRUCTURE
@@ -1262,7 +1259,8 @@ class ImapConnector:
                     f"{mailbox!r} on {self._host}."
                 )
 
-            fetched = client.fetch(uids[:1], fetch_keys)
+            transfer = LiteralBudget(raw_message_budget())
+            fetched = guarded_fetch(client, uids[0], fetch_keys, transfer.remaining, transfer)
             entry = fetched.get(uids[0])
             # The message matched SEARCH but vanished before FETCH (expunged
             # or moved by a concurrent change) — treat as not-found rather
@@ -1276,6 +1274,11 @@ class ImapConnector:
                 raise MailMessageReadIncompleteError(
                     "IMAP returned a message without its required ENVELOPE metadata"
                 )
+
+            if want_body:
+                raw = fetch_bounded_message(client, uids[0], transfer=transfer)
+                entry = dict(entry)
+                entry[body_key] = raw if text_mode else re.split(br"\r?\n\r?\n", raw, maxsplit=1)[-1]
 
             return _build_get_message_result(
                 entry,
@@ -1315,15 +1318,7 @@ class ImapConnector:
                     f"Message-ID {message_id!r} not found in mailbox "
                     f"{mailbox!r} on {self._host}."
                 )
-            fetched = client.fetch(uids[:1], [b"BODY[]"])
-            entry = next(iter(fetched.values()))
-            raw = entry.get(b"BODY[]") or b""
-            if not raw:
-                raise MailMessageNotFoundError(
-                    f"Message-ID {message_id!r} in {mailbox!r} returned an "
-                    f"empty body on {self._host}."
-                )
-            return bytes(raw)
+            return fetch_bounded_message(client, uids[0])
 
     def get_attachments(
         self,
@@ -1902,8 +1897,7 @@ class ImapConnector:
             uids = client.search(["HEADER", "Message-ID", bracketed])
             if len(uids) != 1:
                 raise MailMessageNotFoundError("Draft lookup did not identify exactly one message")
-            fetched = client.fetch(uids, [b"BODY.PEEK[]"])
-            raw = bytes(fetched.get(uids[0], {}).get(b"BODY[]") or b"")
+            raw = fetch_bounded_message(client, uids[0])
             headers = message_from_bytes(raw, policy=policy.default).get_all("Message-ID", [])
             if len(headers) != 1 or str(headers[0]).strip() != bracketed:
                 raise MailMessageNotFoundError("Fetched draft identity did not match")

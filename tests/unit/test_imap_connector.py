@@ -1024,6 +1024,18 @@ class TestFindThreadMembers:
 # ---------------------------------------------------------------------------
 
 
+def _bounded_fetch_responses(client, raw, uid=42):
+    """Model size and exact partial PEEK responses, retaining mutable metadata."""
+    def fetch(uids, keys):
+        if keys == [b"RFC822.SIZE"]:
+            return {uid: {b"RFC822.SIZE": len(raw)}}
+        if len(keys) == 1 and keys[0].startswith(b"BODY.PEEK[]<"):
+            start, count = map(int, keys[0].split(b"<")[1].rstrip(b">").split(b"."))
+            return {uid: {f"BODY[]<{start}>".encode(): raw[start:start + count]}}
+        return client.fetch.return_value
+    client.fetch.side_effect = fetch
+
+
 class TestGetMessage:
     """ImapConnector.get_message — Message-ID lookup + envelope/body fetch."""
 
@@ -1054,6 +1066,7 @@ class TestGetMessage:
                 )
             fetched[uid] = entry
         client.fetch.return_value = fetched
+        _bounded_fetch_responses(client, body, (uids or [42])[0])
         return client
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
@@ -1120,40 +1133,41 @@ class TestGetMessage:
         assert result["read_status"] is True
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
-    def test_default_fetch_keys_include_full_body(
+    def test_default_fetch_uses_bounded_peek_ranges(
         self, mock_cls: MagicMock
     ) -> None:
-        """Default body_format='text' → fetch ENVELOPE + FLAGS + BODY[] (the
-        whole message, so the body is MIME-parsed server-side and attachment
-        bytes are dropped from ``content``)."""
+        """Text content uses envelope metadata then bounded full-message PEEK."""
         self._setup_client(mock_cls)
 
         ImapConnector("h", 993, "u@e.com", "pw").get_message(
             "abc@x", mailbox="INBOX",
         )
 
-        fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
+        calls = mock_cls.return_value.fetch.call_args_list
+        fetch_keys = calls[0].args[1]
         assert b"ENVELOPE" in fetch_keys
         assert b"FLAGS" in fetch_keys
-        assert b"BODY[]" in fetch_keys
+        assert calls[1].args[1] == [b"RFC822.SIZE"]
+        assert calls[2].args[1][0].startswith(b"BODY.PEEK[]<")
+        assert b"BODY[]" not in fetch_keys
         assert b"BODY[TEXT]" not in fetch_keys
         assert b"BODY[HEADER]" not in fetch_keys
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
-    def test_raw_body_format_fetches_legacy_body_text(
+    def test_raw_body_format_preserves_content_with_bounded_transfer(
         self, mock_cls: MagicMock
     ) -> None:
         """body_format='raw' is the escape hatch: keep the legacy
-        header-less BODY[TEXT] fetch and the undecoded content."""
+        header-less undecoded content, after bounded full-message retrieval."""
         self._setup_client(mock_cls, body=b"--b\r\nraw mime\r\n--b--")
 
         result = ImapConnector("h", 993, "u@e.com", "pw").get_message(
             "abc@x", mailbox="INBOX", body_format="raw",
         )
 
-        fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
-        assert b"BODY[TEXT]" in fetch_keys
-        assert b"BODY[]" not in fetch_keys
+        calls = mock_cls.return_value.fetch.call_args_list
+        assert calls[1].args[1] == [b"RFC822.SIZE"]
+        assert calls[2].args[1][0].startswith(b"BODY.PEEK[]<")
         # raw mode returns the bytes verbatim (charset-decoded only).
         assert result["content"] == "--b\r\nraw mime\r\n--b--"
 
@@ -1298,13 +1312,12 @@ class TestGetMessage:
         assert result["content"] == ""
 
     @patch("apple_mail_fast_mcp.imap_connector.IMAPClient")
-    def test_headers_only_uses_body_header_not_body_text(
+    def test_headers_only_uses_envelope_without_body(
         self, mock_cls: MagicMock
     ) -> None:
         """headers_only is the perf knob — fetch headers only, return
         empty content. The envelope already carries subject/sender/date,
-        so the BODY[HEADER] fetch is for spec-correctness vs. servers
-        that might still send the body without an explicit ask."""
+        so no raw header/body payload request is necessary."""
         self._setup_client(
             mock_cls, include_body_fetch=False, include_header_fetch=True,
         )
@@ -1314,7 +1327,7 @@ class TestGetMessage:
         )
 
         fetch_keys = mock_cls.return_value.fetch.call_args[0][1]
-        assert b"BODY[HEADER]" in fetch_keys
+        assert b"BODY[HEADER]" not in fetch_keys
         assert b"BODY[TEXT]" not in fetch_keys
         assert result["content"] == ""
 
@@ -4180,12 +4193,13 @@ class TestFetchRawDraft:
         client.list_folders.return_value = [([b"\\Drafts"] if special else [], b"/", folder)]
         client.search.return_value = [42]
         raw = b"Message-ID: <draft@example.com>\r\n\r\noriginal"
-        client.fetch.return_value = {42: {b"BODY[]": raw}}
+        _bounded_fetch_responses(client, raw)
         conn = ImapConnector("imap.example.com", 993, "test@example.com", "test-only")
         assert conn.fetch_raw_draft("draft@example.com") == raw
         client.select_folder.assert_called_once_with(folder, readonly=True)
         client.search.assert_called_once_with(["HEADER", "Message-ID", "<draft@example.com>"])
-        client.fetch.assert_called_once_with([42], [b"BODY.PEEK[]"])
+        assert client.fetch.call_args_list[0].args == ([42], [b"RFC822.SIZE"])
+        assert client.fetch.call_args_list[1].args[1][0].startswith(b"BODY.PEEK[]<")
 
     @pytest.mark.parametrize("uids,raw", [
         ([], b""), ([1, 2], b""), ([1], b""),
@@ -4197,9 +4211,10 @@ class TestFetchRawDraft:
         client = cls.return_value
         client.list_folders.return_value = [([b"\\Drafts"], b"/", "Drafts")]
         client.search.return_value = uids
-        client.fetch.return_value = {1: {b"BODY[]": raw}}
+        _bounded_fetch_responses(client, raw, 1)
         conn = ImapConnector("imap.example.com", 993, "test@example.com", "test-only")
-        with pytest.raises(MailMessageNotFoundError):
+        from apple_mail_fast_mcp.exceptions import MailMessageReadIncompleteError
+        with pytest.raises((MailMessageNotFoundError, MailMessageReadIncompleteError)):
             conn.fetch_raw_draft("draft@example.com")
         if len(uids) != 1:
             client.fetch.assert_not_called()

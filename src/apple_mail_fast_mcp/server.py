@@ -8,7 +8,8 @@ import logging
 import os
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, TypeVar, cast
 
@@ -47,6 +48,7 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
+from .raw_message import MailRawMessageLimitError
 from .security import (
     SEND_OPERATIONS,
     _injection_scan_enabled,
@@ -1512,8 +1514,8 @@ def get_messages(
         # include_content=False — sender/subject are attacker-controlled too).
         return _mark_untrusted(response, bool(messages))
 
-    except MailMessageReadIncompleteError as e:
-        return {"success": False, "error": str(e), "error_type": "message_read_incomplete"}
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except MailAppleScriptError as e:
         logger.error(f"Error reading messages through AppleScript: {e}")
         return {
@@ -1750,6 +1752,19 @@ async def update_message(
             "error": str(e),
             "error_type": "unknown",
         }
+
+
+@contextmanager
+def _attachment_staging_directory(directory: Path) -> Iterator[str]:
+    """Preserve the save result or primary read failure through cleanup errors."""
+    temporary = tempfile.TemporaryDirectory(dir=directory)
+    try:
+        yield temporary.name
+    finally:
+        try:
+            temporary.cleanup()
+        except Exception:
+            pass  # Cleanup must not replace a completed save or typed read error.
 
 
 @_tool(
@@ -2118,7 +2133,7 @@ def save_attachments(
             # Stage INSIDE the destination directory so the final commit is
             # a same-filesystem atomic operation (os.link/os.replace fail with
             # EXDEV across filesystems, which a system temp dir invites).
-            with tempfile.TemporaryDirectory(dir=save_path) as tmp_dir:
+            with _attachment_staging_directory(save_path) as tmp_dir:
                 tmp_path = Path(tmp_dir)
                 result = mail.save_attachments(
                     message_id=message_id,
@@ -2205,6 +2220,8 @@ def save_attachments(
             response["filename"] = final_filename
         return response
 
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Validation error: {e}")
         return {
@@ -2303,6 +2320,8 @@ def get_attachment_content(
             True,
         )
 
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except MailAttachmentIndexError as e:
         return {
             "success": False,
@@ -3190,6 +3209,20 @@ def _record_completed_draft(
         )
 
 
+def _bounded_read_error_response(
+    error: MailRawMessageLimitError | MailMessageReadIncompleteError,
+    *, original_draft_id: str | None = None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "success": False, "error": str(error),
+        "error_type": ("raw_message_too_large" if isinstance(error, MailRawMessageLimitError)
+                       else "message_read_incomplete"),
+    }
+    if original_draft_id is not None:
+        response["original_draft_id"] = original_draft_id
+    return response
+
+
 def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
     """Map a draft exception to {success, error, error_type}."""
     if isinstance(e, MailDraftNotFoundError):
@@ -3212,6 +3245,8 @@ def _draft_action_error(
     fall through to a generic ``unknown`` mapping). Centralizing this
     keeps the per-tool exception handling small enough to stay under
     the cyclomatic-complexity threshold."""
+    if isinstance(e, (MailRawMessageLimitError, MailMessageReadIncompleteError)):
+        return _bounded_read_error_response(e, original_draft_id=original_draft_id)
     if isinstance(e, (MailSmtpSendOutcomeUnknownError, MailSmtpSendRejectedError)):
         return _smtp_error_response(e, original_draft_id=original_draft_id)
     if isinstance(e, MailMutationOutcomeUnknownError):
@@ -3304,7 +3339,10 @@ def _resolve_draft_attachments(
             raise MailDraftError("Could not preserve every attachment; original draft retained")
         return extracted, tempdir
     except Exception:
-        tempdir.cleanup()
+        try:
+            tempdir.cleanup()
+        except Exception:
+            pass  # Preserve the typed read/limit failure and original draft.
         raise
 
 
