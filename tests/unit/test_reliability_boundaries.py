@@ -1,4 +1,5 @@
 """Regression tests for mutation boundaries; no live Mail or network I/O."""
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,6 +10,14 @@ from apple_mail_fast_mcp.exceptions import MailDraftError
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
 
 pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
+
+def _move_ack(moved: int, not_moved_ids: tuple[str, ...] = ()) -> str:
+    return json.dumps({
+        "moved": moved, "not_moved": len(not_moved_ids), "unknown": 0, "not_found": 0,
+        "read_status": 0, "flag_index": 0, "flagged_status": 0,
+        "not_moved_ids": list(not_moved_ids),
+    })
+
 
 
 @pytest.fixture
@@ -57,7 +66,7 @@ async def test_scoped_fallback_script_stays_in_source(monkeypatch, change):
     monkeypatch.setattr(server, "mail", connector)
     monkeypatch.setattr(server, "check_rate_limit", lambda *a, **kw: None)
     with patch.object(connector, "_try_imap_fast_paths", return_value=None), \
-         patch.object(connector, "_run_applescript", return_value="1") as transport:
+         patch.object(connector, "_run_applescript", return_value=_move_ack(1) if "destination_mailbox" in change else "1") as transport:
         result = await server.update_message(
             ["101"], account="TestAccount", source_mailbox="INBOX", **change
         )
@@ -226,7 +235,7 @@ def test_numeric_mutation_ids_never_reach_imap(ids, change):
     connector = AppleMailConnector()
     with patch("apple_mail_fast_mcp.mail_connector.ImapConnector") as imap, \
          patch.object(connector, "_resolve_bulk_ids", return_value=["123"]), \
-         patch.object(connector, "_run_applescript", return_value="1,0" if "destination_mailbox" in change else "1") as script:
+         patch.object(connector, "_run_applescript", return_value=_move_ack(1) if "destination_mailbox" in change else "1") as script:
         assert connector.update_message(ids, account="TestAccount", source_mailbox="Drafts", **change) == 1
     imap.assert_not_called()
     assert 'set idList to {"123"}' in script.call_args.args[0]

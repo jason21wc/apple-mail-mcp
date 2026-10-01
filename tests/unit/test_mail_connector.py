@@ -1,5 +1,6 @@
 """Unit tests for mail connector."""
 
+import json
 import logging
 import smtplib
 import time
@@ -36,6 +37,14 @@ from apple_mail_fast_mcp.mail_connector import (
 )
 
 pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
+
+
+def _move_ack(moved: int, not_moved_ids: tuple[str, ...] = ()) -> str:
+    return json.dumps({
+        "moved": moved, "not_moved": len(not_moved_ids), "unknown": 0, "not_found": 0,
+        "read_status": 0, "flag_index": 0, "flagged_status": 0,
+        "not_moved_ids": list(not_moved_ids),
+    })
 
 
 class TestMessageIdMatchClause:
@@ -2071,7 +2080,7 @@ class TestAppleMailConnector:
     ) -> None:
         """move + read_status combined: stays on AppleScript until
         sibling issues #150 / #151 / #152 land."""
-        mock_run_as.return_value = "2"
+        mock_run_as.return_value = _move_ack(1)
         connector.update_message(
             ["a@x", "b@x"],
             destination_mailbox="Archive",
@@ -2092,7 +2101,7 @@ class TestAppleMailConnector:
     ) -> None:
         """Move-only without source_mailbox: IMAP can't help (would
         SEARCH every mailbox per id), fall through to AppleScript."""
-        mock_run_as.return_value = "2"
+        mock_run_as.return_value = _move_ack(1)
         connector.update_message(
             ["a@x", "b@x"],
             destination_mailbox="Archive",
@@ -2112,7 +2121,7 @@ class TestAppleMailConnector:
         """Open breaker: IMAP path is bypassed entirely (no wasted
         connect/login round trip)."""
         connector._imap_failure_until["iCloud"] = time.monotonic() + 60
-        mock_run_as.return_value = "1"
+        mock_run_as.return_value = _move_ack(1)
         connector.update_message(
             ["a@x"],
             destination_mailbox="Archive",
@@ -2134,7 +2143,7 @@ class TestAppleMailConnector:
         """Missing-Keychain-entry = benign opt-out: silent DEBUG, no
         WARNING, breaker NOT opened."""
         mock_imap.side_effect = MailKeychainEntryNotFoundError("no entry")
-        mock_run_as.return_value = "1"
+        mock_run_as.return_value = _move_ack(1)
         with caplog.at_level(logging.DEBUG, logger="apple_mail_fast_mcp.mail_connector"):
             connector.update_message(
                 ["a@x"],
@@ -2160,7 +2169,7 @@ class TestAppleMailConnector:
     ) -> None:
         """Network failure: AppleScript runs, breaker opens, one WARNING."""
         mock_imap.side_effect = OSError("unreachable")
-        mock_run_as.return_value = "1"
+        mock_run_as.return_value = _move_ack(1)
         with caplog.at_level(logging.DEBUG, logger="apple_mail_fast_mcp.mail_connector"):
             connector.update_message(
                 ["a@x"],
@@ -2184,7 +2193,7 @@ class TestAppleMailConnector:
         connector: AppleMailConnector,
     ) -> None:
         mock_imap.side_effect = LoginError("rejected")
-        mock_run_as.return_value = "1"
+        mock_run_as.return_value = _move_ack(1)
         connector.update_message(
             ["a@x"],
             destination_mailbox="Archive",
@@ -2205,7 +2214,7 @@ class TestAppleMailConnector:
         """No MOVE / UIDPLUS: capability gap is permanent for the server,
         DEBUG-only log, breaker NOT opened (read paths still work)."""
         mock_imap.side_effect = MailImapMoveUnsupportedError("no caps")
-        mock_run_as.return_value = "1"
+        mock_run_as.return_value = _move_ack(1)
         with caplog.at_level(logging.DEBUG, logger="apple_mail_fast_mcp.mail_connector"):
             connector.update_message(
                 ["a@x"],
@@ -2760,7 +2769,7 @@ class TestAppleMailConnector:
         connector: AppleMailConnector,
     ) -> None:
         """read + move in one call: stays on AppleScript pending #152."""
-        mock_run_as.return_value = "1"
+        mock_run_as.return_value = _move_ack(1)
         connector.update_message(
             ["a@x"],
             read_status=True,
@@ -3127,7 +3136,7 @@ class TestAppleMailConnector:
         connector: AppleMailConnector,
     ) -> None:
         """flag + move in one call: stays on AppleScript."""
-        mock_run_as.return_value = "1"
+        mock_run_as.return_value = _move_ack(1)
         connector.update_message(
             ["a@x"],
             flagged=True,
@@ -4642,7 +4651,7 @@ class TestMessageIdAppleScriptInjection:
     def test_move_messages_quotes_and_escapes_each_id(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "1"
+        mock_run.return_value = _move_ack(2)
         connector.move_messages(['evil"; foo', "ok"], "Gmail", "Archive")
         script = mock_run.call_args[0][0]
         assert '"evil\\"; foo"' in script
@@ -4734,7 +4743,7 @@ class TestBulkOpsSourceMailbox:
     def test_move_messages_narrow_path_standard_branch(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "2"
+        mock_run.return_value = _move_ack(2)
         connector.move_messages(
             ["abc", "def"],
             destination_mailbox="Archive",
@@ -4757,7 +4766,7 @@ class TestBulkOpsSourceMailbox:
     ) -> None:
         # #364: the copy+delete that routed Gmail moves through Trash is gone.
         # gmail_mode is deprecated/ignored — the move is always `set mailbox`.
-        mock_run.return_value = "2,0"
+        mock_run.return_value = _move_ack(2)
         connector.move_messages(
             ["abc", "def"],
             destination_mailbox="[Gmail]/All Mail",
@@ -4786,7 +4795,7 @@ class TestBulkOpsSourceMailbox:
     ) -> None:
         # #364: every AppleScript move now verifies the message actually left
         # the source (Gmail `set mailbox` silently no-ops otherwise).
-        mock_run.return_value = "1,0"
+        mock_run.return_value = _move_ack(1)
         connector.move_messages(
             ["abc"],
             destination_mailbox="Archive",
@@ -4794,7 +4803,7 @@ class TestBulkOpsSourceMailbox:
             source_mailbox="INBOX",
         )
         script = mock_run.call_args[0][0]
-        assert "name of mailbox of msg" in script
+        assert "if actualMailbox is destMailbox" in script
         assert "failCount" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
@@ -4805,7 +4814,7 @@ class TestBulkOpsSourceMailbox:
         # fail loud, not report success.
         from apple_mail_fast_mcp.exceptions import MailImapRequiredError
 
-        mock_run.return_value = "1,1"  # 1 moved, 1 stuck in source
+        mock_run.return_value = _move_ack(1, ("def",))  # 1 moved, 1 stuck in source
         with pytest.raises(MailImapRequiredError, match="IMAP"):
             connector.move_messages(
                 ["abc", "def"],
@@ -4818,7 +4827,7 @@ class TestBulkOpsSourceMailbox:
     def test_move_messages_no_source_keeps_cross_scan(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "1"
+        mock_run.return_value = _move_ack(1)
         connector.move_messages(
             ["abc"], destination_mailbox="Archive", account="Gmail"
         )
@@ -4834,7 +4843,7 @@ class TestBulkOpsSourceMailbox:
         # must not copy+delete. Open the breaker so the IMAP fast path is
         # skipped and the AppleScript path runs.
         connector._imap_failure_until["Gmail"] = time.monotonic() + 60
-        mock_run.return_value = "1,0"
+        mock_run.return_value = _move_ack(1)
         connector.update_message(
             ["abc"],
             destination_mailbox="Newsletters",
@@ -4846,7 +4855,7 @@ class TestBulkOpsSourceMailbox:
         assert "set mailbox of msg to destMailbox" in script
         assert "duplicate msg to destMailbox" not in script
         assert "delete msg" not in script
-        assert "name of mailbox of msg" in script  # verification present
+        assert "if actualMailbox is destMailbox" in script  # verification present
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_update_message_unverified_gmail_move_raises_imap_required(
@@ -4855,7 +4864,7 @@ class TestBulkOpsSourceMailbox:
         from apple_mail_fast_mcp.exceptions import MailImapRequiredError
 
         connector._imap_failure_until["Gmail"] = time.monotonic() + 60
-        mock_run.return_value = "0,1"  # message never left source
+        mock_run.return_value = _move_ack(0, ("abc",))  # message never left source
         with pytest.raises(MailImapRequiredError, match="IMAP"):
             connector.update_message(
                 ["abc"],
@@ -5358,7 +5367,7 @@ class TestNonJsonPathsThreadTimeout:
     @patch("subprocess.run")
     def test_move_messages(self, mock_run: MagicMock) -> None:
         connector = AppleMailConnector(timeout=114)
-        mock_run.return_value = MagicMock(returncode=0, stdout="1", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout=_move_ack(1), stderr="")
         connector.move_messages(["123"], "Archive", "TestAcct")
         script = self._script_from(mock_run)
         assert "with timeout of 114 seconds" in script
@@ -10151,7 +10160,7 @@ class TestScopedBulkResolution:
         scope = {"account": "iCloud", "source_mailbox": "Archive"}
         with (
             patch.object(c, "_resolve_bulk_ids", return_value=["123"]) as resolve,
-            patch.object(c, "_run_applescript", return_value="1"),
+            patch.object(c, "_run_applescript", return_value=_move_ack(1) if operation == "move" else "1"),
             patch.object(c, "_try_imap_delete", return_value=None),
             patch.object(c, "_try_imap_fast_paths", return_value=None),
         ):
@@ -10197,8 +10206,8 @@ class TestScopedBulkResolution:
     def test_move_account_without_source_keeps_legacy_cross_account_resolution(self):
         c = AppleMailConnector()
         with (
-            patch.object(c, "find_message_by_message_id", return_value="123") as find,
-            patch.object(c, "_run_applescript", return_value="1"),
+            patch.object(c, "find_message_by_message_id", return_value=_move_ack(123)) as find,
+            patch.object(c, "_run_applescript", return_value=_move_ack(1)),
         ):
             assert c.move_messages(["a@example.com"], "Archive", account="Destination") == 1
         find.assert_called_once_with("a@example.com")

@@ -3181,6 +3181,34 @@ class TestScopedAttachmentScriptCompilation:
         assert compiled.returncode == 0, compiled.stderr
 
 
+class TestVerifiedMoveScriptCompilation:
+    """Compile generated move scripts only; never execute a Mail operation."""
+
+    @pytest.mark.parametrize("source_mailbox", [None, 'INBOX/Receipts "2026"'])
+    def test_generated_move_script_compiles(self, connector, tmp_path, source_mailbox):
+        import subprocess
+
+        script = connector._verified_move_script(
+            ["41", "42"], account="12345678-1234-1234-1234-123456789abc",
+            source_mailbox=source_mailbox, destination_mailbox='Archive/Receipts "2026"',
+            pre_actions=("set read status of msg to true", "set flag index of msg to 1",
+                         "set flagged status of msg to true"),
+        )
+        bundle = next((path for path in (
+            Path("/System/Applications/Mail.app"), Path("/Applications/Mail.app"),
+        ) if path.is_dir()), None)
+        if bundle is None:
+            pytest.skip("Mail.app must be installed for source compilation")
+        source = script.replace('application "Mail"', f'application "{escape_applescript_string(str(bundle))}"')
+        source_path = tmp_path / "move.applescript"
+        source_path.write_text(source, encoding="utf-8")
+        compiled = subprocess.run(
+            ["/usr/bin/osacompile", "-o", str(tmp_path / "move.scpt"), str(source_path)],
+            text=True, capture_output=True, timeout=30,
+        )
+        assert compiled.returncode == 0, compiled.stderr
+
+
 class TestResolveImapConfigAppleScript:
     """#267 / #272 — _resolve_imap_config coerces `server name` / `port`
     for `missing value` so accounts without an IMAP server don't drop those

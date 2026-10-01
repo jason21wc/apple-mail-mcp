@@ -52,6 +52,8 @@ from .exceptions import (
     MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailMutationOutcomeUnknownError,
+    MailNativeMoveIncompleteError,
     MailRuleNotFoundError,
     MailSafetyError,
     MailUnsupportedGmailSystemLabelError,
@@ -892,7 +894,6 @@ def _bulk_repeat_block(
     source_mailbox: str | None,
     actions: list[str],
     counter_var: str,
-    verify_dest_var: str | None = None,
 ) -> str:
     """Emit the AppleScript repeat block for a bulk-mutation operation.
 
@@ -950,27 +951,7 @@ def _bulk_repeat_block(
         )
 
     def _success_tail(indent: str) -> str:
-        """The per-match tail. Normally a bare counter bump; in verify mode
-        (move ops, #364) it confirms the message actually left the source by
-        checking its current mailbox against the destination — counting
-        silent no-ops into ``failCount`` instead of reporting false success.
-        Reading ``mailbox of msg`` after a successful move can error (the
-        source-scoped reference no longer resolves); that's treated as
-        landed, since the message did leave the source."""
-        if verify_dest_var is None:
-            return f"{indent}set {counter_var} to {counter_var} + 1"
-        return (
-            f"{indent}set landed to true\n"
-            f"{indent}try\n"
-            f"{indent}    if (name of mailbox of msg) is not "
-            f"(name of {verify_dest_var}) then set landed to false\n"
-            f"{indent}end try\n"
-            f"{indent}if landed then\n"
-            f"{indent}    set {counter_var} to {counter_var} + 1\n"
-            f"{indent}else\n"
-            f"{indent}    set failCount to failCount + 1\n"
-            f"{indent}end if"
-        )
+        return f"{indent}set {counter_var} to {counter_var} + 1"
 
     if account is not None and source_mailbox is not None:
         # Narrow path: single mailbox, single loop. O(N).
@@ -4169,16 +4150,26 @@ class AppleMailConnector:
         )
 
     @staticmethod
-    def _parse_move_counts(result: str) -> tuple[int, int]:
-        """Parse the ``"<moved>,<failed>"`` payload from a verified-move
-        script into ``(moved, failed)``. Tolerates a bare ``"<moved>"`` (no
-        comma) for callers/tests that don't exercise verification."""
-        parts = result.strip().split(",")
-        moved = int(parts[0]) if parts[0].strip().isdigit() else 0
-        failed = (
-            int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 0
-        )
-        return moved, failed
+    def _parse_move_counts(result: str, message_ids: list[str]) -> tuple[dict[str, int], list[str]]:
+        """Validate the complete native acknowledgment; never turn noise into zero."""
+        data = parse_applescript_json(result)
+        keys = ("moved", "not_moved", "unknown", "not_found", "read_status", "flag_index", "flagged_status")
+        if not isinstance(data, dict):
+            raise ValueError("Invalid move acknowledgment")
+        counts: dict[str, Any] = {key: data.get(key) for key in keys}
+        if any(type(value) is not int or not 0 <= value <= len(message_ids) for value in counts.values()):
+            raise ValueError("Invalid move counters")
+        if sum(counts[key] for key in keys[:4]) > len(message_ids):
+            raise ValueError("Inconsistent move counters")
+        if not counts["unknown"] and sum(counts[key] for key in keys[:4]) != len(message_ids):
+            raise ValueError("Incomplete move counters")
+        retry_ids = data.get("not_moved_ids")
+        if (not isinstance(retry_ids, list)
+                or any(not isinstance(mid, str) or mid not in message_ids for mid in retry_ids)
+                or len(set(retry_ids)) != len(retry_ids)
+                or len(retry_ids) != counts["not_moved"]):
+            raise ValueError("Invalid move retry identifiers")
+        return counts, retry_ids
 
     def _run_verified_move(
         self,
@@ -4187,61 +4178,120 @@ class AppleMailConnector:
         account: str,
         source_mailbox: str | None,
         destination_mailbox: str,
+        pre_actions: tuple[str, ...] = (),
     ) -> int:
-        """Move messages via AppleScript ``set mailbox`` and verify each one
-        left the source (#364). Raises MailImapRequiredError if any message
-        silently stayed put (the Gmail no-op) — the move can only be done
-        reliably over IMAP. Returns the count that verifiably moved."""
-        from .utils import sanitize_input
+        """Apply properties before moving; report only acknowledged local progress.
 
-        account_clause = applescript_account_clause(account)
-        mailbox_safe = escape_applescript_string(
-            sanitize_input(destination_mailbox)
-        )
-        # #437: resolve RFC Message-IDs to Mail's internal numeric ids so
-        # the emitted match is the INDEXED `whose id is N`. Must come AFTER
-        # any IMAP fast path above — those batch the RFC ids themselves.
-        message_ids = self._resolve_bulk_ids(
+        Exact mailbox references distinguish same-named folders/accounts. A stale
+        post-move reference is uncertainty, never proof that a move succeeded.
+        """
+        account = cast(str, self._native_account(account))
+        message_ids = list(dict.fromkeys(self._resolve_bulk_ids(
             message_ids, account=account, source_mailbox=source_mailbox,
+        )))
+        if not message_ids:
+            return 0
+        script = self._verified_move_script(
+            message_ids, account=account, source_mailbox=source_mailbox,
+            destination_mailbox=destination_mailbox, pre_actions=pre_actions,
         )
+        try:
+            counts, retry_ids = self._parse_move_counts(self._run_applescript(script), message_ids)
+        except (MailAppleScriptError, ValueError, TypeError) as error:
+            raise MailMutationOutcomeUnknownError(
+                operation="update_message" if pre_actions else "move",
+                phase="native_move_acknowledgment", requested=len(message_ids),
+                mailbox=destination_mailbox,
+            ) from error
+        if counts["unknown"]:
+            raise MailMutationOutcomeUnknownError(
+                operation="update_message" if pre_actions else "move",
+                phase="native_move_verification", requested=len(message_ids),
+                mailbox=destination_mailbox, confirmed_progress=counts,
+            )
+        if counts["not_moved"]:
+            raise MailNativeMoveIncompleteError(
+                mailbox=destination_mailbox, requested=len(message_ids),
+                confirmed_progress=counts, retry_message_ids=retry_ids,
+            )
+        return counts["moved"]
 
-        id_list = ", ".join(
-            f'"{escape_applescript_string(sanitize_input(mid))}"'
-            for mid in message_ids
-        )
-        repeat_block = _bulk_repeat_block(
-            account=account if source_mailbox is not None else None,
-            source_mailbox=source_mailbox,
-            actions=["set mailbox of msg to destMailbox"],
-            counter_var="moveCount",
-            verify_dest_var="destMailbox",
-        )
-        script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
-            f"""tell application "Mail"
+    def _verified_move_script(
+        self, message_ids: list[str], *, account: str, source_mailbox: str | None,
+        destination_mailbox: str, pre_actions: tuple[str, ...],
+    ) -> str:
+        """Build a single native batch, keeping each property's acknowledgment."""
+        account_clause = applescript_account_clause(account)
+        mailbox_safe = escape_applescript_string(sanitize_input(destination_mailbox))
+        id_list = ", ".join(f'"{escape_applescript_string(sanitize_input(mid))}"' for mid in message_ids)
+        source_setup = ""
+        if source_mailbox is not None:
+            source_safe = escape_applescript_string(sanitize_input(source_mailbox))
+            source_setup = f'set sourceMb to my resolveMailbox({account_clause}, "{source_safe}")'
+            lookup = "set matches to (every message of sourceMb whose id is mid)"
+        else:
+            # Locate once before mutating: never rediscover the moved message in
+            # another mailbox and replay the same combined patch.
+            lookup = """set matches to {}
+                repeat with acc in accounts
+                    repeat with mb in mailboxes of acc
+                        set matches to (every message of mb whose id is mid)
+                        if (count of matches) > 0 then exit repeat
+                    end repeat
+                    set matched to (count of matches) > 0
+                    if matched then exit repeat
+                end repeat"""
+        property_counters = {"read status": "readCount", "flag index": "flagIndexCount", "flagged status": "flagStatusCount"}
+        actions: list[str] = []
+        for action in pre_actions:
+            counter = next((counter for prop, counter in property_counters.items() if action.startswith(f"set {prop} of msg to ")), None)
+            if counter is None:
+                raise ValueError("Unsupported native move pre-action")
+            actions.extend((action, f"set {counter} to {counter} + 1"))
+        action_lines = "\n                    ".join(actions)
+        body = f'''tell application "Mail"
             set accountRef to {account_clause}
             set destMailbox to my resolveMailbox(accountRef, "{mailbox_safe}")
+            {source_setup}
             set idList to {{{id_list}}}
             set moveCount to 0
             set failCount to 0
-
-{repeat_block}
-
-            return (moveCount as text) & "," & (failCount as text)
-        end tell""",
-            timeout=self.timeout,
-        )
-
-        moved, failed = self._parse_move_counts(self._run_applescript(script))
-        if failed > 0:
-            src = source_mailbox or "the source mailbox"
-            raise MailImapRequiredError(
-                f"Move to {destination_mailbox!r} could not be confirmed for "
-                f"{failed} message(s) — they never left {src!r}. On Gmail, "
-                f"label moves only apply reliably over IMAP: run "
-                f"`apple-mail-fast-mcp setup-imap --account <name>` for this "
-                f"account and retry. (#364)"
-            )
-        return moved
+            set unknownCount to 0
+            set missingCount to 0
+            set readCount to 0
+            set flagIndexCount to 0
+            set flagStatusCount to 0
+            set failedIds to {{}}
+            repeat with msgId in idList
+                set mid to (contents of msgId)
+                try
+                    {lookup}
+                    if (count of matches) is 0 then
+                        set missingCount to missingCount + 1
+                    else
+                        set msg to item 1 of matches
+                        set originalMailbox to get mailbox of msg
+                        {action_lines}
+                        set mailbox of msg to destMailbox
+                        set actualMailbox to get mailbox of msg
+                        if actualMailbox is destMailbox then
+                            set moveCount to moveCount + 1
+                        else if actualMailbox is originalMailbox then
+                            set failCount to failCount + 1
+                            set end of failedIds to mid
+                        else
+                            set unknownCount to unknownCount + 1
+                            exit repeat
+                        end if
+                    end if
+                on error
+                    set unknownCount to unknownCount + 1
+                    exit repeat
+                end try
+            end repeat
+            set resultData to {{|moved|:moveCount, |not_moved|:failCount, |unknown|:unknownCount, |not_found|:missingCount, |read_status|:readCount, |flag_index|:flagIndexCount, |flagged_status|:flagStatusCount, |not_moved_ids|:failedIds}}
+        end tell'''
+        return _wrap_as_json_script(body, timeout=self.timeout, handlers=_MAILBOX_RESOLVER_HANDLERS)
 
     @_account_operation
     def flag_message(
@@ -4416,23 +4466,6 @@ class AppleMailConnector:
         if imap_count is not None:
             return imap_count
 
-        # Pure move (no read/flag) on the AppleScript fallback: route through
-        # the verified mover so a Gmail silent-no-op fails loud instead of
-        # quietly losing the message (#364). gmail_mode is deprecated/ignored.
-        pure_move = (
-            destination_mailbox is not None
-            and read_status is None
-            and flagged is None
-            and flag_color is None
-        )
-        if pure_move:
-            return self._run_verified_move(
-                message_ids,
-                account=cast(str, account),
-                source_mailbox=source_mailbox,
-                destination_mailbox=cast(str, destination_mailbox),
-            )
-
         actions: list[str] = []
 
         if read_status is not None:
@@ -4441,13 +4474,11 @@ class AppleMailConnector:
 
         actions.extend(self._build_flag_actions(flagged, flag_color))
 
-        # Move (always last — IMAP STORE requires source folder). gmail_mode
-        # is deprecated/ignored (#364): never copy+delete (it trashes on
-        # Gmail). Combined move+read/flag patches stay on this unverified
-        # path; the move itself is a plain relabel that never routes through
-        # Trash.
         if destination_mailbox is not None:
-            actions.append("set mailbox of msg to destMailbox")
+            return self._run_verified_move(
+                message_ids, account=cast(str, account), source_mailbox=source_mailbox,
+                destination_mailbox=destination_mailbox, pre_actions=tuple(actions),
+            )
 
         repeat_block = _bulk_repeat_block(
             account=account if source_mailbox is not None else None,
@@ -4468,20 +4499,8 @@ class AppleMailConnector:
             for mid in message_ids
         )
 
-        # Set up destMailbox at script level when moving; the actions list
-        # references it inside the loop.
-        dest_setup = ""
-        if destination_mailbox is not None:
-            account_clause = applescript_account_clause(cast(str, account))
-            mb_safe = escape_applescript_string(sanitize_input(destination_mailbox))
-            dest_setup = (
-                f'set accountRef to {account_clause}\n'
-                f'            set destMailbox to my resolveMailbox(accountRef, "{mb_safe}")'
-            )
-
         script = f"{_MAILBOX_RESOLVER_HANDLERS}\n" + _wrap_with_timeout(
             f"""tell application "Mail"
-            {dest_setup}
             set idList to {{{id_list}}}
             set updateCount to 0
 

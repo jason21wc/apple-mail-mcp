@@ -32,6 +32,8 @@ from .exceptions import (
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
     MailMessageReadIncompleteError,
+    MailMutationOutcomeUnknownError,
+    MailNativeMoveIncompleteError,
     MailRuleNotFoundError,
     MailSafetyError,
     MailTemplateError,
@@ -1665,6 +1667,8 @@ async def update_message(
             "requested": len(message_ids),
         }
 
+    except MailMutationOutcomeUnknownError as e:
+        return _mutation_error_response(e)
     except MailAccountNotFoundError as e:
         logger.error(f"Account not found: {e}")
         return {
@@ -1678,6 +1682,15 @@ async def update_message(
             "success": False,
             "error": str(e),
             "error_type": "not_found",
+        }
+    except MailNativeMoveIncompleteError as e:
+        return {
+            "success": False, "error": str(e), "error_type": "imap_required",
+            "partial": True, "partial_reason": "native_move_not_applied",
+            "retry_safe": False, "retry_operation": "move_only",
+            "retry_message_ids": e.retry_message_ids, "retry_id_type": "mail",
+            "requested": e.requested, "mailbox": e.mailbox,
+            "confirmed_progress": e.confirmed_progress,
         }
     except MailImapRequiredError as e:
         # #364: a Gmail label move that couldn't be verified needs IMAP.
@@ -2773,6 +2786,8 @@ async def delete_messages(
             "permanent": permanent,
         }
 
+    except MailMutationOutcomeUnknownError as e:
+        return _mutation_error_response(e)
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         return {
@@ -3076,6 +3091,29 @@ def _get_draft_state_store() -> DraftStateStore:
     return DraftStateStore()
 
 
+def _mutation_error_response(
+    error: MailMutationOutcomeUnknownError, *, original_draft_id: str | None = None,
+) -> dict[str, Any]:
+    """Expose uncertainty without claiming zero changes or inviting a replay."""
+    response: dict[str, Any] = {
+        "success": False, "error": str(error),
+        "error_type": "mutation_outcome_unknown", "partial": True,
+        "partial_reason": "mutation_unconfirmed", "retry_safe": False,
+        "operation": error.operation, "phase": error.phase,
+        "requested": error.requested,
+        "confirmed_steps": list(error.confirmed_steps),
+    }
+    if error.confirmed_progress is not None:
+        response["confirmed_progress"] = error.confirmed_progress
+    if error.mailbox is not None:
+        response["mailbox"] = error.mailbox
+    if error.candidate_draft_id is not None:
+        response["candidate_draft_id"] = error.candidate_draft_id
+    if original_draft_id is not None:
+        response["original_draft_id"] = original_draft_id
+    return response
+
+
 def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
     """Map a draft exception to {success, error, error_type}."""
     if isinstance(e, MailDraftNotFoundError):
@@ -3089,13 +3127,17 @@ def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
     return {"success": False, "error": str(e), "error_type": et}
 
 
-def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
+def _draft_action_error(
+    op: str, e: Exception, *, original_draft_id: str | None = None,
+) -> dict[str, Any] | None:
     """Map a catchable draft-action exception to a response dict.
 
     Returns None if the exception isn't one we model here (caller should
     fall through to a generic ``unknown`` mapping). Centralizing this
     keeps the per-tool exception handling small enough to stay under
     the cyclomatic-complexity threshold."""
+    if isinstance(e, MailMutationOutcomeUnknownError):
+        return _mutation_error_response(e, original_draft_id=original_draft_id)
     if isinstance(e, MailMessageNotFoundError):
         return {"success": False, "error": str(e), "error_type": "message_not_found"}
     if isinstance(e, MailAccountNotFoundError):
@@ -3942,7 +3984,7 @@ async def update_draft(
         )
 
     except Exception as e:
-        handled = _draft_action_error("update_draft", e)
+        handled = _draft_action_error("update_draft", e, original_draft_id=draft_id)
         if handled is not None:
             return handled
         logger.exception(f"Unexpected error in update_draft: {e}")

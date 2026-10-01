@@ -443,11 +443,17 @@ Patch one or more messages: change read state, flag color, and/or move to anothe
 | `source_mailbox` | string \| null | No | null | Optional narrow-path hint — narrows the AppleScript scan to one mailbox. Required to unlock the IMAP fast path on move-only patches (#149) — without it, the move runs via AppleScript even when IMAP is configured. |
 | `gmail_mode` | boolean | No | false | **Deprecated and ignored (#364).** The move strategy is chosen automatically; this flag does nothing. Slated for removal at v1.0 (#369). |
 
-> **Gmail label moves (#364).** The old `gmail_mode` copy+delete strategy silently routed Gmail INBOX→label moves through `[Gmail]/Trash` (stripping the destination label) and reported success anyway — data loss. It has been removed. Moves now run via IMAP `UID MOVE` when the account has IMAP configured (the reliable Gmail relabel); otherwise via a **verified** AppleScript `set mailbox`. If a move can't be confirmed (the Gmail silent-no-op), `update_message` returns `error_type: "imap_required"` instead of falsely succeeding — configure IMAP with `apple-mail-fast-mcp setup-imap --account <name>` and pass `source_mailbox`.
+> **Gmail label moves (#364).** The old `gmail_mode` copy+delete strategy silently routed Gmail INBOX→label moves through `[Gmail]/Trash` (stripping the destination label) and reported success anyway — data loss. It has been removed. Moves now run via IMAP `UID MOVE` when the account has IMAP configured (the reliable Gmail relabel); otherwise via a **verified** AppleScript `set mailbox`. If Mail verifies that a message stayed in its original mailbox (the Gmail silent-no-op), `update_message` returns `error_type: "imap_required"`. An unreadable or unexpected post-move mailbox is instead `mutation_outcome_unknown`.
 
 **Patch semantics:** caller specifies only the fields they want changed. At least one field parameter must be set; otherwise returns `validation_error`.
 
 **Order of operations:** read-state and flag changes apply first (in the source mailbox), then the move. IMAP requires the message to exist in the source folder for STORE before MOVE.
+
+**Incomplete moves:** combined updates apply read/flag properties before moving. A verified native no-op returns `imap_required`, `partial: true`, `retry_safe: false`, and `confirmed_progress`: counts of acknowledged `read_status`, `flag_index`, `flagged_status`, `moved`, `not_moved`, `not_found`, and `unknown` outcomes. The two flag counters are separate because Mail can acknowledge the index change before a flag-status change fails. Counts describe local acknowledgments, not proof of server synchronization. A later failure does not roll back earlier properties or messages.
+
+For a verified no-op, `retry_operation: "move_only"` and `retry_message_ids` identify only messages observed still in the source (`retry_id_type: "mail"` means numeric Mail IDs). Configure IMAP with `apple-mail-fast-mcp setup-imap --account <name>` if needed, obtain those messages' RFC Message-IDs with scoped `get_messages`, and retry only the move with `account` and `source_mailbox`. Repeating numeric IDs would still select AppleScript. Do not replay the whole combined update.
+
+**Uncertain mutation results:** loss of an IMAP MOVE/COPY/STORE/UID EXPUNGE/APPEND acknowledgment, an interrupted native move, or unreadable native move verification returns `mutation_outcome_unknown`, `partial: true`, and `retry_safe: false`; the server does not replay the operation through another transport. `phase` identifies the uncertain stage. `confirmed_steps` records completed IMAP stages; native `confirmed_progress`, when available, records local counts. Missing progress means unknown, not zero changes. Inspect the affected mailboxes before attempting another mutation. Draft APPEND failures may include `candidate_draft_id`; failed draft replacement also preserves and reports `original_draft_id`.
 
 **Move synchronization:** a move performed through AppleScript (including a numeric Mail.app ID) is verified using Mail's local state. Success does not guarantee that the IMAP server already sees the message in the destination mailbox. An immediate follow-up using an RFC Message-ID and the destination mailbox can therefore resolve no message and report zero updates while Mail synchronizes. When applying flags or read state with a move, prefer one combined `update_message` call, which applies those changes before moving. Separate IMAP-dependent operations require server visibility first; the server does not automatically wait for cross-path synchronization.
 
@@ -519,7 +525,8 @@ update_message(
 - `validation_error`: Too many IDs, no fields set, or missing `account` for move
 - `account_not_found`: `account` does not match a configured Mail.app account
 - `not_found`: `destination_mailbox` not found on the account
-- `imap_required`: A move could not be confirmed via AppleScript (the Gmail silent-no-op) and the account has no IMAP configured (#364). Run `apple-mail-fast-mcp setup-imap --account <name>` and pass `source_mailbox`.
+- `imap_required`: Mail verified that at least one move stayed in the source. Inspect `confirmed_progress` and follow the move-only retry guidance above. This can also occur with IMAP configured when numeric IDs or a combined patch selected AppleScript.
+- `mutation_outcome_unknown`: A mutation may have applied but its result could not be confirmed; inspect before retrying. No transport replay occurs.
 - `unknown`: Unexpected error occurred
 
 ---

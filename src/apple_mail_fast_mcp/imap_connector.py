@@ -34,6 +34,7 @@ from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
+from email.parser import BytesHeaderParser
 from typing import Any, cast
 
 from imapclient import DRAFT, IMAPClient
@@ -47,6 +48,7 @@ from .exceptions import (
     MailImapTrashNotFoundError,
     MailMessageNotFoundError,
     MailMessageReadIncompleteError,
+    MailMutationOutcomeUnknownError,
 )
 from .utils import parse_rfc822_ids
 
@@ -96,6 +98,19 @@ scan depth."""
 _FLAG_SEEN = b"\\Seen"
 _FLAG_FLAGGED = b"\\Flagged"
 _FLAG_ANSWERED = b"\\Answered"
+
+
+@dataclass
+class _MutationProgress:
+    """Acknowledgments observed during one non-idempotent operation."""
+
+    phase: str | None = None
+    confirmed_steps: list[str] = field(default_factory=list)
+    mailbox: str | None = None
+
+    def confirmed(self) -> None:
+        if self.phase is not None:
+            self.confirmed_steps.append(self.phase)
 
 
 # ---------------------------------------------------------------------------
@@ -973,7 +988,60 @@ class ImapConnector:
             _apply_operation_timeout(client)
             yield client
         finally:
-            client.logout()
+            try:
+                client.logout()
+            except Exception:
+                # Cleanup cannot replace an operation's result or its primary
+                # error: doing so could trigger a second, native mutation.
+                try:
+                    logger.warning("IMAP session cleanup failed; not retrying the operation")
+                except Exception:
+                    pass  # Even a broken log sink must not replace the outcome.
+
+    @contextmanager
+    def _mutation_session(
+        self, operation: str, requested: int, *, candidate_draft_id: str | None = None,
+    ) -> Iterator[tuple[IMAPClient, _MutationProgress]]:
+        """Classify failures only after the session sees the raw exception.
+
+        This keeps pool invalidation intact. A phase is set immediately before
+        the first command that can change mail; setup failures remain eligible
+        for the caller's ordinary fallback.
+        """
+        progress = _MutationProgress()
+        try:
+            with self._session() as client:
+                yield client, progress
+        except (OSError, IMAPClientError, LoginError) as exc:
+            if progress.phase is None:
+                raise
+            raise MailMutationOutcomeUnknownError(
+                operation=operation, phase=progress.phase, requested=requested,
+                confirmed_steps=tuple(progress.confirmed_steps),
+                mailbox=progress.mailbox, candidate_draft_id=candidate_draft_id,
+            ) from exc
+
+    @staticmethod
+    def _move_resolved_uids(
+        client: IMAPClient, uids: list[int], destination: str,
+        has_move: bool, progress: _MutationProgress,
+    ) -> None:
+        """Move one resolved batch without replaying an uncertain step."""
+        progress.mailbox = destination
+        if has_move:
+            progress.phase = "move"
+            client.move(uids, destination)
+            progress.confirmed()
+            return
+        progress.phase = "copy"
+        client.copy(uids, destination)
+        progress.confirmed()
+        progress.phase = "store_deleted"
+        client.add_flags(uids, [b"\\Deleted"], silent=True)
+        progress.confirmed()
+        progress.phase = "uid_expunge"
+        client.uid_expunge(uids)
+        progress.confirmed()
 
     def search_messages(
         self,
@@ -1724,14 +1792,15 @@ class ImapConnector:
         Raises:
             MailImapMoveUnsupportedError: Server advertises neither MOVE
                 nor UIDPLUS.
-            IMAPClientError: SELECT / SEARCH / MOVE / COPY / STORE /
-                EXPUNGE failed at the protocol level.
+            IMAPClientError: Setup failed before a mutation was dispatched.
+            MailMutationOutcomeUnknownError: A dispatched command did not
+                receive a conclusive response; do not replay through fallback.
         """
         _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
         _reject_control_chars(destination_mailbox, "destination_mailbox")
 
-        with self._session() as client:
+        with self._mutation_session("move", len(message_ids)) as (client, progress):
             client.select_folder(source_mailbox, readonly=False)
 
             has_move = self._has_capability(client, b"MOVE")
@@ -1747,12 +1816,7 @@ class ImapConnector:
             if not uids:
                 return 0
 
-            if has_move:
-                client.move(uids, destination_mailbox)
-            else:
-                client.copy(uids, destination_mailbox)
-                client.add_flags(uids, [b"\\Deleted"], silent=True)
-                client.uid_expunge(uids)
+            self._move_resolved_uids(client, uids, destination_mailbox, has_move, progress)
             return len(uids)
 
     # Conventional Trash folder names to fall back on when the IMAP
@@ -1795,8 +1859,16 @@ class ImapConnector:
         ``<blockquote type="cite">`` that renders as a quote on iOS
         (Mail.app bug FB11734014, issue #245). The caller builds
         ``raw_message`` via :func:`apple_mail_fast_mcp.draft_builder.build_draft_mime`.
+
+        A lost APPEND acknowledgment raises MailMutationOutcomeUnknownError
+        with the candidate Message-ID, preventing duplicate native creation.
         """
-        with self._session() as client:
+        candidate = str(BytesHeaderParser(policy=policy.default).parsebytes(
+            raw_message
+        ).get("Message-ID", "")).strip().strip("<>") or None
+        with self._mutation_session(
+            "append_draft", 1, candidate_draft_id=candidate,
+        ) as (client, progress):
             folder = self._find_drafts_folder(
                 client
             ) or self._find_drafts_by_convention(client)
@@ -1806,7 +1878,10 @@ class ImapConnector:
                     f"(no \\Drafts SPECIAL-USE flag and none of "
                     f"{list(self._CONVENTIONAL_DRAFTS_NAMES)} present)."
                 )
+            progress.mailbox = folder
+            progress.phase = "append"
             client.append(folder, raw_message, flags=[DRAFT])
+            progress.confirmed()
             return folder
 
     def fetch_raw_draft(self, message_id: str) -> bytes:
@@ -1896,12 +1971,14 @@ class ImapConnector:
                 SPECIAL-USE or conventional names. Callers treat this (like
                 any failure here) as best-effort — the message is already
                 delivered — and must not surface it as a send failure.
-            IMAPClientError: Protocol-level APPEND failure.
+            MailMutationOutcomeUnknownError: APPEND completion is uncertain.
+                This must still be treated as a best-effort Sent-copy failure,
+                never as permission to send the message again.
         """
         flags: list[bytes] = [_FLAG_SEEN]
         if answered:
             flags.append(_FLAG_ANSWERED)
-        with self._session() as client:
+        with self._mutation_session("append_sent_copy", 1) as (client, progress):
             folder = self._find_sent_folder(
                 client
             ) or self._find_sent_by_convention(client)
@@ -1911,7 +1988,10 @@ class ImapConnector:
                     f"(no \\Sent SPECIAL-USE flag and none of "
                     f"{list(self._CONVENTIONAL_SENT_NAMES)} present)."
                 )
+            progress.mailbox = folder
+            progress.phase = "append"
             client.append(folder, raw_message, flags=flags)
+            progress.confirmed()
             return folder
 
     def _find_sent_by_convention(self, client: IMAPClient) -> str | None:
@@ -1963,12 +2043,14 @@ class ImapConnector:
                 nor UIDPLUS.
             MailImapTrashNotFoundError: No Trash folder discoverable via
                 SPECIAL-USE or conventional names.
-            IMAPClientError: Protocol-level failure.
+            IMAPClientError: Setup failed before mutation dispatch.
+            MailMutationOutcomeUnknownError: A dispatched move-to-Trash step
+                did not receive a conclusive response; do not replay it.
         """
         _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
 
-        with self._session() as client:
+        with self._mutation_session("delete", len(message_ids)) as (client, progress):
             # #199 / #198: do all LIST traffic in AUTHENTICATED state.
             # Some servers (Exchange Online, older Dovecot) issue an
             # implicit CLOSE when LIST runs while a mailbox is SELECTED,
@@ -2001,12 +2083,7 @@ class ImapConnector:
             if not uids:
                 return 0
 
-            if has_move:
-                client.move(uids, trash)
-            else:
-                client.copy(uids, trash)
-                client.add_flags(uids, [b"\\Deleted"], silent=True)
-                client.uid_expunge(uids)
+            self._move_resolved_uids(client, uids, trash, has_move, progress)
             return len(uids)
 
     def set_read_status(

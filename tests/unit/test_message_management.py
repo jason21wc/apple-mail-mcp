@@ -1,5 +1,6 @@
 """Unit tests for message management functionality."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -26,7 +27,7 @@ class TestMoveMessages:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         """Test moving a single message."""
-        mock_run.return_value = "1"
+        mock_run.return_value = json.dumps({"moved": 1, "not_moved": 0, "unknown": 0, "not_found": 0, "read_status": 0, "flag_index": 0, "flagged_status": 0, "not_moved_ids": []})
 
         result = connector.move_messages(
             message_ids=["12345"],
@@ -44,7 +45,7 @@ class TestMoveMessages:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         """Test moving multiple messages."""
-        mock_run.return_value = "3"
+        mock_run.return_value = json.dumps({"moved": 3, "not_moved": 0, "unknown": 0, "not_found": 0, "read_status": 0, "flag_index": 0, "flagged_status": 0, "not_moved_ids": []})
 
         result = connector.move_messages(
             message_ids=["12345", "12346", "12347"],
@@ -59,7 +60,7 @@ class TestMoveMessages:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         """Test moving to nested mailbox."""
-        mock_run.return_value = "1"
+        mock_run.return_value = json.dumps({"moved": 1, "not_moved": 0, "unknown": 0, "not_found": 0, "read_status": 0, "flag_index": 0, "flagged_status": 0, "not_moved_ids": []})
 
         result = connector.move_messages(
             message_ids=["12345"],
@@ -75,8 +76,8 @@ class TestMoveMessages:
     def test_move_with_gmail_handling(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        """Test Gmail-specific move handling (copy + delete)."""
-        mock_run.return_value = "1"
+        """Deprecated gmail_mode retains verified native move behavior."""
+        mock_run.return_value = json.dumps({"moved": 1, "not_moved": 0, "unknown": 0, "not_found": 0, "read_status": 0, "flag_index": 0, "flagged_status": 0, "not_moved_ids": []})
 
         result = connector.move_messages(
             message_ids=["12345"],
@@ -86,7 +87,7 @@ class TestMoveMessages:
         )
 
         assert result == 1
-        # Gmail mode uses copy+delete instead of native move
+        # Deprecated gmail_mode does not switch to copy+delete
         mock_run.assert_called_once()
 
     def test_move_empty_list(self, connector: AppleMailConnector) -> None:
@@ -117,7 +118,7 @@ class TestMoveMessages:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         uuid = "DC5AC137-2F7A-4299-B3D0-4D3E06C18DD5"
-        mock_run.return_value = "1"
+        mock_run.return_value = json.dumps({"moved": 1, "not_moved": 0, "unknown": 0, "not_found": 0, "read_status": 0, "flag_index": 0, "flagged_status": 0, "not_moved_ids": []})
         connector.move_messages(
             message_ids=["12345"],
             destination_mailbox="Archive",
@@ -131,7 +132,7 @@ class TestMoveMessages:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         uuid = "DC5AC137-2F7A-4299-B3D0-4D3E06C18DD5"
-        mock_run.return_value = "1"
+        mock_run.return_value = json.dumps({"moved": 1, "not_moved": 0, "unknown": 0, "not_found": 0, "read_status": 0, "flag_index": 0, "flagged_status": 0, "not_moved_ids": []})
         connector.move_messages(
             message_ids=["12345"],
             destination_mailbox="Archive",
