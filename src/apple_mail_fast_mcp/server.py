@@ -1910,7 +1910,7 @@ def preview_move_by_query(
     sender list are the only view of what will move. If the senders or the
     count are not what was intended, tighten the filters and preview again.
 
-    IMAP only. Not available for Gmail accounts or servers without MOVE.
+    Requires IMAP MOVE or UIDPLUS. Gmail accounts are unsupported.
 
     Args:
         account: Mail.app account name or UUID.
@@ -2025,7 +2025,9 @@ async def commit_move_by_query(
           ``remaining`` was recounted on a fresh connection (null with
           ``remaining_unverified`` when even that failed).
           ``moved_unconfirmed`` counts messages that left the source without
-          a confirmed reply. Calling again is safe: nothing is moved twice.
+          a confirmed reply. On servers using UIDPLUS (including iCloud), a
+          failed call may have copied messages still present in the source.
+          Inspect the destination before retrying to avoid duplicate copies.
 
     Moving to a Trash mailbox asks the user to confirm first, on the same
     terms as ``delete_messages``.

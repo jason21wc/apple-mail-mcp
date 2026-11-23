@@ -383,7 +383,7 @@ Read the result before committing: ``matched``, the date range, and the
 sender list are the only view of what will move. If the senders or the
 count are not what was intended, tighten the filters and preview again.
 
-IMAP only. Not available for Gmail accounts or servers without MOVE.
+Requires IMAP MOVE or UIDPLUS. Gmail accounts are unsupported.
 
 **Parameters:**
 
