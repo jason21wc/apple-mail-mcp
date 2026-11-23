@@ -320,6 +320,7 @@ class TestToolInvocation:
             uidvalidity=7,
             uids=[1, 2],
             selector={"sender_contains": "news@example.com"},
+            identity=(connector._host, connector._email),
         )
 
     @pytest.mark.parametrize(
