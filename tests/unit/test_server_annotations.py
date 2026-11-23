@@ -33,6 +33,7 @@ READ_ONLY_TOOLS: set[str] = {
     "get_messages",
     "get_thread",
     "get_statistics",
+    "preview_move_by_query",
     "get_attachment_content",
     "get_template",
     "render_template",
@@ -41,6 +42,7 @@ READ_ONLY_TOOLS: set[str] = {
 # Mutating tools, partitioned by destructiveHint.
 DESTRUCTIVE_TOOLS: set[str] = {
     "update_message",
+    "commit_move_by_query",
     "update_mailbox",
     "update_rule",
     "update_draft",
@@ -64,6 +66,7 @@ MUTATING_TOOLS = DESTRUCTIVE_TOOLS | ADDITIVE_TOOLS
 
 # Idempotent: same args → same end state.
 NON_IDEMPOTENT_TOOLS: set[str] = {
+    "commit_move_by_query",  # each call moves the next slice of the preview
     "update_draft",   # retries can create/send again when the original is retained
     "create_draft",   # each call may create a new draft
     "create_rule",    # rules may be appended on each call
@@ -172,10 +175,10 @@ class TestProductionAnnotations:
         assert names == READ_ONLY_TOOLS | MUTATING_TOOLS
 
     def test_classifications_partition_correctly(self) -> None:
-        """No overlap between read-only and mutating sets; counts are 11 + 14."""
+        """No overlap between read-only and mutating sets; counts are 12 + 15."""
         assert READ_ONLY_TOOLS.isdisjoint(MUTATING_TOOLS)
-        assert len(READ_ONLY_TOOLS) == 11
-        assert len(MUTATING_TOOLS) == 14
+        assert len(READ_ONLY_TOOLS) == 12
+        assert len(MUTATING_TOOLS) == 15
         assert DESTRUCTIVE_TOOLS.isdisjoint(ADDITIVE_TOOLS)
 
     @pytest.mark.parametrize("name", sorted(READ_ONLY_TOOLS))

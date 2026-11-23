@@ -234,6 +234,7 @@ class TestCheckRateLimit:
             "search_messages", "get_statistics",
             "update_message", "create_mailbox", "update_mailbox",
             "delete_mailbox", "delete_messages",
+            "preview_move_by_query", "commit_move_by_query",
             "create_draft", "update_draft", "delete_draft",
             "delete_rule", "create_rule", "update_rule",
             "list_templates", "get_template", "save_template",
