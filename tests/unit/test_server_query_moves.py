@@ -110,6 +110,30 @@ class TestCommitTool:
         assert (out["moved"], out["outcome"]) == (3, "complete")
         assert (tmp_path / "query_move_receipts.jsonl").exists()
 
+    async def test_confirmed_move_survives_an_audit_log_failure(
+        self, backend: FakeConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pid = _preview()["preview_id"]
+
+        def boom(*_a: Any, **_k: Any) -> None:
+            raise OSError("audit log unavailable")
+
+        monkeypatch.setattr(server.operation_logger, "log_operation", boom)
+        out = await server.commit_move_by_query(pid, max_count=10)
+        assert out["success"] is True
+        assert out["moved"] == 3
+        assert "audit_log_error" in out
+
+    async def test_server_journals_under_the_app_data_directory(
+        self, backend: FakeConnector, tmp_path: Any
+    ) -> None:
+        backend.client.capabilities.return_value = (b"IMAP4REV1", b"UIDPLUS")
+        pid = _preview()["preview_id"]
+        backend.client.uid_expunge.side_effect = IMAPClientError("dropped")
+        out = await server.commit_move_by_query(pid, max_count=10)
+        assert out["outcome"] == "failed"
+        assert (tmp_path / "query_move_journal.json").exists()
+
     async def test_unknown_preview_id(self, backend: FakeConnector) -> None:
         out = await server.commit_move_by_query("nope", max_count=10)
         assert out["success"] is False

@@ -557,6 +557,8 @@ At least one of `sender_contains`, `subject_contains`, `date_from`, `date_to`, `
   "other_senders_count": 0,
   "expires_in_seconds": 900,
   "max_per_commit_call": 1000,
+  "commit_time_budget_seconds": 20,
+  "flagged_deleted_skipped": 0,
   "content_is_untrusted": true,
   "security_notice": "..."
 }
@@ -582,7 +584,7 @@ At least one of `sender_contains`, `subject_contains`, `date_from`, `date_to`, `
 
 **Fork-local.** Move the messages held by a `preview_move_by_query` result.
 
-Moves exactly the previewed messages. Mail that arrives after the preview is never included, even if it matches the filters. Each call moves at most 1,000 messages; repeat with the same `preview_id` while `outcome` is `"more"`.
+Moves exactly the previewed messages. Mail that arrives after the preview is never included, even if it matches the filters. Each call works for about 20 seconds and then returns; repeat with the same `preview_id` while `outcome` is `"more"`. A large set takes many calls. The limit is on time, not count, because a client that gives up on a slow call can restart the server mid-move. If a call errors or times out, do not assume nothing moved: preview again and compare counts.
 
 **Parameters:**
 - `preview_id` (string, required): From `preview_move_by_query`
@@ -603,14 +605,25 @@ Moves exactly the previewed messages. Mail that arrives after the preview is nev
 - `outcome`: `"complete"` (everything previewed has been handled), `"more"` (call again), or `"failed"` (IMAP failed part-way; `success` is `false`, `error` says why).
 - After a failure, `remaining` is recounted on a fresh connection, and `moved_unconfirmed` counts messages that left the source without a confirmed reply (the server applied a chunk but the reply was lost). If the recount also fails, `remaining` is `null` with `remaining_unverified: true`. Calling again is safe: each chunk is checked for presence before it is moved, so nothing moves twice. One exception on servers without `MOVE` (iCloud): if a call fails after the copy landed but before the originals were removed, the retry copies those messages again, leaving duplicates in the destination. Nothing is lost.
 - `already_gone` counts previewed messages that were no longer in the source (for example moved by hand in the meantime).
+- `resumed` (when present) counts messages whose removal an earlier interrupted call left unfinished and this call completed. Their copy had already landed, so they are not copied again.
+- `held_back_uncertain` (when present) counts messages left in place because an earlier copy of them may or may not have landed. They are never retried automatically. Check the destination by hand; once they are gone from the source the hold clears.
 - Moving to a Trash mailbox asks the user to confirm first, on the same terms as `delete_messages`.
 
-**Receipts:** every call that moves mail or fails appends one JSON line to `~/.apple_mail_mcp/query_move_receipts.jsonl` (or under `APPLE_MAIL_MCP_HOME`): time, account, source, destination, the filters, the source UIDs moved, the source UIDs moved without confirmation, and the outcome. No subjects, senders or bodies. The receipt does not record where messages landed in the destination; to undo, preview the same filters from the destination back to the source.
+**Interrupted moves (servers without `MOVE`, such as iCloud):** each chunk is written to `~/.apple_mail_mcp/query_move_journal.json` before its copy starts and cleared when the originals are removed. If the server process dies in between, the next commit on that mailbox reads the journal:
+
+- Where the copy had returned, it first checks that every copy is still in the destination, using the UIDs the server reported for the copy. Only then does it remove the originals (`resumed`). If any copy is missing, for example because the destination was emptied in the meantime, the originals are left alone and held back.
+- Where the copy was still in flight, the messages are held back (`held_back_uncertain`). A copy the server refused outright leaves no hold.
+
+The preview leaves out messages already flagged deleted and reports them as `flagged_deleted_skipped`, since that flag is what an interrupted move leaves behind. It reports `interrupted_pending` when the journal holds chunks for the mailbox, and in that case issues a `preview_id` even if `matched` is 0, so the commit that settles them can run. An unreadable journal stops commits with `journal_unreadable` until it is inspected by hand.
+
+**Receipts:** every call that moves mail or fails appends one JSON line to `~/.apple_mail_mcp/query_move_receipts.jsonl` (or under `APPLE_MAIL_MCP_HOME`): time, account, source, destination, the filters, the source UIDs moved, those moved without confirmation, those whose interrupted removal was finished, and the outcome. No subjects, senders or bodies. The receipt does not record where messages landed in the destination; to undo, preview the same filters from the destination back to the source.
 
 **Error Types:**
 - `preview_not_found`: Unknown, completed, or expired `preview_id`, or the server restarted
 - `max_count_exceeded`: The previewed set is larger than `max_count`
-- `selection_stale`: The source mailbox was rebuilt since the preview (UIDVALIDITY changed). Preview again
+- `selection_stale`: The source mailbox was rebuilt since the preview (UIDVALIDITY changed). Preview again, or the account now resolves to a different server or login
+- `journal_unreadable`: The interrupted-move journal cannot be read; nothing moves until it is inspected
+- `commit_in_progress`: Another commit call is still working on this preview. Wait, then preview again
 - `confirmation_required` / `cancelled`: Trash destination not confirmed
 - `imap_required`, `unsupported_account`, `imap_move_unsupported`, `imap_error`: as for the preview
 

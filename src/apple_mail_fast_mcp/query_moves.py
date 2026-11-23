@@ -15,6 +15,16 @@ Two properties matter more than speed:
 * A commit moves only UIDs the preview saw. Mail delivered afterwards is
   never included, and a retry after a failure cannot move anything twice,
   because each chunk is re-checked for presence before it is moved.
+* A commit call is bounded by elapsed time. A client that gives up on a slow
+  call may kill this process outright (seen live: the call passed about a
+  minute and the server was restarted mid-chunk), so each call stops well
+  short of that and reports ``more``.
+* On the UIDPLUS path every chunk is journalled to disk before its copy. If
+  the process dies between the copy and the removal, the next commit
+  finishes the removal instead of copying again, but only after finding
+  every copy still in the destination (by the UIDs the server reported).
+  If the copy is in doubt, or its copies have since gone, those messages
+  are held back, never blindly retried and never removed.
 
 IMAP only. Uses MOVE (RFC 6851) where the server advertises it, otherwise the
 UIDPLUS (RFC 4315) sequence the ID-based move already uses: copy, flag
@@ -24,15 +34,22 @@ no AppleScript fallback: if IMAP cannot do it, the call fails.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
+import logging
+import os
+import re
 import secrets
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
+
+from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
 
 from .exceptions import (
     MailError,
@@ -48,12 +65,22 @@ from .imap_connector import (
 )
 from .utils import rank_senders
 
-MAX_PER_CALL = 1000
-"""Most messages one commit call moves. Bounds the call's duration so a
-client or proxy timeout cannot fire while the server is still moving mail."""
+logger = logging.getLogger(__name__)
 
-MOVE_CHUNK = 250
-"""UIDs per IMAP MOVE command."""
+MAX_PER_CALL = 1000
+"""Most messages one commit call moves, whatever the time budget allows."""
+
+MOVE_CHUNK = 25
+"""UIDs per move step. Small on purpose: on iCloud's UIDPLUS path a chunk of
+250 took over a minute, longer than a client waits."""
+
+CHUNK_SOCKET_TIMEOUT_SECONDS = 15.0
+"""Socket read timeout while moving. The connector's default is 30 s per
+read, which lets one stalled chunk outlast a client on its own."""
+
+TIME_BUDGET_SECONDS = 20.0
+"""A commit call starts no new chunk after this long. Sized well under the
+roughly 60 s after which a client was seen to restart the server."""
 
 FETCH_CHUNK = 100
 """UIDs per ENVELOPE fetch while building the preview summary."""
@@ -81,6 +108,18 @@ class PreviewTooLargeError(QueryMoveError):
 
 class SelectionStaleError(QueryMoveError):
     """The mailbox was rebuilt since the preview, so its UIDs mean nothing."""
+
+
+class CommitInProgressError(QueryMoveError):
+    """Another commit call is already working on this preview."""
+
+
+class JournalUnreadableError(QueryMoveError):
+    """The interrupted-move journal exists but cannot be read.
+
+    Refusing is the safe direction: the journal is what stops a half-moved
+    chunk from being copied again.
+    """
 
 
 class _Connector(Protocol):
@@ -155,6 +194,8 @@ class PreviewEntry:
     selector: dict[str, Any]
     expires_at: float
     remaining: list[int] = field(default_factory=list)
+    identity: tuple[str | None, str | None] = (None, None)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 class PreviewStore:
@@ -192,6 +233,7 @@ class PreviewStore:
         uidvalidity: int | None,
         uids: list[int],
         selector: dict[str, Any],
+        identity: tuple[str | None, str | None] = (None, None),
     ) -> str:
         preview_id = secrets.token_urlsafe(16)
         entry = PreviewEntry(
@@ -203,6 +245,7 @@ class PreviewStore:
             selector=selector,
             expires_at=self._clock() + self._ttl,
             remaining=list(uids),
+            identity=identity,
         )
         with self._lock:
             self._prune()
@@ -235,6 +278,157 @@ def connector_for(mail: Any, account: str) -> ImapConnector:
     host, port, email = mail._resolve_imap_config(account)
     password = mail._get_imap_password_with_fallback(account, email)
     return ImapConnector(host, port, email, password, pool=mail._imap_pool)
+
+
+def _identity(connector: Any) -> tuple[str | None, str | None]:
+    """Which server and login a connector talks to.
+
+    A preview's UIDs only mean something on the server they came from. The
+    account name is resolved again at commit time, so the resolved endpoint
+    is compared too.
+    """
+    return (getattr(connector, "_host", None), getattr(connector, "_email", None))
+
+
+class MoveJournal:
+    """On-disk record of UIDPLUS chunks that are part-way through a move.
+
+    ``stage`` is ``"copying"`` from just before the COPY until it returns
+    (the copy may or may not have landed) and ``"copied"`` from then until
+    the originals are removed. A record that outlives its call is what lets
+    the next call finish safely. With no path it keeps records in memory
+    only, which is enough for a failure the process survives.
+
+    Several server processes can share one data directory (each client
+    launches its own), so every read-modify-write holds a file lock.
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._memory: list[dict[str, Any]] = []
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        if self._path is None:
+            yield
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path.with_suffix(".lock"), "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    def _read(self) -> list[dict[str, Any]]:
+        if self._path is None:
+            return list(self._memory)
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise JournalUnreadableError(
+                f"the interrupted-move journal at {self._path} is not valid "
+                f"JSON; nothing was moved. Inspect or remove it by hand."
+            ) from exc
+        if not isinstance(data, list) or not all(isinstance(r, dict) for r in data):
+            raise JournalUnreadableError(
+                f"the interrupted-move journal at {self._path} has an "
+                f"unexpected shape; nothing was moved."
+            )
+        return data
+
+    def _write(self, records: list[dict[str, Any]]) -> None:
+        if self._path is None:
+            self._memory = list(records)
+            return
+        tmp = self._path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(records, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, self._path)
+
+    def load(self) -> list[dict[str, Any]]:
+        with self._locked():
+            return self._read()
+
+    def add(self, record: dict[str, Any]) -> None:
+        with self._locked():
+            self._write([*self._read(), record])
+
+    def replace(self, old: dict[str, Any], new: dict[str, Any] | None) -> None:
+        with self._locked():
+            records = [r for r in self._read() if r != old]
+            if new is not None:
+                records.append(new)
+            self._write(records)
+
+
+def _mailbox_key(name: str) -> str:
+    """INBOX is case-insensitive in IMAP; every other name is exact."""
+    return "INBOX" if name.upper() == "INBOX" else name
+
+
+def _record_key(record: dict[str, Any]) -> tuple[Any, Any, str]:
+    return (
+        record.get("host"),
+        record.get("login"),
+        _mailbox_key(str(record.get("source_mailbox", ""))),
+    )
+
+
+def _entry_key(entry: PreviewEntry) -> tuple[Any, Any, str]:
+    return (*entry.identity, _mailbox_key(entry.source_mailbox))
+
+
+_COPYUID_RE = re.compile(rb"^(?:COPYUID )?(\d+) (\S+) ([0-9:,]+)$")
+
+
+def _expand_uid_set(text: bytes) -> list[int]:
+    uids: list[int] = []
+    for part in text.split(b","):
+        low, _, high = part.partition(b":")
+        first, last = int(low), int(high or low)
+        uids.extend(range(min(first, last), max(first, last) + 1))
+    return uids
+
+
+def _parse_copyuid(value: Any, expected: int) -> tuple[int, list[int]] | None:
+    """Destination UIDVALIDITY and UIDs from a COPYUID response code.
+
+    None unless it names exactly ``expected`` destination UIDs: a later
+    resume removes originals on the strength of this, so anything short of
+    a full account of the copies is treated as "the server did not say".
+    """
+    if not isinstance(value, bytes):
+        return None
+    match = _COPYUID_RE.match(value.strip())
+    if match is None:
+        return None
+    dest = _expand_uid_set(match.group(3))
+    if len(dest) != expected:
+        return None
+    return int(match.group(1)), dest
+
+
+def _copy_reporting_uids(
+    client: Any, uids: list[int], destination: str
+) -> tuple[int, list[int]] | None:
+    """COPY, and return where the copies landed if the server said.
+
+    imapclient's ``copy`` returns untagged FETCH data, not the tagged reply,
+    so the COPYUID code (RFC 4315) has to be read from where imaplib files
+    response codes.
+    """
+    responses = getattr(getattr(client, "_imap", None), "untagged_responses", None)
+    if isinstance(responses, dict):
+        responses.pop("COPYUID", None)
+    client.copy(uids, destination)
+    if not isinstance(responses, dict):
+        return None
+    values = responses.pop("COPYUID", None) or [None]
+    return _parse_copyuid(values[-1], len(uids))
 
 
 def _chunks(items: list[int], size: int) -> list[list[int]]:
@@ -318,6 +512,7 @@ def preview(
     destination_mailbox: str,
     selector: Selector,
     ceiling: int = DEFAULT_CEILING,
+    journal_path: Path | None = None,
 ) -> dict[str, Any]:
     """Find what the selector matches and hold that set. Changes nothing."""
     _reject_control_chars(source_mailbox, "source_mailbox")
@@ -342,16 +537,38 @@ def preview(
                 "the server did not report UIDVALIDITY for the source "
                 "mailbox; a preview cannot be bound to it safely"
             )
-        found = client.search(criteria, charset) if charset else client.search(criteria)
+        # Messages already flagged \\Deleted are left out: that flag is what an
+        # interrupted UIDPLUS move leaves behind after its copy has landed,
+        # so selecting them again would copy them a second time.
+        live = [*criteria, "UNDELETED"]
+        flagged = [*criteria, "DELETED"]
+        found = client.search(live, charset) if charset else client.search(live)
+        skipped = client.search(flagged, charset) if charset else client.search(flagged)
         uids = sorted(int(u) for u in found)
 
-        result: dict[str, Any] = {"matched": len(uids), "preview_id": None}
-        if not uids:
+        result: dict[str, Any] = {
+            "matched": len(uids),
+            "preview_id": None,
+            "flagged_deleted_skipped": len(skipped),
+        }
+        # An earlier call may have left chunks part-way through. Say so, and
+        # still issue an id when nothing else matches: the commit is what
+        # settles them, and flagged originals no longer match the search.
+        key = (*_identity(connector), _mailbox_key(source_mailbox))
+        pending = sum(
+            len(r.get("uids", []))
+            for r in MoveJournal(journal_path).load()
+            if _record_key(r) == key and r.get("uidvalidity") == uidvalidity
+        )
+        if pending:
+            result["interrupted_pending"] = pending
+        if not uids and not pending:
             return result
         if len(uids) > ceiling:
             result.update(over_limit=True, limit=ceiling)
             return result
-        result.update(_summarize(client, uids, selector))
+        if uids:
+            result.update(_summarize(client, uids, selector))
 
     result["preview_id"] = store.put(
         account=account,
@@ -360,25 +577,132 @@ def preview(
         uidvalidity=uidvalidity,
         uids=uids,
         selector=selector.as_dict(),
+        identity=_identity(connector),
     )
     result["expires_in_seconds"] = int(store.ttl)
     result["max_per_commit_call"] = MAX_PER_CALL
+    result["commit_time_budget_seconds"] = int(TIME_BUDGET_SECONDS)
     return result
 
 
-def _move_chunk(client: Any, uids: list[int], destination: str, has_move: bool) -> None:
-    """Move ``uids`` out of the selected mailbox into ``destination``.
-
-    The UIDPLUS path copies first and removes last, so a failure part-way
-    leaves the originals in place. The cost is that a retry after a copy
-    that did land copies those messages again: duplicates, never loss.
-    """
-    if has_move:
-        client.move(uids, destination)
-        return
-    client.copy(uids, destination)
+def _remove_copied(client: Any, uids: list[int]) -> None:
+    """Remove originals whose copy is known to exist."""
     client.add_flags(uids, [b"\\Deleted"], silent=True)
     client.uid_expunge(uids)
+
+
+def _move_chunk(
+    client: Any,
+    uids: list[int],
+    entry: PreviewEntry,
+    has_move: bool,
+    journal: MoveJournal,
+) -> None:
+    """Move ``uids`` out of the selected mailbox into the entry's destination.
+
+    The UIDPLUS path copies first and removes last, so a failure part-way
+    leaves the originals in place. Each step is journalled first, so a
+    failure (or the process being killed) is finished or held back by the
+    next call rather than copied again.
+    """
+    if has_move:
+        client.move(uids, entry.destination_mailbox)
+        return
+    host, login = entry.identity
+    record: dict[str, Any] = {
+        "host": host,
+        "login": login,
+        "source_mailbox": entry.source_mailbox,
+        "destination_mailbox": entry.destination_mailbox,
+        "uidvalidity": entry.uidvalidity,
+        "uids": list(uids),
+        "stage": "copying",
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    journal.add(record)
+    try:
+        parsed = _copy_reporting_uids(client, uids, entry.destination_mailbox)
+    except IMAPClientAbortError:
+        raise  # connection broke: the copy may or may not have landed
+    except IMAPClientError:
+        # A tagged NO or BAD: the server refused, so nothing was copied
+        # (COPY is all-or-nothing). No hold is needed.
+        journal.replace(record, None)
+        raise
+    copied = {**record, "stage": "copied"}
+    if parsed is not None:
+        copied["dest_uidvalidity"], copied["dest_uids"] = parsed
+    else:
+        logger.warning(
+            "COPY reply carried no COPYUID; an interrupted removal of this "
+            "chunk could not be resumed and would be held back"
+        )
+    journal.replace(record, copied)
+    _remove_copied(client, uids)
+    journal.replace(copied, None)
+
+
+def _copies_exist(client: Any, record: dict[str, Any], source_mailbox: str) -> bool:
+    """Whether every copy a "copied" record made is still in its destination.
+
+    The originals are only removed on this proof. Time may have passed since
+    the copy: the copies could have been deleted as apparent duplicates, and
+    removing the originals then would lose the mail. A copy that is itself
+    flagged deleted does not count. Leaves the source mailbox selected for
+    writing again.
+    """
+    dest_uids = [int(u) for u in record.get("dest_uids") or []]
+    if not dest_uids or record.get("dest_uidvalidity") is None:
+        return False
+    try:
+        try:
+            selected = client.select_folder(
+                record["destination_mailbox"], readonly=True
+            )
+        except IMAPClientAbortError:
+            raise
+        except IMAPClientError:
+            return False  # destination renamed or removed: cannot prove it
+        if _uidvalidity(selected) != record["dest_uidvalidity"]:
+            return False
+        found = client.search(
+            ["UID", ",".join(str(u) for u in dest_uids), "UNDELETED"]
+        )
+        return {int(u) for u in found} >= set(dest_uids)
+    finally:
+        client.select_folder(source_mailbox, readonly=False)
+
+
+def _settle_interrupted(
+    client: Any, journal: MoveJournal, entry: PreviewEntry
+) -> tuple[list[int], set[int]]:
+    """Deal with chunks an earlier call left part-way through.
+
+    Returns the originals removed now (their copies were verified in the
+    destination) and the UIDs that must be held back, either because the
+    copy is in doubt or because its copies can no longer be found.
+    """
+    resumed: list[int] = []
+    held: set[int] = set()
+    for record in journal.load():
+        if _record_key(record) != _entry_key(entry):
+            continue
+        if record.get("uidvalidity") != entry.uidvalidity:
+            # The mailbox was rebuilt; these UIDs name other messages now.
+            journal.replace(record, None)
+            continue
+        present = _present(client, [int(u) for u in record.get("uids", [])])
+        if not present:
+            journal.replace(record, None)
+        elif record.get("stage") == "copied" and _copies_exist(
+            client, record, entry.source_mailbox
+        ):
+            _remove_copied(client, present)
+            journal.replace(record, None)
+            resumed.extend(present)
+        else:
+            held.update(present)
+    return resumed, held
 
 
 def _present(client: Any, uids: list[int]) -> list[int]:
@@ -401,7 +725,9 @@ def _recount(
     """
     try:
         with connector._session() as client:
-            client.select_folder(entry.source_mailbox, readonly=True)
+            selected = client.select_folder(entry.source_mailbox, readonly=True)
+            if _uidvalidity(selected) != entry.uidvalidity:
+                return None
             still: list[int] = []
             for chunk in _chunks(candidates, MOVE_CHUNK):
                 still.extend(_present(client, chunk))
@@ -416,32 +742,51 @@ def _write_receipt(path: Path, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def commit(
+@dataclass
+class _Progress:
+    """What one commit call got through before it stopped."""
+
+    moved: list[int] = field(default_factory=list)
+    held_back: list[int] = field(default_factory=list)
+    pending: list[int] = field(default_factory=list)  # chunk in flight on error
+    resumed: list[int] = field(default_factory=list)
+    gone: int = 0
+    done: int = 0  # UIDs of entry.remaining dealt with
+    error: str | None = None
+
+
+@contextlib.contextmanager
+def _socket_timeout(client: Any) -> Iterator[None]:
+    """Shorten the socket read timeout for a move, then put it back."""
+    try:
+        sock = client.socket()
+        previous = sock.gettimeout()
+        sock.settimeout(CHUNK_SOCKET_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 - a client without a tunable socket
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            sock.settimeout(previous)
+
+
+def _run_chunks(
     connector: _Connector,
     store: PreviewStore,
-    *,
     preview_id: str,
-    max_count: int,
-    receipts_path: Path | None = None,
-) -> dict[str, Any]:
-    """Move the next slice of a previewed set. Repeat until ``complete``."""
-    entry = store.get(preview_id)
-    if entry.total > max_count:
-        raise PreviewTooLargeError(
-            f"the preview holds {entry.total} messages, above max_count="
-            f"{max_count}; nothing was moved"
-        )
-
-    batch = entry.remaining[:MAX_PER_CALL]
-    untouched = entry.remaining[MAX_PER_CALL:]
-    moved: list[int] = []
-    unconfirmed: list[int] = []
-    gone = 0
-    error: str | None = None
-    pending = list(batch)
-
+    entry: PreviewEntry,
+    journal: MoveJournal,
+    time_budget: float,
+    clock: Callable[[], float],
+) -> _Progress:
+    """Work through the entry's chunks until done, out of time, or failing."""
+    progress = _Progress()
+    chunks = _chunks(entry.remaining[:MAX_PER_CALL], MOVE_CHUNK)
+    started = clock()
     try:
-        with connector._session() as client:
+        with connector._session() as client, _socket_timeout(client):
             has_move = _check_server(connector, client)
             selected = client.select_folder(entry.source_mailbox, readonly=False)
             if _uidvalidity(selected) != entry.uidvalidity:
@@ -450,28 +795,99 @@ def commit(
                     "the source mailbox was rebuilt since the preview "
                     "(UIDVALIDITY changed); nothing was moved. Preview again."
                 )
-            for chunk in _chunks(batch, MOVE_CHUNK):
+            progress.resumed, held = _settle_interrupted(client, journal, entry)
+            for index, chunk in enumerate(chunks):
+                if index and clock() - started >= time_budget:
+                    break
+                progress.pending = chunk
                 present = _present(client, chunk)
+                skip = [u for u in present if u in held]
+                present = [u for u in present if u not in held]
                 if present:
-                    _move_chunk(
-                        client, present, entry.destination_mailbox, has_move
-                    )
-                moved.extend(present)
-                gone += len(chunk) - len(present)
-                pending = pending[len(chunk):]
+                    _move_chunk(client, present, entry, has_move, journal)
+                progress.moved.extend(present)
+                progress.held_back.extend(skip)
+                progress.gone += len(chunk) - len(present) - len(skip)
+                progress.done += len(chunk)
+                progress.pending = []
     except MailError:
         # Refusals decided before or between moves (stale mailbox, no MOVE
         # support). Typed, so the server reports them as such.
         raise
-    except Exception as exc:  # noqa: BLE001 - reported to the caller below
-        error = str(exc) or type(exc).__name__
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        progress.error = str(exc) or type(exc).__name__
+    return progress
 
+
+def commit(
+    connector: _Connector,
+    store: PreviewStore,
+    *,
+    preview_id: str,
+    max_count: int,
+    receipts_path: Path | None = None,
+    journal_path: Path | None = None,
+    time_budget: float = TIME_BUDGET_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Move the next slice of a previewed set. Repeat until ``complete``."""
+    entry = store.get(preview_id)
+    # One commit per preview at a time. A client that retries while an
+    # earlier call is still running would otherwise interleave with it:
+    # two copies of a chunk, or UIDs sliced off the list unprocessed.
+    if not entry.lock.acquire(blocking=False):
+        raise CommitInProgressError(
+            "another commit call is still working on this preview; wait "
+            "for it to finish, then preview again to see what is left"
+        )
+    try:
+        return _commit_locked(
+            connector, store, entry, preview_id, max_count,
+            receipts_path, MoveJournal(journal_path), time_budget, clock,
+        )
+    finally:
+        entry.lock.release()
+
+
+def _commit_locked(
+    connector: _Connector,
+    store: PreviewStore,
+    entry: PreviewEntry,
+    preview_id: str,
+    max_count: int,
+    receipts_path: Path | None,
+    journal: MoveJournal,
+    time_budget: float,
+    clock: Callable[[], float],
+) -> dict[str, Any]:
+    if entry.total > max_count:
+        raise PreviewTooLargeError(
+            f"the preview holds {entry.total} messages, above max_count="
+            f"{max_count}; nothing was moved"
+        )
+    if _identity(connector) != entry.identity:
+        store.discard(preview_id)
+        raise SelectionStaleError(
+            "the account now resolves to a different server or login than "
+            "the one previewed; nothing was moved. Preview again."
+        )
+
+    progress = _run_chunks(
+        connector, store, preview_id, entry, journal, time_budget, clock,
+    )
+    pending = progress.pending
+    untouched = entry.remaining[progress.done + len(pending):]
+    unconfirmed: list[int] = []
     result: dict[str, Any] = {
-        "moved": len(moved),
-        "already_gone": gone,
+        "moved": len(progress.moved),
+        "already_gone": progress.gone,
         "total": entry.total,
     }
-    if error is None:
+    if progress.resumed:
+        result["resumed"] = len(progress.resumed)
+    if progress.held_back:
+        result["held_back_uncertain"] = len(progress.held_back)
+    if progress.error is None:
         entry.remaining = untouched
         result["remaining"] = len(untouched)
         result["outcome"] = "more" if untouched else "complete"
@@ -479,7 +895,7 @@ def commit(
         # The failed chunk may or may not have been applied by the server.
         still = _recount(connector, entry, pending)
         result["outcome"] = "failed"
-        result["error"] = error
+        result["error"] = progress.error
         if still is None:
             entry.remaining = pending + untouched
             result["remaining"] = None
@@ -495,7 +911,9 @@ def commit(
     if result["outcome"] == "complete":
         store.discard(preview_id)
 
-    if receipts_path is not None and (moved or error is not None):
+    if receipts_path is not None and (
+        progress.moved or progress.resumed or progress.error is not None
+    ):
         try:
             _write_receipt(
                 receipts_path,
@@ -507,9 +925,10 @@ def commit(
                     "destination_mailbox": entry.destination_mailbox,
                     "selector": entry.selector,
                     "uidvalidity": entry.uidvalidity,
-                    "source_uids": moved,
+                    "source_uids": progress.moved,
                     "source_uids_unconfirmed": unconfirmed,
-                    "moved": len(moved),
+                    "source_uids_resumed": progress.resumed,
+                    "moved": len(progress.moved),
                     "outcome": result["outcome"],
                 },
             )
