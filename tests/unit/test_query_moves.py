@@ -33,6 +33,9 @@ def _envelope(sender: str, when: datetime | None) -> Envelope:
     return Envelope(when, b"subj", (addr,), (addr,), (addr,), None, None, None, None, b"<id@x>")
 
 
+UIDPLUS_ONLY = (b"IMAP4REV1", b"UIDPLUS")
+
+
 class FakeConnector:
     """Stands in for ImapConnector: hands the same mock client to each session."""
 
@@ -88,8 +91,13 @@ def _client(
         for uid in chunk:
             present.discard(uid)
 
+    def uid_expunge(chunk: list[int]) -> None:
+        for uid in chunk:
+            present.discard(uid)
+
     client.fetch.side_effect = fetch
     client.move.side_effect = move
+    client.uid_expunge.side_effect = uid_expunge
     client._present = present
     return client
 
@@ -218,10 +226,17 @@ class TestPreview:
             _preview(FakeConnector(client), qm.PreviewStore())
         client.search.assert_not_called()
 
-    def test_server_without_move_refused(self) -> None:
-        client = _client([1], capabilities=(b"IMAP4REV1", b"UIDPLUS"))
+    def test_server_without_move_or_uidplus_refused(self) -> None:
+        client = _client([1], capabilities=(b"IMAP4REV1",))
         with pytest.raises(MailImapMoveUnsupportedError):
             _preview(FakeConnector(client), qm.PreviewStore())
+
+    def test_uidplus_only_server_can_preview(self) -> None:
+        """iCloud advertises UIDPLUS but not MOVE (observed 2026-11-23)."""
+        client = _client([1, 2], capabilities=UIDPLUS_ONLY)
+        out = _preview(FakeConnector(client), qm.PreviewStore())
+        assert out["matched"] == 2
+        assert out["preview_id"]
 
     def test_missing_destination_refused(self) -> None:
         client = _client([1])
@@ -415,6 +430,35 @@ class TestCommit:
         record = json.loads(receipts.read_text().strip())
         assert record["source_uids"] == []
         assert record["source_uids_unconfirmed"] == [1, 2]
+
+    def test_uidplus_fallback_copies_then_removes_only_those_uids(self) -> None:
+        conn, store, pid, client = self._ready([1, 2, 3], capabilities=UIDPLUS_ONLY)
+        client._present.add(99)
+
+        out = qm.commit(conn, store, preview_id=pid, max_count=10)
+
+        assert (out["moved"], out["remaining"], out["outcome"]) == (3, 0, "complete")
+        client.move.assert_not_called()
+        steps = [c[0] for c in client.method_calls if c[0] in ("copy", "add_flags", "uid_expunge")]
+        assert steps == ["copy", "add_flags", "uid_expunge"]
+        client.copy.assert_called_once_with([1, 2, 3], "_To Delete")
+        client.add_flags.assert_called_once_with([1, 2, 3], [b"\\Deleted"], silent=True)
+        # Scoped expunge: never a bare EXPUNGE, which would remove every
+        # message flagged deleted in the mailbox.
+        client.uid_expunge.assert_called_once_with([1, 2, 3])
+        client.expunge.assert_not_called()
+        assert 99 in client._present
+
+    def test_uidplus_failure_before_removal_loses_nothing(self) -> None:
+        conn, store, pid, client = self._ready([1, 2], capabilities=UIDPLUS_ONLY)
+        client.add_flags.side_effect = IMAPClientError("dropped")
+
+        out = qm.commit(conn, store, preview_id=pid, max_count=10)
+
+        assert out["outcome"] == "failed"
+        assert (out["moved"], out["remaining"]) == (0, 2)
+        client.uid_expunge.assert_not_called()
+        assert client._present == {1, 2}
 
     def test_move_support_lost_at_commit_is_a_typed_refusal(self) -> None:
         conn, store, pid, client = self._ready([1])
