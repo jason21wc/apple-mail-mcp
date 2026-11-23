@@ -16,8 +16,10 @@ Two properties matter more than speed:
   never included, and a retry after a failure cannot move anything twice,
   because each chunk is re-checked for presence before it is moved.
 
-IMAP only, and only where the server advertises MOVE. There is no AppleScript
-fallback: if IMAP cannot do it, the call fails.
+IMAP only. Uses MOVE (RFC 6851) where the server advertises it, otherwise the
+UIDPLUS (RFC 4315) sequence the ID-based move already uses: copy, flag
+deleted, and expunge only those UIDs. iCloud is in the second group. There is
+no AppleScript fallback: if IMAP cannot do it, the call fails.
 """
 
 from __future__ import annotations
@@ -246,17 +248,27 @@ def _uidvalidity(select_response: Any) -> int | None:
     return int(value) if value is not None else None
 
 
-def _check_server(connector: _Connector, client: Any) -> None:
+def _check_server(connector: _Connector, client: Any) -> bool:
+    """Refuse servers this tool cannot move on safely.
+
+    Returns True when the server has MOVE, False when the UIDPLUS sequence
+    must be used instead.
+    """
     if connector._has_capability(client, b"X-GM-EXT-1"):
         raise QueryMoveUnsupportedError(
             "query moves are not supported on Gmail accounts: Gmail folders "
             "are labels and need different handling"
         )
-    if not connector._has_capability(client, b"MOVE"):
-        raise MailImapMoveUnsupportedError(
-            "the IMAP server does not advertise MOVE (RFC 6851); query moves "
-            "require it"
-        )
+    if connector._has_capability(client, b"MOVE"):
+        return True
+    if connector._has_capability(client, b"UIDPLUS"):
+        return False
+    # Without UIDPLUS the only expunge is unscoped, which would remove every
+    # message flagged deleted in the mailbox, not just the ones moved here.
+    raise MailImapMoveUnsupportedError(
+        "the IMAP server advertises neither MOVE (RFC 6851) nor UIDPLUS "
+        "(RFC 4315); query moves cannot be done safely"
+    )
 
 
 def _header_date(envelope: Any) -> date | None:
@@ -354,6 +366,21 @@ def preview(
     return result
 
 
+def _move_chunk(client: Any, uids: list[int], destination: str, has_move: bool) -> None:
+    """Move ``uids`` out of the selected mailbox into ``destination``.
+
+    The UIDPLUS path copies first and removes last, so a failure part-way
+    leaves the originals in place. The cost is that a retry after a copy
+    that did land copies those messages again: duplicates, never loss.
+    """
+    if has_move:
+        client.move(uids, destination)
+        return
+    client.copy(uids, destination)
+    client.add_flags(uids, [b"\\Deleted"], silent=True)
+    client.uid_expunge(uids)
+
+
 def _present(client: Any, uids: list[int]) -> list[int]:
     """Which of ``uids`` still exist in the selected mailbox."""
     # UID SEARCH, not FETCH: imapclient keys an unsolicited FETCH reply that
@@ -415,7 +442,7 @@ def commit(
 
     try:
         with connector._session() as client:
-            _check_server(connector, client)
+            has_move = _check_server(connector, client)
             selected = client.select_folder(entry.source_mailbox, readonly=False)
             if _uidvalidity(selected) != entry.uidvalidity:
                 store.discard(preview_id)
@@ -426,7 +453,9 @@ def commit(
             for chunk in _chunks(batch, MOVE_CHUNK):
                 present = _present(client, chunk)
                 if present:
-                    client.move(present, entry.destination_mailbox)
+                    _move_chunk(
+                        client, present, entry.destination_mailbox, has_move
+                    )
                 moved.extend(present)
                 gone += len(chunk) - len(present)
                 pending = pending[len(chunk):]
