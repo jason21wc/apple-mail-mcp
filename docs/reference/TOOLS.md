@@ -566,13 +566,13 @@ At least one of `sender_contains`, `subject_contains`, `date_from`, `date_to`, `
 - Date filters use the server's received date. `oldest_date` / `newest_date` are header dates, and `header_dates_outside_window` counts messages where the two disagree with the requested window.
 - `preview_id` is `null` when nothing matched, or when the set is above the server limit (default 5,000, override with `APPLE_MAIL_MCP_MAX_QUERY_MOVE`); in that case `over_limit` is `true` and no sender summary is fetched. Narrow the filters, for example by date.
 
-**Limits:** IMAP only, with no AppleScript fallback. Refused for Gmail accounts (folders are labels) and for servers that do not advertise `MOVE`.
+**Limits:** IMAP only, with no AppleScript fallback. Uses `MOVE` where the server advertises it and otherwise the `UIDPLUS` sequence (copy, flag deleted, expunge only those UIDs); iCloud is in the second group. Refused for Gmail accounts (folders are labels) and for servers with neither.
 
 **Error Types:**
 - `validation_error`: Open or blank selector, bad date, same source and destination, control characters
 - `imap_required`: No IMAP credentials for the account. Run `apple-mail-fast-mcp setup-imap --account <name>`
 - `unsupported_account`: Gmail account, or the server did not report UIDVALIDITY for the source mailbox
-- `imap_move_unsupported`: Server does not advertise `MOVE`
+- `imap_move_unsupported`: Server advertises neither `MOVE` nor `UIDPLUS`
 - `account_not_found` / `not_found`: Account or destination mailbox does not exist
 - `imap_error`: IMAP protocol or network failure
 
@@ -601,7 +601,7 @@ Moves exactly the previewed messages. Mail that arrives after the preview is nev
 ```
 
 - `outcome`: `"complete"` (everything previewed has been handled), `"more"` (call again), or `"failed"` (IMAP failed part-way; `success` is `false`, `error` says why).
-- After a failure, `remaining` is recounted on a fresh connection, and `moved_unconfirmed` counts messages that left the source without a confirmed reply (the server applied a chunk but the reply was lost). If the recount also fails, `remaining` is `null` with `remaining_unverified: true`. Calling again is safe: each chunk is checked for presence before it is moved, so nothing moves twice.
+- After a failure, `remaining` is recounted on a fresh connection, and `moved_unconfirmed` counts messages that left the source without a confirmed reply (the server applied a chunk but the reply was lost). If the recount also fails, `remaining` is `null` with `remaining_unverified: true`. Calling again is safe: each chunk is checked for presence before it is moved, so nothing moves twice. One exception on servers without `MOVE` (iCloud): if a call fails after the copy landed but before the originals were removed, the retry copies those messages again, leaving duplicates in the destination. Nothing is lost.
 - `already_gone` counts previewed messages that were no longer in the source (for example moved by hand in the meantime).
 - Moving to a Trash mailbox asks the user to confirm first, on the same terms as `delete_messages`.
 

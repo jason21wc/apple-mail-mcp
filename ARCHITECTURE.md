@@ -65,7 +65,8 @@ The fork is deliberately thin. **Two behavioral modifications, both in
 caller carry every message id through its own context; a bulk job of a few
 thousand messages needed hundreds of calls. These two let the server select
 with an IMAP SEARCH, show the result, hold that exact UID set in memory, and
-then move only that set. It is IMAP-only with no AppleScript fallback, refuses
+then move only that set. It uses MOVE or, where the server lacks it (iCloud), the UIDPLUS
+copy-flag-expunge sequence. It is IMAP-only with no AppleScript fallback, refuses
 Gmail, and does not touch `mail_connector.py` (ADR-3). It reuses four private
 helpers from `imap_connector.py` and three from `mail_connector.py` (connector
 construction), which is the sync cost to watch. It is an upstream candidate
