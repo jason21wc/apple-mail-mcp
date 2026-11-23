@@ -10,11 +10,12 @@ An MCP server that provides programmatic access to Apple Mail, enabling AI assis
 
 ## Tools (25)
 
-Grouped by lifecycle (11 read-only, 14 mutating):
+Grouped by lifecycle (12 read-only, 15 mutating):
 
 - **Discovery** — `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`: enumerate what's configured (no external cache — call per account).
 - **Read** — `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `get_attachment_content`, `get_template`, `render_template`: read messages/threads, aggregate inbox stats, pull an attachment's content inline, and render templates.
 - **Message actions** — `update_message` (read/flag/move in one pass), `delete_messages` (→ Trash), `save_attachments` (to disk, byte-capped).
+- **Bulk move by query** — `preview_move_by_query` (read-only: what a filter matches, held as an exact set) and `commit_move_by_query` (moves that set, up to 1,000 per call). IMAP only.
 - **Drafts** — `create_draft` (new / reply / forward, optionally `send_now`), `update_draft`, `delete_draft`.
 - **Mailbox CRUD** — `create_mailbox`, `update_mailbox` (rename or move), `delete_mailbox`.
 - **Rules** — `create_rule`, `update_rule`, `delete_rule`.

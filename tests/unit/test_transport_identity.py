@@ -140,7 +140,8 @@ def test_numeric_disk_save_scopes_metadata_and_save_script(connector, monkeypatc
     imap = Mock()
     monkeypatch.setattr(connector, "_get_attachments_applescript", metadata)
     monkeypatch.setattr(connector, "_imap_save_attachments", imap)
-    connector._run_applescript.return_value = "1"
+    (tmp_path / "report.txt").write_bytes(b"ok")
+    connector._run_applescript.return_value = '{"saved_positions":[0],"failures":[]}'
     assert (
         connector.save_attachments("42", tmp_path, account="Work", mailbox="Archive/Receipts")[
             "saved"
@@ -388,7 +389,7 @@ def test_numeric_and_rfc_payload_paths_return_and_save_identical_bytes(
             assert f'account id "{ACCOUNT_ID}"' in script
             assert 'my resolveMailbox(acc, "Archive/Receipts")' in script
             (native_dir / "report.bin").write_bytes(payload)
-            return "1"
+            return '{"saved_positions":[0],"failures":[]}'
         return config_result
 
     connector._run_applescript.side_effect = run_native
@@ -402,7 +403,8 @@ def test_numeric_and_rfc_payload_paths_return_and_save_identical_bytes(
     rfc_result = connector.save_attachments(
         "fixture@example.com", rfc_dir, account=account, mailbox="Archive/Receipts"
     )
-    assert native_result == rfc_result == {"saved": 1, "rejected": []}
+    assert native_result == rfc_result
+    assert native_result["saved"] == 1 and native_result["rejected"] == []
     assert (
         (native_dir / "report.bin").read_bytes() == (rfc_dir / "report.bin").read_bytes() == payload
     )

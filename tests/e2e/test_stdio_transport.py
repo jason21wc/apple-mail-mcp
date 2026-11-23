@@ -43,6 +43,8 @@ EXPECTED_TOOLS = {
     "delete_draft",
     # Mutations
     "update_message",
+    "preview_move_by_query",
+    "commit_move_by_query",
     "save_attachments",
     "get_attachment_content",
     "create_mailbox",

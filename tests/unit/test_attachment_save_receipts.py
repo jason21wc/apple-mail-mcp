@@ -74,7 +74,11 @@ def test_native_invalid_receipt_is_incomplete_not_saved_zero(tmp_path, malformed
 
 @pytest.mark.parametrize("error_kind", ["account", "mailbox", "message"])
 def test_lookup_failures_before_write_keep_type(tmp_path, error_kind):
-    from apple_mail_fast_mcp.exceptions import MailAccountNotFoundError, MailMailboxNotFoundError, MailMessageNotFoundError
+    from apple_mail_fast_mcp.exceptions import (
+        MailAccountNotFoundError,
+        MailMailboxNotFoundError,
+        MailMessageNotFoundError,
+    )
     error = {"account": MailAccountNotFoundError, "mailbox": MailMailboxNotFoundError, "message": MailMessageNotFoundError}[error_kind]("fixture")
     connector = AppleMailConnector()
     with patch.object(connector, "_get_attachments_applescript", return_value=[{"name": "a.txt"}]), patch.object(
@@ -125,8 +129,9 @@ def test_named_commit_failure_never_reports_staged_saved_as_final(tmp_path, comm
 
 
 def test_named_commit_survives_cleanup_and_audit_failure(tmp_path):
-    from apple_mail_fast_mcp import server
     import tempfile
+
+    from apple_mail_fast_mcp import server
     staging = tempfile.TemporaryDirectory(dir=tmp_path)
     def stage(**kwargs):
         (kwargs["save_directory"] / "source.txt").write_bytes(b"fixture")
@@ -143,3 +148,17 @@ def test_named_commit_survives_cleanup_and_audit_failure(tmp_path):
         assert (tmp_path / "final.txt").read_bytes() == b"fixture"
     finally:
         cleanup()
+
+
+def test_named_staging_inspection_preserves_acknowledgment(tmp_path):
+    from apple_mail_fast_mcp import server
+
+    with patch.object(server.mail, "save_attachments", return_value={"saved": 1}), patch.object(
+        server, "check_rate_limit", return_value=None
+    ), patch.object(Path, "iterdir", side_effect=PermissionError("inaccessible staging directory")):
+        response = server.save_attachments("123", str(tmp_path), [0], "final.txt")
+
+    assert response["error_type"] == "attachment_save_incomplete"
+    assert response["phase"] == "staging_receipt"
+    assert response["acknowledged_writes"] == 1
+    assert response["retry_safe"] is False and "saved" not in response

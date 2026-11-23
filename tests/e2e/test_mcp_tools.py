@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from apple_mail_fast_mcp import server
+from apple_mail_fast_mcp import query_moves, server
 from apple_mail_fast_mcp.exceptions import (
     MailAppleScriptError,
     MailDraftError,
@@ -25,6 +25,7 @@ from apple_mail_fast_mcp.exceptions import (
 )
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
 from apple_mail_fast_mcp.templates import Template, TemplateStore
+from tests.unit.test_query_moves import FakeConnector, _client
 
 pytestmark = pytest.mark.e2e
 
@@ -46,6 +47,9 @@ EXPECTED_TOOLS = {
     "get_attachment_content",
     # Mutations
     "update_message",
+    # Query-driven bulk move (fork-local)
+    "preview_move_by_query",
+    "commit_move_by_query",
     "save_attachments",
     "create_mailbox",
     "update_mailbox",
@@ -109,6 +113,11 @@ class TestToolRegistration:
         "tool_name,expected_required",
         [
             ("update_message", {"message_ids"}),
+            (
+                "preview_move_by_query",
+                {"account", "source_mailbox", "destination_mailbox"},
+            ),
+            ("commit_move_by_query", {"preview_id", "max_count"}),
             ("delete_draft", {"draft_id"}),
         ],
     )
@@ -133,6 +142,9 @@ class TestToolRegistration:
 # per-test fixtures directly.
 _TMP_DIR = "__TMP_DIR__"
 _TMP_FILE = "__TMP_FILE__"
+# Replaced with the id of a preview seeded by the ``query_move_preview_id``
+# fixture: commit_move_by_query only accepts an id the server issued.
+_PREVIEW_ID = "__PREVIEW_ID__"
 
 
 # (tool_name, call_args, connector_method, connector_return_value)
@@ -209,6 +221,25 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str | None, Any]] = [
         1,
     ),
     (
+        "preview_move_by_query",
+        {
+            "account": "TestAccount",
+            "source_mailbox": "News",
+            "destination_mailbox": "Old",
+            "sender_contains": "news@example.com",
+            "sender_not_contains": ["gmail.com"],
+            "date_to": "2026-05-16",
+        },
+        None,
+        None,
+    ),
+    (
+        "commit_move_by_query",
+        {"preview_id": _PREVIEW_ID, "max_count": 10},
+        None,
+        None,
+    ),
+    (
         "save_attachments",
         {"message_id": "msg-1", "save_directory": _TMP_DIR},
         "save_attachments",
@@ -277,6 +308,25 @@ class TestToolInvocation:
             "apple_mail_fast_mcp.server._elicit_confirmation", _accept
         )
 
+    @pytest.fixture
+    def query_move_preview_id(self, monkeypatch: pytest.MonkeyPatch) -> str:
+        """Back the query-move tools with a fake IMAP connector and seed one
+        preview, so both tools dispatch end to end without a network."""
+        connector = FakeConnector(_client([1, 2]))
+        store = query_moves.PreviewStore()
+        monkeypatch.setattr(server, "_query_move_store", store)
+        monkeypatch.setattr(
+            query_moves, "connector_for", lambda _mail, _account: connector
+        )
+        return store.put(
+            account="TestAccount",
+            source_mailbox="News",
+            destination_mailbox="Old",
+            uidvalidity=7,
+            uids=[1, 2],
+            selector={"sender_contains": "news@example.com"},
+        )
+
     @pytest.mark.parametrize(
         "tool_name,call_args,connector_method,connector_return",
         INVOCATION_CASES,
@@ -290,6 +340,7 @@ class TestToolInvocation:
         call_args: dict[str, Any],
         connector_method: str | None,
         connector_return: Any,
+        query_move_preview_id: str,
     ) -> None:
         # Materialize tmp_path-dependent sentinels. save_attachments requires
         # the directory to exist; send_email_with_attachments requires each
@@ -299,6 +350,8 @@ class TestToolInvocation:
         for key, value in call_args.items():
             if value == _TMP_DIR:
                 resolved_args[key] = str(tmp_path)
+            elif value == _PREVIEW_ID:
+                resolved_args[key] = query_move_preview_id
             elif isinstance(value, list) and _TMP_FILE in value:
                 tmp_file.write_text("dummy")
                 resolved_args[key] = [
@@ -331,6 +384,13 @@ class TestToolInvocation:
         elif tool_name == "update_draft":
             assert result.structured_content["draft_id"] == "new-1"
             mock_mail.delete_draft.assert_called_once_with("old-1")
+        elif tool_name == "preview_move_by_query":
+            assert result.structured_content["matched"] == 2
+            assert result.structured_content["preview_id"]
+            assert result.structured_content["content_is_untrusted"] is True
+        elif tool_name == "commit_move_by_query":
+            assert result.structured_content["moved"] == 2
+            assert result.structured_content["outcome"] == "complete"
         elif tool_name == "list_templates":
             assert result.structured_content["templates"] == [
                 {"name": "smoke", "subject": "Hello {person}"}]

@@ -3,6 +3,7 @@ import json
 from unittest.mock import Mock, patch
 
 import pytest
+
 from apple_mail_fast_mcp.attachment_saves import (
     MailAttachmentSaveIncompleteError,
     SaveFailure,
@@ -13,7 +14,6 @@ from apple_mail_fast_mcp.attachment_saves import (
     save_response,
     write_payloads,
 )
-
 from apple_mail_fast_mcp.mail_connector import _prune_oversized_written
 
 

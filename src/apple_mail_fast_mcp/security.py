@@ -133,6 +133,9 @@ OPERATION_TIERS: dict[str, str] = {
     # get_statistics (#378) composes one search_messages pass — same tier.
     "get_statistics": "expensive_ops",
     "update_message": "expensive_ops",
+    # Query-driven bulk move (fork-local): one IMAP SEARCH / bounded MOVE each.
+    "preview_move_by_query": "expensive_ops",
+    "commit_move_by_query": "expensive_ops",
     "create_mailbox": "expensive_ops",
     "update_mailbox": "expensive_ops",
     "delete_mailbox": "expensive_ops",
@@ -412,6 +415,8 @@ ACCOUNT_GATED_OPERATIONS = {
     "update_mailbox",
     "delete_mailbox",
     "get_statistics",
+    "preview_move_by_query",
+    "commit_move_by_query",
 }
 
 SEND_OPERATIONS = {

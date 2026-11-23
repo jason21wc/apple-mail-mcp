@@ -59,6 +59,19 @@ The fork is deliberately thin. **Two behavioral modifications, both in
    single-source `_mark_untrusted()` helper on every content-returning tool
    (`get_messages`, `get_attachment_content`, `search_messages`, `get_thread`).
 
+**One fork-local capability, in its own module (added 2026-11-22):**
+`query_moves.py` plus two tool registrations in `server.py`,
+`preview_move_by_query` and `commit_move_by_query`. The ID-list tools make the
+caller carry every message id through its own context; a bulk job of a few
+thousand messages needed hundreds of calls. These two let the server select
+with an IMAP SEARCH, show the result, hold that exact UID set in memory, and
+then move only that set. It is IMAP-only with no AppleScript fallback, refuses
+Gmail, and does not touch `mail_connector.py` (ADR-3). It reuses four private
+helpers from `imap_connector.py` and three from `mail_connector.py` (connector
+construction), which is the sync cost to watch. It is an upstream candidate
+(it answers upstream #442); until it is proposed there it is the fork's third
+divergence.
+
 Everything else the fork once carried has converged into upstream and been
 dropped. Fork infrastructure that is not a behavior change: governance
 integration, the attachment-retrieval skill, and

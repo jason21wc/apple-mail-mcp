@@ -25,8 +25,11 @@ from typing import Any, ParamSpec, TypeVar, cast
 from imapclient.exceptions import IMAPClientError, LoginError
 
 from .attachment_saves import (
-    MailAttachmentSaveIncompleteError, SaveReceipt, completed_save_result,
-    parse_save_receipt, write_payloads,
+    MailAttachmentSaveIncompleteError,
+    SaveReceipt,
+    completed_save_result,
+    parse_save_receipt,
+    write_payloads,
 )
 from .draft_builder import (
     build_draft_mime,
