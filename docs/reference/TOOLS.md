@@ -19,8 +19,8 @@ Every tool ships with the per-tool annotations the MCP 2025-03 spec defines so h
 
 **Classification:**
 
-- **Read-only:** `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
-- **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`, `save_template`. All have `destructiveHint=true`, `idempotentHint=true`. `save_attachments` and `save_template` are here because `overwrite=true` can replace state the caller did not create — the annotation describes capability, not the default path, which refuses to clobber.
+- **Read-only:** `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `preview_move_by_query`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
+- **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`, `save_template`, `commit_move_by_query`. All have `destructiveHint=true`, and `idempotentHint=true` except `commit_move_by_query` (each call moves the next slice of a preview). `save_attachments` and `save_template` are here because `overwrite=true` can replace state the caller did not create — the annotation describes capability, not the default path, which refuses to clobber.
 - **Mutating additive:** `create_mailbox`, `create_draft`, `create_rule`. All have `destructiveHint=false`. Idempotent except `create_draft` and `create_rule` (each call may create a new entity).
 
 Counts are deliberately omitted — they are derivable and go stale. `make eval-descriptions` regenerates the authoritative list.
@@ -521,6 +521,98 @@ update_message(
 - `not_found`: `destination_mailbox` not found on the account
 - `imap_required`: A move could not be confirmed via AppleScript (the Gmail silent-no-op) and the account has no IMAP configured (#364). Run `apple-mail-fast-mcp setup-imap --account <name>` and pass `source_mailbox`.
 - `unknown`: Unexpected error occurred
+
+---
+
+### preview_move_by_query
+
+**Fork-local.** Preview a bulk move chosen by filters instead of message ids. Read-only: nothing changes.
+
+Use this pair for large moves (hundreds or thousands of messages). The server runs the IMAP search itself, reports what it found, and holds that exact set of messages under `preview_id` for 15 minutes. `commit_move_by_query` then moves that set. For a handful of known messages, use `update_message`.
+
+**Parameters:**
+- `account` (string, required): Mail.app account name or UUID
+- `source_mailbox` (string, required): Mailbox to move messages out of
+- `destination_mailbox` (string, required): Mailbox to move them into. Must exist and differ from the source
+- `sender_contains` (string, optional): Only messages whose sender contains this text
+- `sender_not_contains` (list of strings, optional): Exclude messages whose sender contains any of these
+- `subject_contains` (string, optional): Only messages whose subject contains this text
+- `date_from` / `date_to` (string, optional): Inclusive bounds, `YYYY-MM-DD`
+- `read_status` (boolean, optional): Only read (`true`) or unread (`false`)
+- `is_flagged` (boolean, optional): Only flagged (`true`) or unflagged (`false`)
+
+At least one of `sender_contains`, `subject_contains`, `date_from`, `date_to`, `read_status` or `is_flagged` is required. A blank string or blank list entry is an error, not "no filter", so a selector is never silently widened. Exclusions alone are not enough. A broad but valid filter (a date alone, for example) is still allowed: read `matched` and `senders` before committing.
+
+**Returns:**
+```json
+{
+  "success": true,
+  "matched": 2486,
+  "preview_id": "kq3...",
+  "oldest_date": "2023-02-01",
+  "newest_date": "2026-05-16",
+  "header_dates_outside_window": 0,
+  "distinct_senders": 1,
+  "senders": [{"address": "news@example.com", "count": 2486}],
+  "other_senders_count": 0,
+  "expires_in_seconds": 900,
+  "max_per_commit_call": 1000,
+  "content_is_untrusted": true,
+  "security_notice": "..."
+}
+```
+
+- `senders` lists up to 50 senders with counts; the rest are summed in `other_senders_count`. Sender strings come from email and are marked untrusted.
+- Date filters use the server's received date. `oldest_date` / `newest_date` are header dates, and `header_dates_outside_window` counts messages where the two disagree with the requested window.
+- `preview_id` is `null` when nothing matched, or when the set is above the server limit (default 5,000, override with `APPLE_MAIL_MCP_MAX_QUERY_MOVE`); in that case `over_limit` is `true` and no sender summary is fetched. Narrow the filters, for example by date.
+
+**Limits:** IMAP only, with no AppleScript fallback. Refused for Gmail accounts (folders are labels) and for servers that do not advertise `MOVE`.
+
+**Error Types:**
+- `validation_error`: Open or blank selector, bad date, same source and destination, control characters
+- `imap_required`: No IMAP credentials for the account. Run `apple-mail-fast-mcp setup-imap --account <name>`
+- `unsupported_account`: Gmail account, or the server did not report UIDVALIDITY for the source mailbox
+- `imap_move_unsupported`: Server does not advertise `MOVE`
+- `account_not_found` / `not_found`: Account or destination mailbox does not exist
+- `imap_error`: IMAP protocol or network failure
+
+---
+
+### commit_move_by_query
+
+**Fork-local.** Move the messages held by a `preview_move_by_query` result.
+
+Moves exactly the previewed messages. Mail that arrives after the preview is never included, even if it matches the filters. Each call moves at most 1,000 messages; repeat with the same `preview_id` while `outcome` is `"more"`.
+
+**Parameters:**
+- `preview_id` (string, required): From `preview_move_by_query`
+- `max_count` (integer, required): The most messages the whole move may involve. If the previewed set is larger, nothing moves. Set it from what the user approved, not from the preview's own count
+
+**Returns:**
+```json
+{
+  "success": true,
+  "moved": 1000,
+  "already_gone": 0,
+  "remaining": 1486,
+  "total": 2486,
+  "outcome": "more"
+}
+```
+
+- `outcome`: `"complete"` (everything previewed has been handled), `"more"` (call again), or `"failed"` (IMAP failed part-way; `success` is `false`, `error` says why).
+- After a failure, `remaining` is recounted on a fresh connection, and `moved_unconfirmed` counts messages that left the source without a confirmed reply (the server applied a chunk but the reply was lost). If the recount also fails, `remaining` is `null` with `remaining_unverified: true`. Calling again is safe: each chunk is checked for presence before it is moved, so nothing moves twice.
+- `already_gone` counts previewed messages that were no longer in the source (for example moved by hand in the meantime).
+- Moving to a Trash mailbox asks the user to confirm first, on the same terms as `delete_messages`.
+
+**Receipts:** every call that moves mail or fails appends one JSON line to `~/.apple_mail_mcp/query_move_receipts.jsonl` (or under `APPLE_MAIL_MCP_HOME`): time, account, source, destination, the filters, the source UIDs moved, the source UIDs moved without confirmation, and the outcome. No subjects, senders or bodies. The receipt does not record where messages landed in the destination; to undo, preview the same filters from the destination back to the source.
+
+**Error Types:**
+- `preview_not_found`: Unknown, completed, or expired `preview_id`, or the server restarted
+- `max_count_exceeded`: The previewed set is larger than `max_count`
+- `selection_stale`: The source mailbox was rebuilt since the preview (UIDVALIDITY changed). Preview again
+- `confirmation_required` / `cancelled`: Trash destination not confirmed
+- `imap_required`, `unsupported_account`, `imap_move_unsupported`, `imap_error`: as for the preview
 
 ---
 

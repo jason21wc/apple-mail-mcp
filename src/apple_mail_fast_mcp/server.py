@@ -16,6 +16,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.server.elicitation import AcceptedElicitation
 from pydantic import BeforeValidator
 
+from . import query_moves
 from .drafts import DraftStateStore, SeedRecord
 from .exceptions import (
     MailAccountNotFoundError,
@@ -27,7 +28,9 @@ from .exceptions import (
     MailDraftHtmlUnavailableError,
     MailDraftInvalidIdError,
     MailDraftNotFoundError,
+    MailImapMoveUnsupportedError,
     MailImapRequiredError,
+    MailKeychainError,
     MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
@@ -1703,6 +1706,279 @@ async def update_message(
             "error": str(e),
             "error_type": "unknown",
         }
+
+
+# ---------------------------------------------------------------------------
+# Query-driven bulk move (fork-local; see query_moves.py)
+# ---------------------------------------------------------------------------
+
+_query_move_store = query_moves.PreviewStore()
+
+
+def _query_move_ceiling() -> int:
+    """Largest set a preview will hold, honoring APPLE_MAIL_MCP_MAX_QUERY_MOVE."""
+    raw = os.getenv("APPLE_MAIL_MCP_MAX_QUERY_MOVE")
+    if raw is None:
+        return query_moves.DEFAULT_CEILING
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring non-integer APPLE_MAIL_MCP_MAX_QUERY_MOVE=%r", raw)
+        return query_moves.DEFAULT_CEILING
+    return value if value > 0 else query_moves.DEFAULT_CEILING
+
+
+def _query_move_receipts_path() -> Path:
+    """Receipt log location, resolved at call time (APPLE_MAIL_MCP_HOME)."""
+    home_override = os.environ.get("APPLE_MAIL_MCP_HOME")
+    base = Path(home_override) if home_override else Path.home() / ".apple_mail_mcp"
+    return base / "query_move_receipts.jsonl"
+
+
+_QUERY_MOVE_ERROR_TYPES: tuple[tuple[type[Exception], str], ...] = (
+    (query_moves.PreviewNotFoundError, "preview_not_found"),
+    (query_moves.PreviewTooLargeError, "max_count_exceeded"),
+    (query_moves.SelectionStaleError, "selection_stale"),
+    (query_moves.QueryMoveUnsupportedError, "unsupported_account"),
+    (MailImapMoveUnsupportedError, "imap_move_unsupported"),
+    (MailKeychainError, "imap_required"),
+    (MailImapRequiredError, "imap_required"),
+    (MailAccountNotFoundError, "account_not_found"),
+    (MailMailboxNotFoundError, "not_found"),
+    (ValueError, "validation_error"),
+)
+
+
+def _query_move_error(operation: str, exc: Exception) -> dict[str, Any]:
+    """Map a query-move failure to the structured error shape.
+
+    Anything not listed (an IMAP protocol or network error) is reported as
+    ``imap_error``: there is no AppleScript fallback for these tools, so the
+    caller must see that IMAP itself failed.
+    """
+    error_type = next(
+        (name for cls, name in _QUERY_MOVE_ERROR_TYPES if isinstance(exc, cls)),
+        "imap_error",
+    )
+    logger.error("%s failed (%s): %s", operation, error_type, exc)
+    return {"success": False, "error": str(exc), "error_type": error_type}
+
+
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
+)
+def preview_move_by_query(
+    account: str,
+    source_mailbox: str,
+    destination_mailbox: str,
+    sender_contains: str | None = None,
+    sender_not_contains: StrList | None = None,
+    subject_contains: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    read_status: bool | None = None,
+    is_flagged: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Preview a bulk move chosen by filters instead of message ids. Changes nothing.
+
+    Use this with ``commit_move_by_query`` for large moves (hundreds or
+    thousands of messages). The server finds the matching messages itself,
+    reports what it found, and holds that exact set under ``preview_id``.
+    For a handful of known messages, use ``update_message`` instead.
+
+    Read the result before committing: ``matched``, the date range, and the
+    sender list are the only view of what will move. If the senders or the
+    count are not what was intended, tighten the filters and preview again.
+
+    IMAP only. Not available for Gmail accounts or servers without MOVE.
+
+    Args:
+        account: Mail.app account name or UUID.
+        source_mailbox: Mailbox to move messages out of.
+        destination_mailbox: Mailbox to move them into (must exist and differ).
+        sender_contains: Only messages whose sender contains this text.
+        sender_not_contains: Exclude messages whose sender contains any of
+            these (for example ``["gmail.com", "me.com"]``).
+        subject_contains: Only messages whose subject contains this text.
+        date_from: Inclusive lower bound, YYYY-MM-DD.
+        date_to: Inclusive upper bound, YYYY-MM-DD.
+        read_status: Only read (true) or unread (false) messages.
+        is_flagged: Only flagged (true) or unflagged (false) messages.
+
+        At least one of sender_contains, subject_contains, date_from, date_to,
+        read_status or is_flagged is required. A blank value is an error, not
+        "no filter".
+
+    Returns:
+        ``matched`` (count); ``preview_id`` (null when nothing matched or the
+        set is above the server limit, in which case ``over_limit`` is true);
+        ``oldest_date`` / ``newest_date`` (header dates);
+        ``header_dates_outside_window`` (date filters use the server's
+        received date, so a few header dates can fall outside the window);
+        ``distinct_senders``; ``senders`` (up to 50, with counts);
+        ``other_senders_count``; ``expires_in_seconds``;
+        ``max_per_commit_call``.
+
+    Example:
+        >>> preview_move_by_query(
+        ...     "iCloud", "Newsletters", "_To Delete",
+        ...     sender_contains="news@example.com", date_to="2026-05-16",
+        ... )
+        {"success": True, "matched": 2486, "preview_id": "...", ...}
+    """
+    operation = "preview_move_by_query"
+    try:
+        safety_err = check_test_mode_safety(
+            "preview_move_by_query", account=account
+        )
+        if safety_err:
+            return safety_err
+        rate_err = check_rate_limit(operation, {"account": account})
+        if rate_err:
+            return rate_err
+
+        selector = query_moves.Selector(
+            sender_contains=sender_contains,
+            sender_not_contains=tuple(sender_not_contains or ()),
+            subject_contains=subject_contains,
+            date_from=date_from,
+            date_to=date_to,
+            read_status=read_status,
+            is_flagged=is_flagged,
+        )
+        result = query_moves.preview(
+            query_moves.connector_for(mail, account),
+            _query_move_store,
+            account=account,
+            source_mailbox=source_mailbox,
+            destination_mailbox=destination_mailbox,
+            selector=selector,
+            ceiling=_query_move_ceiling(),
+        )
+        operation_logger.log_operation(
+            operation,
+            {
+                "account": account,
+                "source_mailbox": source_mailbox,
+                "destination_mailbox": destination_mailbox,
+                "matched": result["matched"],
+            },
+            "success",
+        )
+        return _mark_untrusted(
+            {"success": True, **result}, has_content=bool(result.get("senders"))
+        )
+    except Exception as e:
+        return _query_move_error(operation, e)
+
+
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": False},
+    mutating=True,
+)
+async def commit_move_by_query(
+    preview_id: str,
+    max_count: int,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """
+    Move the messages held by a ``preview_move_by_query`` result.
+
+    Moves exactly the previewed messages. Mail that arrived after the preview
+    is never included. Each call moves at most 1,000 messages; when
+    ``outcome`` is ``"more"``, call again with the same ``preview_id`` until
+    it is ``"complete"``.
+
+    Args:
+        preview_id: From ``preview_move_by_query``. Valid for 15 minutes.
+        max_count: The most messages this whole move may involve. If the
+            previewed set is larger, nothing moves. Set it from what the user
+            approved, not from the preview's own count.
+
+    Returns:
+        ``moved`` (this call); ``already_gone`` (previewed messages no longer
+        in the source); ``remaining``; ``total``; ``outcome``:
+
+        - ``"complete"``: everything previewed has been handled.
+        - ``"more"``: call again with the same ``preview_id``.
+        - ``"failed"``: IMAP failed part-way. ``error`` says why and
+          ``remaining`` was recounted on a fresh connection (null with
+          ``remaining_unverified`` when even that failed).
+          ``moved_unconfirmed`` counts messages that left the source without
+          a confirmed reply. Calling again is safe: nothing is moved twice.
+
+    Moving to a Trash mailbox asks the user to confirm first, on the same
+    terms as ``delete_messages``.
+    """
+    operation = "commit_move_by_query"
+    try:
+        entry = _query_move_store.get(preview_id)
+
+        safety_err = check_test_mode_safety(
+            "commit_move_by_query", account=entry.account
+        )
+        if safety_err:
+            return safety_err
+        rate_err = check_rate_limit(operation, {"account": entry.account})
+        if rate_err:
+            return rate_err
+
+        if entry.total > max_count:
+            # Checked here as well as in commit() so the user is never asked
+            # to confirm a move that is then refused.
+            raise query_moves.PreviewTooLargeError(
+                f"the preview holds {entry.total} messages, above "
+                f"max_count={max_count}; nothing was moved"
+            )
+
+        if _is_trash_destination(entry.destination_mailbox):
+            this_call = min(len(entry.remaining), query_moves.MAX_PER_CALL)
+            summary = (
+                f"Move {this_call} of {len(entry.remaining)} remaining "
+                f"message(s) from "
+                f"{entry.account}/{entry.source_mailbox} to "
+                f"{entry.destination_mailbox}?\n\n"
+                f"This is the same outcome as deleting them. Recoverable from "
+                f"that mailbox until it is emptied."
+            )
+            cancel_err = await _elicit_confirmation(
+                ctx,
+                summary,
+                operation,
+                {
+                    "count": len(entry.remaining),
+                    "account": entry.account,
+                    "destination_mailbox": entry.destination_mailbox,
+                },
+            )
+            if cancel_err:
+                return cancel_err
+
+        result = query_moves.commit(
+            query_moves.connector_for(mail, entry.account),
+            _query_move_store,
+            preview_id=preview_id,
+            max_count=max_count,
+            receipts_path=_query_move_receipts_path(),
+        )
+        operation_logger.log_operation(
+            operation,
+            {
+                "account": entry.account,
+                "source_mailbox": entry.source_mailbox,
+                "destination_mailbox": entry.destination_mailbox,
+                "moved": result["moved"],
+                "remaining": result["remaining"],
+                "outcome": result["outcome"],
+            },
+            "success" if result["outcome"] != "failed" else "failure",
+        )
+        if result["outcome"] == "failed":
+            return {"success": False, "error_type": "imap_error", **result}
+        return {"success": True, **result}
+    except Exception as e:
+        return _query_move_error(operation, e)
 
 
 @_tool(
