@@ -55,6 +55,10 @@ until it is ``"complete"``. Expect many calls for a large set. If a call
 errors or times out, do not assume nothing moved: preview again and
 compare counts before continuing.
 
+When a result carries ``server_slow``, the mail server has stopped
+keeping up. Wait ``retry_after_seconds`` before the next call; calling
+sooner moves nothing. Tell the user if it keeps happening.
+
 **Parameters:**
 
 - `preview_id` (string, required): From ``preview_move_by_query``. Valid for 15 minutes.

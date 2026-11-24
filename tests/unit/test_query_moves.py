@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -27,10 +27,14 @@ from apple_mail_fast_mcp.exceptions import (
 )
 
 
-def _envelope(sender: str, when: datetime | None) -> Envelope:
+def _envelope(
+    sender: str, when: datetime | None, message_id: bytes = b"<id@x>"
+) -> Envelope:
     mailbox, host = sender.split("@")
     addr = Address(None, None, mailbox.encode(), host.encode())
-    return Envelope(when, b"subj", (addr,), (addr,), (addr,), None, None, None, None, b"<id@x>")
+    return Envelope(
+        when, b"subj", (addr,), (addr,), (addr,), None, None, None, None, message_id
+    )
 
 
 UIDPLUS_ONLY = (b"IMAP4REV1", b"UIDPLUS")
@@ -74,6 +78,9 @@ def _client(
 
     client._deleted = []
     client._dest = set()  # UIDs of copies in the destination mailbox
+    client._dest_origin = {}  # destination UID -> the source UID it copies
+    client._dest_deleted = set()  # copies flagged \\Deleted in the destination
+    client._mids = {}  # source UID -> Message-ID, where a test sets one
     client._dest_name = None
     client._next_dest_uid = 1000
     # imaplib files response codes here; imapclient's copy() does not return
@@ -84,11 +91,22 @@ def _client(
         call = client.select_folder.call_args
         return call.args[0] if call else None
 
+    def in_destination() -> bool:
+        return client._dest_name is not None and selected_mailbox() == client._dest_name
+
+    def message_id(uid: int) -> bytes:
+        return client._mids.get(uid, b"<m%d@x>" % uid)
+
     def search(criteria: list[Any], charset: str | None = None) -> list[int]:
         if criteria and criteria[0] == "UID":
-            asked = {int(u) for u in str(criteria[1]).split(",")}
-            in_dest = client._dest_name is not None and selected_mailbox() == client._dest_name
-            return sorted(asked & (client._dest if in_dest else present))
+            pool = client._dest if in_destination() else present
+            if in_destination() and "UNDELETED" in criteria:
+                pool = pool - client._dest_deleted
+            token = str(criteria[1])
+            if ":" in token:
+                low, high = (int(part) for part in token.split(":"))
+                return sorted(u for u in pool if low <= u <= high)
+            return sorted({int(u) for u in token.split(",")} & pool)
         if criteria[-1] == "DELETED":
             return [u for u in client._matches if u in client._deleted and u in present]
         if criteria[-1] == "UNDELETED":
@@ -100,6 +118,7 @@ def _client(
         new = list(range(client._next_dest_uid, client._next_dest_uid + len(chunk)))
         client._next_dest_uid += len(chunk)
         client._dest.update(new)
+        client._dest_origin.update(dict(zip(new, chunk, strict=True)))
         src = ",".join(str(u) for u in chunk).encode()
         dst = ",".join(str(u) for u in new).encode()
         client._imap.untagged_responses["COPYUID"] = [
@@ -117,13 +136,27 @@ def _client(
 
     def fetch(chunk: list[int], parts: list[str]) -> dict[int, dict[bytes, Any]]:
         out: dict[int, dict[bytes, Any]] = {}
+        when = datetime(2026, 3, 1, 9, 0)
+        if in_destination():
+            for uid in chunk:
+                if uid in client._dest:
+                    origin = client._dest_origin.get(uid, uid)
+                    out[uid] = {
+                        b"ENVELOPE": _envelope(
+                            "news@example.com", when, message_id(origin)
+                        )
+                    }
+            return out
         for uid in chunk:
             if uid not in present:
                 continue
             if "ENVELOPE" in parts:
                 sender = (senders or {}).get(uid, "news@example.com")
-                when = (dates or {}).get(uid, datetime(2026, 3, 1, 9, 0))
-                out[uid] = {b"ENVELOPE": _envelope(sender, when)}
+                out[uid] = {
+                    b"ENVELOPE": _envelope(
+                        sender, (dates or {}).get(uid, when), message_id(uid)
+                    )
+                }
         return out
 
     def move(chunk: list[int], dest: str) -> None:
@@ -320,6 +353,10 @@ class TestPreview:
             b"FROM", b"a@x.com",
         ]
         assert _normalise_search_criteria(["UID", "1,2,3"]) == [b"UID", b"1,2,3"]
+        # The lost-copy search: a UID range must not be quoted either.
+        assert _normalise_search_criteria(["UID", "1000:4294967295", "UNDELETED"]) == [
+            b"UID", b"1000:4294967295", b"UNDELETED",
+        ]
 
     def test_mailbox_control_characters_rejected(self) -> None:
         with pytest.raises(ValueError, match="control character"):
@@ -420,7 +457,7 @@ class TestCommit:
 
         assert out == {
             "moved": 3, "already_gone": 0, "remaining": 0, "total": 3,
-            "outcome": "complete",
+            "outcome": "complete", "slowest_chunk_seconds": 0.0,
         }
         client.select_folder.assert_called_once_with("News", readonly=False)
         client.move.assert_called_once_with([1, 2, 3], "_To Delete")
@@ -608,17 +645,376 @@ class TestCommit:
         mid-move (observed live 2026-11-23). Bound it by elapsed time."""
         monkeypatch.setattr(qm, "MOVE_CHUNK", 2)
         conn, store, pid, client = self._ready([1, 2, 3, 4, 5, 6])
-        # start, then one reading before the second and third chunk
-        ticks = iter([0.0, 15.0, 30.0])
+        now = [0.0]
+        real_move = client.move.side_effect
 
+        def slow_move(chunk: list[int], dest: str) -> None:
+            now[0] += 12.0  # two chunks fit in the budget, a third does not
+            real_move(chunk, dest)
+
+        client.move.side_effect = slow_move
         out = qm.commit(
             conn, store, preview_id=pid, max_count=10,
-            time_budget=20.0, clock=lambda: next(ticks),
+            time_budget=20.0, clock=lambda: now[0],
         )
 
         assert (out["moved"], out["remaining"], out["outcome"]) == (4, 2, "more")
         again = qm.commit(conn, store, preview_id=pid, max_count=10)
         assert (again["moved"], again["outcome"]) == (2, "complete")
+
+    # ---- a slowed server (observed live 2026-11-23, late) ----------------
+
+    def _slow_ready(
+        self, uids: list[int], **client_kw: Any
+    ) -> tuple[FakeConnector, qm.PreviewStore, str, MagicMock, Any]:
+        """A UIDPLUS server that reports where its destination UIDs stand,
+        as a real one does. Returns the working copy() as well."""
+        conn, store, pid, client = self._ready(
+            uids, capabilities=UIDPLUS_ONLY, **client_kw
+        )
+        client._dest_name = "_To Delete"
+        client.folder_status.side_effect = lambda name, what: {
+            b"UIDVALIDITY": 7, b"UIDNEXT": client._next_dest_uid,
+        }
+        return conn, store, pid, client, client.copy.side_effect
+
+    @staticmethod
+    def _after_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+        later = qm._utcnow() + timedelta(seconds=qm.COPY_GRACE_SECONDS + 5)
+        monkeypatch.setattr(qm, "_utcnow", lambda: later)
+
+    @staticmethod
+    def _lose_reply(client: MagicMock, real_copy: Any, *, landed: bool) -> None:
+        def copy(chunk: list[int], dest: str) -> Any:
+            if landed:
+                real_copy(chunk, dest)
+            raise TimeoutError("timed out")
+
+        client.copy.side_effect = copy
+
+    def test_lost_copy_reply_is_found_and_the_move_finished(
+        self, tmp_path: Path
+    ) -> None:
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2, 3])
+        self._lose_reply(client, real_copy, landed=True)
+
+        first = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert (first["outcome"], first["moved"]) == ("failed", 0)
+        assert first["server_slow"] is True
+        assert first["retry_after_seconds"] == int(qm.COPY_GRACE_SECONDS)
+        assert json.loads(journal.read_text())[0]["dest_uidnext"] == 1000
+        assert client._present == {1, 2, 3}
+
+        client.copy.side_effect = real_copy
+        client.copy.reset_mock()
+        second = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+
+        client.copy.assert_not_called()  # found, so not copied a second time
+        assert second["resumed"] == 3
+        assert second["outcome"] == "complete"
+        assert "held_back_uncertain" not in second
+        assert client._present == set()
+        assert json.loads(journal.read_text()) == []
+
+    def test_lost_copy_that_never_landed_waits_then_is_moved_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2, 3])
+        self._lose_reply(client, real_copy, landed=False)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+
+        client.copy.side_effect = real_copy
+        client.copy.reset_mock()
+        soon = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        # Inside the grace period the copy may still land: nothing is started.
+        client.copy.assert_not_called()
+        assert (soon["moved"], soon["outcome"], soon["remaining"]) == (0, "more", 3)
+        assert soon["awaiting_copy_check"] == 3
+        assert soon["server_slow"] is True
+
+        self._after_grace(monkeypatch)
+        done = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+
+        client.copy.assert_called_once()
+        assert (done["moved"], done["outcome"]) == (3, "complete")
+        assert "server_slow" not in done
+        assert client._present == set()
+        assert json.loads(journal.read_text()) == []
+
+    def test_lost_copy_found_only_in_part_keeps_every_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2, 3])
+        self._lose_reply(client, real_copy, landed=True)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        client._dest_deleted.add(1001)  # one copy flagged deleted: not proof
+
+        client.copy.side_effect = real_copy
+        client.copy.reset_mock()
+        soon = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert soon["awaiting_copy_check"] == 3
+
+        self._after_grace(monkeypatch)
+        out = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+
+        assert out["held_back_uncertain"] == 3
+        assert client._present == {1, 2, 3}
+        client.copy.assert_not_called()
+        client.uid_expunge.assert_not_called()
+        # Its window is closed now, so nothing copied later can fall in it.
+        assert json.loads(journal.read_text())[0]["dest_uidceil"] == 1003
+
+    def test_an_earlier_twin_is_not_mistaken_for_the_lost_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two messages share a Message-ID (duplicates do). The first moved
+        normally; the second's COPY never landed. The first one's copy must
+        not be taken as proof for the second."""
+        monkeypatch.setattr(qm, "MOVE_CHUNK", 1)
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2])
+        client._mids = {1: b"<same@x>", 2: b"<same@x>"}
+
+        def copy(chunk: list[int], dest: str) -> Any:
+            if chunk == [2]:
+                raise TimeoutError("timed out")
+            return real_copy(chunk, dest)
+
+        client.copy.side_effect = copy
+        first = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert (first["moved"], first["outcome"]) == (1, "failed")
+
+        soon = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert "resumed" not in soon
+        assert soon["awaiting_copy_check"] == 1
+        assert client._present == {2}
+
+        self._after_grace(monkeypatch)
+        client.copy.side_effect = real_copy
+        client.copy.reset_mock()
+        done = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        client.copy.assert_called_once_with([2], "_To Delete")  # its own copy
+        assert (done["moved"], done["outcome"]) == (1, "complete")
+        assert "resumed" not in done
+
+    def test_twins_in_one_chunk_each_need_their_own_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2])
+        client._mids = {1: b"<same@x>", 2: b"<same@x>"}
+        self._lose_reply(client, real_copy, landed=True)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        client._dest_deleted.add(1000)  # one of the two identical copies
+
+        client.copy.side_effect = real_copy
+        self._after_grace(monkeypatch)
+        out = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert out["held_back_uncertain"] == 2
+        assert client._present == {1, 2}
+
+    def test_original_without_a_message_id_is_held(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2])
+        client._mids = {2: b""}
+        self._lose_reply(client, real_copy, landed=True)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+
+        client.copy.side_effect = real_copy
+        self._after_grace(monkeypatch)
+        out = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert out["held_back_uncertain"] == 2
+        assert client._present == {1, 2}
+
+    def test_a_held_chunk_cannot_be_proved_by_copies_made_later(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review finding: uid 2's copy is missing, so [1, 2] is held. A
+        later chunk then copies uid 3, a twin of 2. That copy must not
+        complete the held chunk."""
+        monkeypatch.setattr(qm, "MOVE_CHUNK", 2)
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2, 3])
+        client._mids = {2: b"<twin@x>", 3: b"<twin@x>"}
+        self._lose_reply(client, real_copy, landed=True)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        client._dest_deleted.add(1001)  # the copy of uid 2
+
+        client.copy.side_effect = real_copy
+        self._after_grace(monkeypatch)
+        second = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert (second["held_back_uncertain"], second["moved"]) == (2, 1)
+        assert client._present == {1, 2}  # uid 3 moved, the held pair did not
+
+        # The held pair's window was closed before uid 3 was copied.
+        fresh = qm.PreviewStore()
+        again = _preview(conn, fresh, journal_path=journal)
+        out = qm.commit(
+            conn, fresh, preview_id=again["preview_id"], max_count=10,
+            journal_path=journal,
+        )
+        assert "resumed" not in out
+        assert client._present == {1, 2}
+
+    def test_another_source_cannot_copy_into_an_open_window(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review finding: the window belongs to the destination. While an
+        INBOX chunk's lost copy is unaccounted for, a move from another
+        mailbox into the same destination waits, then closes that window
+        before copying."""
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2])
+        self._lose_reply(client, real_copy, landed=False)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        client.copy.side_effect = real_copy
+        client.copy.reset_mock()
+
+        other = _preview(conn, store, source_mailbox="Archive", journal_path=journal)
+        soon = qm.commit(
+            conn, store, preview_id=other["preview_id"], max_count=10,
+            journal_path=journal,
+        )
+        client.copy.assert_not_called()
+        assert (soon["moved"], soon["outcome"]) == (0, "more")
+        assert soon["awaiting_copy_check"] == 2
+
+        self._after_grace(monkeypatch)
+        done = qm.commit(
+            conn, store, preview_id=other["preview_id"], max_count=10,
+            journal_path=journal,
+        )
+        assert done["moved"] == 2
+        record = json.loads(journal.read_text())[0]
+        assert (record["source_mailbox"], record["dest_uidceil"]) == ("News", 1000)
+
+    def test_two_commits_into_one_destination_do_not_overlap(
+        self, tmp_path: Path
+    ) -> None:
+        """Review finding: commits from two sources running at once could
+        each land copies inside the other's lost-copy window."""
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, _ = self._slow_ready([1, 2])
+        other = _preview(conn, store, source_mailbox="Archive", journal_path=journal)
+        started: list[dict[str, Any]] = []
+
+        def copy_while_another_commit_tries(chunk: list[int], dest: str) -> Any:
+            with pytest.raises(qm.CommitInProgressError):
+                qm.commit(
+                    conn, store, preview_id=other["preview_id"], max_count=10,
+                    journal_path=journal,
+                )
+            started.append({"chunk": chunk})
+            raise IMAPClientError("refused")
+
+        client.copy.side_effect = copy_while_another_commit_tries
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert started == [{"chunk": [1, 2]}]
+        # Released afterwards: the other commit can run now.
+        client.copy.side_effect = None
+        client.copy.return_value = [None]
+        out = qm.commit(
+            conn, store, preview_id=other["preview_id"], max_count=10,
+            journal_path=journal,
+        )
+        assert out["outcome"] in {"complete", "more", "failed"}
+
+    def test_destination_rebuilt_since_the_copy_is_held(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2])
+        self._lose_reply(client, real_copy, landed=True)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+
+        def select(name: str, readonly: bool = False) -> dict[bytes, int]:
+            return {b"UIDVALIDITY": 8 if name == "_To Delete" else 7}
+
+        client.select_folder.side_effect = select
+        client.folder_status.side_effect = lambda name, what: {
+            b"UIDVALIDITY": 8, b"UIDNEXT": 1,
+        }
+        client.copy.side_effect = real_copy
+        client.copy.reset_mock()
+        self._after_grace(monkeypatch)
+        out = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert out["held_back_uncertain"] == 2
+        assert client._present == {1, 2}
+        client.copy.assert_not_called()
+
+    def test_waiting_is_never_reported_as_complete(
+        self, tmp_path: Path
+    ) -> None:
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client, real_copy = self._slow_ready([1, 2])
+        self._lose_reply(client, real_copy, landed=False)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        client.copy.side_effect = real_copy
+        # A preview issued only to settle: nothing else is left to move.
+        store.get(pid).remaining = []
+        out = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert (out["outcome"], out["awaiting_copy_check"]) == ("more", 2)
+        assert store.get(pid) is not None
+
+    def test_a_timeout_shrinks_the_step_for_the_next_preview_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(qm, "MOVE_CHUNK", 20)
+        conn, store, pid, client, real_copy = self._slow_ready(list(range(1, 41)))
+        self._lose_reply(client, real_copy, landed=False)
+        qm.commit(conn, store, preview_id=pid, max_count=99, journal_path=tmp_path / "j")
+        assert client.copy.call_args.args[0] == list(range(1, 21))
+        assert store.get(pid).chunk_size == 10
+        # After a failure the caller previews again: same account, new id.
+        again = _preview(conn, store, journal_path=tmp_path / "j")
+        assert store.get(again["preview_id"]).chunk_size == 10
+
+    def test_a_slow_step_halves_the_next_and_a_fast_one_grows_it(self) -> None:
+        assert qm._next_size(24, qm.SLOW_CHUNK_SECONDS) == 12
+        assert qm._next_size(6, 30.0) == qm.MIN_CHUNK
+        assert qm._next_size(qm.MIN_CHUNK, 30.0) == qm.MIN_CHUNK
+        assert qm._next_size(12, 5.0) == 12
+        assert qm._next_size(12, 1.0) == 24
+        assert qm._next_size(20, 1.0) == qm.MOVE_CHUNK
+
+    def test_steps_shrink_within_a_call_when_the_server_slows(self) -> None:
+        conn, store, pid, client, real_copy = self._slow_ready(list(range(1, 51)))
+        now = [0.0]
+
+        def slow_copy(chunk: list[int], dest: str) -> Any:
+            now[0] += 9.0
+            return real_copy(chunk, dest)
+
+        client.copy.side_effect = slow_copy
+        out = qm.commit(
+            conn, store, preview_id=pid, max_count=99, clock=lambda: now[0]
+        )
+        sizes = [len(call.args[0]) for call in client.copy.call_args_list]
+        assert sizes == [25, 12, 6]
+        assert out["slowest_chunk_seconds"] == 9.0
+        assert (out["moved"], out["outcome"]) == (43, "more")
+
+    def test_copying_record_without_a_snapshot_is_still_held(
+        self, tmp_path: Path
+    ) -> None:
+        """Records written before copies could be located (and servers that
+        will not report UIDNEXT) keep the old, cautious behaviour."""
+        journal = tmp_path / "journal.json"
+        conn, store, pid, client = self._ready([1, 2], capabilities=UIDPLUS_ONLY)
+        real_copy = client.copy.side_effect
+        self._lose_reply(client, real_copy, landed=True)
+        qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert "dest_uidnext" not in json.loads(journal.read_text())[0]
+
+        client.copy.side_effect = real_copy
+        out = qm.commit(conn, store, preview_id=pid, max_count=10, journal_path=journal)
+        assert out["held_back_uncertain"] == 2
+        assert client._present == {1, 2}
 
     def test_at_least_one_chunk_moves_even_with_no_budget(
         self, monkeypatch: pytest.MonkeyPatch
@@ -973,3 +1369,30 @@ def test_recovery_refuses_rebuilt_source_after_verifying_copies(tmp_path):
     client.add_flags.assert_not_called()
     client.uid_expunge.assert_not_called()
     assert journal.read_bytes() == record
+
+
+@pytest.mark.parametrize("binding", [{}, {"account_id": "other", "port": 993}])
+def test_destination_guard_preserves_ambiguously_bound_copy(binding):
+    conn = FakeConnector(_client([1]))
+    store = qm.PreviewStore()
+    entry = store.get(_preview(conn, store)["preview_id"])
+    journal = qm.MoveJournal(None)
+    record = {"host": conn._host, "login": conn._email, "stage": "copying",
+              "source_mailbox": "another-source", "destination_mailbox": entry.destination_mailbox,
+              "dest_uidnext": 100, "uids": [1], **binding}
+    journal.add(record)
+    with pytest.raises(qm.JournalUnreadableError):
+        qm._guard_destination(journal, entry, (7, 110))
+    assert journal.load() == [record]
+
+
+def test_lost_copy_lookup_refuses_rebuilt_source_on_return(monkeypatch):
+    client = _client([1])
+    monkeypatch.setattr(qm, "_message_ids", lambda *_: {1: b"<fixture@test>"})
+    client.select_folder.side_effect = [{b"UIDVALIDITY": 7}, {b"UIDVALIDITY": 8}]
+    record = {"destination_mailbox": "dest", "dest_uidvalidity": 7, "uidvalidity": 7,
+              "dest_uidnext": 100, "dest_uidceil": 100}
+    with pytest.raises(qm.SelectionStaleError):
+        qm._locate_copies(client, record, [1], "News", set())
+    client.add_flags.assert_not_called()
+    client.uid_expunge.assert_not_called()
