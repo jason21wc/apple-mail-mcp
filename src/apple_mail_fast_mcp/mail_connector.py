@@ -5008,32 +5008,38 @@ set resultData to {{|saved_positions|:savedPositions, |failures|:failedSaves}}""
 
         script = _wrap_with_timeout(
             f"""tell application "Mail"
-            set foundId to ""
-            try
-                repeat with d in messages of drafts mailbox
-                    set mid to ""
-                    try
-                        set mid to message id of d
-                    end try
-                    if mid is "{safe_bare}" or mid is "{safe_bracketed}" then
-                        set foundId to (id of d as text)
-                        exit repeat
-                    end if
-                end repeat
-            end try
-            if foundId is "" then
-                return "NOT_FOUND"
-            else
-                return foundId
-            end if
+            set lookupIncomplete to false
+            repeat with d in messages of drafts mailbox
+                set mid to missing value
+                try
+                    set mid to message id of d
+                on error
+                    set lookupIncomplete to true
+                end try
+                if mid is "{safe_bare}" or mid is "{safe_bracketed}" then
+                    return (id of d as text)
+                end if
+            end repeat
+            if lookupIncomplete then return "INCOMPLETE"
+            return "NOT_FOUND"
         end tell""",
             timeout=self.timeout,
         )
 
-        result = self._run_applescript(script).strip()
-        if result == "NOT_FOUND" or not result:
-            return None
-        return result
+        # IMAP can confirm APPEND before Mail indexes the RFC ID. Retry only
+        # this read, never the update or deletion which depends on it.
+        deadline = time.monotonic() + min(self.timeout, 25)
+        for delay in (0, 2, 6, 12):
+            if delay:
+                if time.monotonic() + delay >= deadline:
+                    break
+                time.sleep(delay)
+            result = self._run_applescript(script).strip()
+            if re.fullmatch(r"[0-9]+", result):
+                return result
+            if result != "NOT_FOUND":
+                raise MailAppleScriptError("Mail could not completely resolve the draft ID.")
+        return None
 
     def delete_draft(self, draft_id: str) -> bool:
         """Move a draft to Trash (lifecycle endpoint for cancellation).
@@ -5389,14 +5395,12 @@ set resultData to {{|saved_positions|:savedPositions, |failures|:failedSaves}}""
             set targetId to "{lookup_id_safe}"
             set foundDraft to missing value
             -- Unified "drafts mailbox": locale-independent, Gmail-mirror-safe. (#407)
-            try
-                repeat with d in messages of drafts mailbox
-                    if (id of d as text) is targetId then
-                        set foundDraft to d
-                        exit repeat
-                    end if
-                end repeat
-            end try
+            repeat with d in messages of drafts mailbox
+                if (id of d as text) is targetId then
+                    set foundDraft to d
+                    exit repeat
+                end if
+            end repeat
 
             if foundDraft is missing value then
                 set resultData to {{|found|:false}}

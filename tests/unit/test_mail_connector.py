@@ -5850,12 +5850,30 @@ class TestResolveDraftInternalId:
         assert 'mid is "abc@host"' in script
         assert 'mid is "<abc@host>"' in script
 
+    def test_late_imap_append_is_resolved_before_delete(self, connector, monkeypatch):
+        run = MagicMock(side_effect=["NOT_FOUND", "NOT_FOUND", "173659", "OK"])
+        monkeypatch.setattr(connector, "_run_applescript", run)
+        monkeypatch.setattr("apple_mail_fast_mcp.mail_connector.time.sleep", lambda _: None)
+        assert connector.delete_draft("fixture@example.test")
+        scripts = [c.args[0] for c in run.call_args_list]
+        assert all("delete m" not in s for s in scripts[:-1])
+        assert 'whose id is "173659"' in scripts[-1]
+
+    def test_invalid_native_reply_is_not_a_draft_id(self, connector, monkeypatch):
+        run = MagicMock(return_value="unexpected")
+        monkeypatch.setattr(connector, "_run_applescript", run)
+        with pytest.raises(MailAppleScriptError):
+            connector.delete_draft("fixture@example.test")
+        run.assert_called_once()
+
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_not_found_returns_none(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         mock_run.return_value = "NOT_FOUND"
-        assert connector._resolve_draft_internal_id("missing@host") is None
+        with patch("apple_mail_fast_mcp.mail_connector.time.sleep"):
+            assert connector._resolve_draft_internal_id("missing@host") is None
+        assert mock_run.call_count == 4
 
     @patch.object(AppleMailConnector, "_resolve_draft_internal_id")
     def test_lookup_id_uses_drafts_scoped_resolver_not_broad(

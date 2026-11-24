@@ -1363,6 +1363,8 @@ create_draft(
 
 ### update_draft
 
+An IMAP-created draft can be readable on the server before Mail.app indexes its Message-ID. The native lookup briefly polls Drafts before replacement or deletion. If Mail still cannot find the draft, verify the original in Drafts before trying again.
+
 Update an existing draft. Implemented as **create replacement, then remove original** —
 Mail.app forbids mutating saved drafts, so this tool reads the
 current state, creates a new draft with merged fields, and only then
