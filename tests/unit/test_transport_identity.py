@@ -408,3 +408,16 @@ def test_numeric_and_rfc_payload_paths_return_and_save_identical_bytes(
     assert (
         (native_dir / "report.bin").read_bytes() == (rfc_dir / "report.bin").read_bytes() == payload
     )
+
+
+@pytest.mark.parametrize("account", ["Work", ACCOUNT_ID])
+def test_query_move_connector_binds_one_account_snapshot(connector, monkeypatch, account):
+    from apple_mail_fast_mcp import query_moves
+
+    monkeypatch.setattr(mail_connector, "get_imap_password", Mock(return_value="fixture-only"))
+    bound = query_moves.connector_for(connector, account)
+    assert query_moves._identity(bound) == (
+        "mail.example.com", "person@example.com", 993, ACCOUNT_ID,
+    )
+    connector.list_accounts.assert_called_once()
+    assert bound._pool is None

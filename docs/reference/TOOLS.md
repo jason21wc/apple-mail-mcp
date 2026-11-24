@@ -688,8 +688,8 @@ The preview leaves out messages already flagged deleted and reports them as `fla
 **Error Types:**
 - `preview_not_found`: Unknown, completed, or expired `preview_id`, or the server restarted
 - `max_count_exceeded`: The previewed set is larger than `max_count`
-- `selection_stale`: The source mailbox was rebuilt since the preview (UIDVALIDITY changed). Preview again, or the account now resolves to a different server or login
-- `journal_unreadable`: The interrupted-move journal cannot be read; nothing moves until it is inspected
+- `selection_stale`: The source mailbox was rebuilt (UIDVALIDITY changed), or the resolved account UUID, IMAP host, port, or login changed. Preview again.
+- `journal_unreadable`: Inspect the interrupted-move journal and the affected mailboxes. An unreadable journal or an overlapping record without a matching account UUID and known port blocks recovery. Older records lack this identity information and require manual reconciliation.
 - `commit_in_progress`: Another commit call is still working on this preview. Wait, then preview again
 - `confirmation_required` / `cancelled`: Trash destination not confirmed
 - `imap_required`, `unsupported_account`, `imap_move_unsupported`, `imap_error`: as for the preview

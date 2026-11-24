@@ -325,7 +325,7 @@ class TestToolInvocation:
             uidvalidity=7,
             uids=[1, 2],
             selector={"sender_contains": "news@example.com"},
-            identity=(connector._host, connector._email),
+            identity=query_moves._identity(connector),
         )
 
     @pytest.mark.parametrize(

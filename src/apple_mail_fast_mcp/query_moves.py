@@ -47,7 +47,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
 
@@ -122,7 +122,23 @@ class JournalUnreadableError(QueryMoveError):
     """
 
 
+class MoveIdentity(NamedTuple):
+    host: str
+    login: str
+    port: int
+    account_id: str
+
+
+class _AccountConnector(ImapConnector):
+    _account_id: str
+
+
 class _Connector(Protocol):
+    _host: str
+    _email: str
+    _port: int
+    _account_id: str
+
     def _session(self) -> Any: ...
 
     @staticmethod
@@ -193,8 +209,8 @@ class PreviewEntry:
     total: int
     selector: dict[str, Any]
     expires_at: float
+    identity: MoveIdentity
     remaining: list[int] = field(default_factory=list)
-    identity: tuple[str | None, str | None] = (None, None)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
@@ -233,7 +249,7 @@ class PreviewStore:
         uidvalidity: int | None,
         uids: list[int],
         selector: dict[str, Any],
-        identity: tuple[str | None, str | None] = (None, None),
+        identity: MoveIdentity,
     ) -> str:
         preview_id = secrets.token_urlsafe(16)
         entry = PreviewEntry(
@@ -268,26 +284,25 @@ class PreviewStore:
             self._entries.pop(preview_id, None)
 
 
-def connector_for(mail: Any, account: str) -> ImapConnector:
+def connector_for(mail: Any, account: str) -> _AccountConnector:
     """Build an IMAP connector for ``account`` the way the move fast path does.
 
     Mirrors ``AppleMailConnector._imap_move_messages``. Raises the Keychain
     and account-lookup errors unchanged; the server reports them, because
     these tools have no AppleScript fallback.
     """
-    host, port, email = mail._resolve_imap_config(account)
-    password = mail._get_imap_password_with_fallback(account, email)
-    return ImapConnector(host, port, email, password, pool=mail._imap_pool)
+    with mail._account_identity_scope():
+        account_id = mail._resolve_account_identity(account).id
+        host, port, email = mail._resolve_imap_config(account_id)
+        password = mail._get_imap_password_with_fallback(account_id, email)
+    # Query UIDs must use this exact endpoint; the optional pool omits port.
+    connector = _AccountConnector(host, port, email, password)
+    connector._account_id = account_id
+    return connector
 
 
-def _identity(connector: Any) -> tuple[str | None, str | None]:
-    """Which server and login a connector talks to.
-
-    A preview's UIDs only mean something on the server they came from. The
-    account name is resolved again at commit time, so the resolved endpoint
-    is compared too.
-    """
-    return (getattr(connector, "_host", None), getattr(connector, "_email", None))
+def _identity(connector: _Connector) -> MoveIdentity:
+    return MoveIdentity(connector._host, connector._email, connector._port, connector._account_id)
 
 
 class MoveJournal:
@@ -370,16 +385,26 @@ def _mailbox_key(name: str) -> str:
     return "INBOX" if name.upper() == "INBOX" else name
 
 
-def _record_key(record: dict[str, Any]) -> tuple[Any, Any, str]:
-    return (
-        record.get("host"),
-        record.get("login"),
-        _mailbox_key(str(record.get("source_mailbox", ""))),
-    )
-
-
-def _entry_key(entry: PreviewEntry) -> tuple[Any, Any, str]:
-    return (*entry.identity, _mailbox_key(entry.source_mailbox))
+def _records_for(
+    journal: MoveJournal, identity: MoveIdentity, mailbox: str,
+) -> list[dict[str, Any]]:
+    """Validate all matching records before allowing any recovery writes."""
+    records = []
+    for row in journal.load():
+        if (row.get("host"), row.get("login"), _mailbox_key(str(row.get("source_mailbox", "")))) != (
+            identity.host, identity.login, _mailbox_key(mailbox)
+        ):
+            continue
+        port = row.get("port")
+        if type(port) is int and port != identity.port:
+            continue
+        if type(port) is not int or row.get("account_id") != identity.account_id:
+            raise JournalUnreadableError(
+                "An interrupted move for this mailbox cannot be bound to this account and port. "
+                "Inspect the source, destination and journal before moving messages."
+            )
+        records.append(row)
+    return records
 
 
 _COPYUID_RE = re.compile(rb"^(?:COPYUID )?(\d+) (\S+) ([0-9:,]+)$")
@@ -554,11 +579,10 @@ def preview(
         # An earlier call may have left chunks part-way through. Say so, and
         # still issue an id when nothing else matches: the commit is what
         # settles them, and flagged originals no longer match the search.
-        key = (*_identity(connector), _mailbox_key(source_mailbox))
         pending = sum(
             len(r.get("uids", []))
-            for r in MoveJournal(journal_path).load()
-            if _record_key(r) == key and r.get("uidvalidity") == uidvalidity
+            for r in _records_for(MoveJournal(journal_path), _identity(connector), source_mailbox)
+            if r.get("uidvalidity") == uidvalidity
         )
         if pending:
             result["interrupted_pending"] = pending
@@ -608,10 +632,8 @@ def _move_chunk(
     if has_move:
         client.move(uids, entry.destination_mailbox)
         return
-    host, login = entry.identity
     record: dict[str, Any] = {
-        "host": host,
-        "login": login,
+        **entry.identity._asdict(),
         "source_mailbox": entry.source_mailbox,
         "destination_mailbox": entry.destination_mailbox,
         "uidvalidity": entry.uidvalidity,
@@ -670,7 +692,11 @@ def _copies_exist(client: Any, record: dict[str, Any], source_mailbox: str) -> b
         )
         return {int(u) for u in found} >= set(dest_uids)
     finally:
-        client.select_folder(source_mailbox, readonly=False)
+        restored = client.select_folder(source_mailbox, readonly=False)
+        if _uidvalidity(restored) != record["uidvalidity"]:
+            raise SelectionStaleError(
+                "The source mailbox changed during copy verification. Preview again."
+            )
 
 
 def _settle_interrupted(
@@ -684,9 +710,7 @@ def _settle_interrupted(
     """
     resumed: list[int] = []
     held: set[int] = set()
-    for record in journal.load():
-        if _record_key(record) != _entry_key(entry):
-            continue
+    for record in _records_for(journal, entry.identity, entry.source_mailbox):
         if record.get("uidvalidity") != entry.uidvalidity:
             # The mailbox was rebuilt; these UIDs name other messages now.
             journal.replace(record, None)
@@ -868,7 +892,7 @@ def _commit_locked(
     if _identity(connector) != entry.identity:
         store.discard(preview_id)
         raise SelectionStaleError(
-            "the account now resolves to a different server or login than "
+            "the account UUID, host, port or login differs from "
             "the one previewed; nothing was moved. Preview again."
         )
 
