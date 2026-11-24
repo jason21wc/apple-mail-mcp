@@ -1908,6 +1908,10 @@ async def commit_move_by_query(
     errors or times out, do not assume nothing moved: preview again and
     compare counts before continuing.
 
+    When a result carries ``server_slow``, the mail server has stopped
+    keeping up. Wait ``retry_after_seconds`` before the next call; calling
+    sooner moves nothing. Tell the user if it keeps happening.
+
     Args:
         preview_id: From ``preview_move_by_query``. Valid for 15 minutes.
         max_count: The most messages this whole move may involve. If the
@@ -1928,9 +1932,12 @@ async def commit_move_by_query(
 
         ``resumed`` (when present) counts messages whose removal an earlier
         interrupted call left unfinished and this call completed.
-        ``held_back_uncertain`` counts messages left in place because an
-        earlier copy of them may or may not have landed; check the
-        destination by hand before moving those.
+        ``awaiting_copy_check`` counts messages whose copy lost its reply
+        and may still land; the next call after the wait looks for the
+        copies and then finishes or redoes that step by itself.
+        ``held_back_uncertain`` counts messages left in place because only
+        some of their copies could be found; check the destination by hand
+        before moving those.
 
     Moving to a Trash mailbox asks the user to confirm first, on the same
     terms as ``delete_messages``.

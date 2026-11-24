@@ -606,13 +606,20 @@ Moves exactly the previewed messages. Mail that arrives after the preview is nev
 - After a failure, `remaining` is recounted on a fresh connection, and `moved_unconfirmed` counts messages that left the source without a confirmed reply (the server applied a chunk but the reply was lost). If the recount also fails, `remaining` is `null` with `remaining_unverified: true`. Calling again is safe: each chunk is checked for presence before it is moved, so nothing moves twice. One exception on servers without `MOVE` (iCloud): if a call fails after the copy landed but before the originals were removed, the retry copies those messages again, leaving duplicates in the destination. Nothing is lost.
 - `already_gone` counts previewed messages that were no longer in the source (for example moved by hand in the meantime).
 - `resumed` (when present) counts messages whose removal an earlier interrupted call left unfinished and this call completed. Their copy had already landed, so they are not copied again.
-- `held_back_uncertain` (when present) counts messages left in place because an earlier copy of them may or may not have landed. They are never retried automatically. Check the destination by hand; once they are gone from the source the hold clears.
+- `server_slow` with `retry_after_seconds` (when present): the mail server has stopped keeping up, either because a step timed out or because a copy whose reply was lost may still land. Wait that long before the next call; calling sooner moves nothing.
+- `awaiting_copy_check` (when present) counts messages whose copy lost its reply. After the wait, the next call looks for the copies and finishes or redoes that step by itself.
+- `slowest_chunk_seconds` (when messages moved): how long the slowest step of this call took.
+- `held_back_uncertain` (when present) counts messages left in place because only some of their copies could be found, or because the step was recorded before copies could be located. They are never retried automatically. Check the destination by hand; once they are gone from the source the hold clears.
 - Moving to a Trash mailbox asks the user to confirm first, on the same terms as `delete_messages`.
 
 **Interrupted moves (servers without `MOVE`, such as iCloud):** each chunk is written to `~/.apple_mail_mcp/query_move_journal.json` before its copy starts and cleared when the originals are removed. If the server process dies in between, the next commit on that mailbox reads the journal:
 
 - Where the copy had returned, it first checks that every copy is still in the destination, using the UIDs the server reported for the copy. Only then does it remove the originals (`resumed`). If any copy is missing, for example because the destination was emptied in the meantime, the originals are left alone and held back.
-- Where the copy was still in flight, the messages are held back (`held_back_uncertain`). A copy the server refused outright leaves no hold.
+- Where the copy was still in flight (its reply never arrived, typically a timeout on a slowed server), the next commit looks for the copies itself. Before each copy the journal records where the destination's UIDs stood, so only messages that arrived since are examined, and they are paired with the originals by Message-ID, one copy per original. All found: the originals are removed (`resumed`). None found: the step is done again. Some found, or no way to tell: the messages are held back (`held_back_uncertain`).
+
+Duplicates share a Message-ID, so that search is kept to a closed window. For 60 seconds after a lost reply, in case the copy still lands, no commit copies anything into that destination, from any source mailbox (`awaiting_copy_check`, `outcome` stays `"more"`). After that, the first commit about to copy into the destination closes the window at the destination's current UIDNEXT. Nothing this tool copies later can then be taken for the lost copy. Mail put into the destination by another client during those 60 seconds is the one thing this cannot tell apart. A copy the server refused outright leaves no hold.
+
+**Slow servers:** steps start at 25 messages. A step that takes 8 seconds or more halves the next one, down to 5; a quick one lets it grow back. A timeout halves it too, and the size is remembered for the account, so a fresh preview does not return to the size that just timed out. iCloud publishes no IMAP limits; this was sized from one evening in which 25-message copies went from about 2 seconds to more than 15 after roughly 9,000 moves.
 
 The preview leaves out messages already flagged deleted and reports them as `flagged_deleted_skipped`, since that flag is what an interrupted move leaves behind. It reports `interrupted_pending` when the journal holds chunks for the mailbox, and in that case issues a `preview_id` even if `matched` is 0, so the commit that settles them can run. An unreadable journal stops commits with `journal_unreadable` until it is inspected by hand.
 
@@ -623,7 +630,7 @@ The preview leaves out messages already flagged deleted and reports them as `fla
 - `max_count_exceeded`: The previewed set is larger than `max_count`
 - `selection_stale`: The source mailbox was rebuilt since the preview (UIDVALIDITY changed). Preview again, or the account now resolves to a different server or login
 - `journal_unreadable`: The interrupted-move journal cannot be read; nothing moves until it is inspected
-- `commit_in_progress`: Another commit call is still working on this preview. Wait, then preview again
+- `commit_in_progress`: Another commit call is still working on this preview, or another move into the same destination mailbox is running. Wait, then call or preview again
 - `confirmation_required` / `cancelled`: Trash destination not confirmed
 - `imap_required`, `unsupported_account`, `imap_move_unsupported`, `imap_error`: as for the preview
 
