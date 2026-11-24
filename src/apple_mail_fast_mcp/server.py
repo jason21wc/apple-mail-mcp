@@ -2043,9 +2043,7 @@ async def commit_move_by_query(
           ``remaining`` was recounted on a fresh connection (null with
           ``remaining_unverified`` when even that failed).
           ``moved_unconfirmed`` counts messages that left the source without
-          a confirmed reply. On servers using UIDPLUS (including iCloud), a
-          failed call may have copied messages still present in the source.
-          Inspect the destination before retrying to avoid duplicate copies.
+          a confirmed reply.
 
         ``resumed`` (when present) counts messages whose removal an earlier
         interrupted call left unfinished and this call completed.
