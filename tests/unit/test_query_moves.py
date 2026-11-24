@@ -163,10 +163,9 @@ class TestBuildCriteria:
             sender_not_contains=("gmail.com", "me.com"),
             date_to="2026-05-16",
         )
-        assert qm.build_criteria(sel) == [
-            "FROM", "a@x.com", "BEFORE", "17-May-2026",
-            "NOT", "FROM", "gmail.com", "NOT", "FROM", "me.com",
-        ]
+        # Exclusions are applied by the preview, never sent as NOT FROM:
+        # iCloud times out on a negated sender search.
+        assert qm.build_criteria(sel) == ["FROM", "a@x.com", "BEFORE", "17-May-2026"]
 
     def test_empty_selector_rejected(self) -> None:
         with pytest.raises(ValueError, match="at least one"):
@@ -310,13 +309,13 @@ class TestPreview:
         assert qm._parse_copyuid(None, 1) is None
 
     def test_criteria_survive_imapclient_normalisation(self) -> None:
-        """Run the real imapclient normaliser: exclusions must stay NOT FROM
-        pairs and the presence check must be a bare sequence set."""
+        """Run the real imapclient normaliser: no negated sender term reaches
+        the server and the presence check must be a bare sequence set."""
         from imapclient.imapclient import _normalise_search_criteria
 
         sel = qm.Selector(sender_contains="a@x.com", sender_not_contains=("my co",))
         assert _normalise_search_criteria(qm.build_criteria(sel)) == [
-            b"FROM", b"a@x.com", b"NOT", b"FROM", b'"my co"',
+            b"FROM", b"a@x.com",
         ]
         assert _normalise_search_criteria(["UID", "1,2,3"]) == [b"UID", b"1,2,3"]
 
@@ -329,6 +328,73 @@ class TestPreview:
 
 
 # ----------------------------------------------------------------- commit
+
+
+class TestPreviewExclusions:
+    def _run(self, senders: dict[int, str], *terms: str) -> tuple[Any, ...]:
+        client = _client(sorted(senders), senders=senders)
+        conn, store = FakeConnector(client), qm.PreviewStore()
+        out = _preview(
+            conn, store,
+            selector=qm.Selector(date_to="2026-05-16", sender_not_contains=terms),
+        )
+        return out, store, client
+
+    def test_excluded_senders_are_left_out_of_the_held_set(self) -> None:
+        out, store, client = self._run(
+            {1: "news@example.com", 2: "pal@gmail.com", 3: "news@example.com"},
+            "@GMAIL.com",
+        )
+        assert out["matched"] == 2
+        assert out["excluded_by_sender"] == 1
+        assert out["senders"] == [{"address": "news@example.com", "count": 2}]
+        assert store.get(out["preview_id"]).remaining == [1, 3]
+        # Nothing negated was sent to the server.
+        for call in client.search.call_args_list:
+            assert "NOT" not in call.args[0]
+
+    def test_exclusion_matches_the_display_name(self) -> None:
+        client = _client([1, 2])
+        named = Address(b"Peter Sarjeant", None, b"someone", b"example.org")
+        plain = _envelope("news@example.com", datetime(2026, 3, 1))
+        from_named = Envelope(
+            plain.date, b"subj", (named,), (named,), (named,),
+            None, None, None, None, b"<id2@x>",
+        )
+        client.fetch.side_effect = lambda chunk, parts: {
+            1: {b"ENVELOPE": from_named},
+            2: {b"ENVELOPE": plain},
+        }
+        store = qm.PreviewStore()
+        out = _preview(
+            FakeConnector(client), store,
+            selector=qm.Selector(date_to="2026-05-16", sender_not_contains=("sarjeant",)),
+        )
+        assert store.get(out["preview_id"]).remaining == [2]
+
+    def test_unreadable_sender_is_left_out_when_excluding(self) -> None:
+        client = _client([1, 2])
+        real_fetch = client.fetch.side_effect
+        client.fetch.side_effect = lambda chunk, parts: {
+            u: d for u, d in real_fetch(chunk, parts).items() if u != 2
+        }
+        store = qm.PreviewStore()
+        out = _preview(
+            FakeConnector(client), store,
+            selector=qm.Selector(date_to="2026-05-16", sender_not_contains=("gmail",)),
+        )
+        assert out["sender_unreadable_left_out"] == 1
+        assert store.get(out["preview_id"]).remaining == [1]
+
+    def test_everything_excluded_issues_no_preview_id(self) -> None:
+        out, _, _ = self._run({1: "a@gmail.com", 2: "b@gmail.com"}, "gmail.com")
+        assert out["matched"] == 0
+        assert out["excluded_by_sender"] == 2
+        assert out["preview_id"] is None
+
+    def test_no_exclusions_reports_no_exclusion_counts(self) -> None:
+        out = _preview(FakeConnector(_client([1, 2])), qm.PreviewStore())
+        assert "excluded_by_sender" not in out
 
 
 class TestCommit:

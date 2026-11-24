@@ -131,7 +131,13 @@ class _Connector(Protocol):
 
 @dataclass(frozen=True)
 class Selector:
-    """Which messages to act on. Filters are ANDed; exclusions are NOT FROM."""
+    """Which messages to act on. Filters are ANDed.
+
+    Exclusions are applied by the preview itself, against the senders it
+    reads back, not sent to the server as ``NOT FROM``: iCloud takes longer
+    than the socket timeout to answer a negated sender search, even over a
+    few hundred messages.
+    """
 
     sender_contains: str | None = None
     sender_not_contains: tuple[str, ...] = ()
@@ -179,9 +185,13 @@ def build_criteria(selector: Selector) -> list[Any]:
             "subject_contains, date_from, date_to, read_status or is_flagged; "
             "exclusions alone would select nearly the whole mailbox"
         )
-    for term in selector.sender_not_contains:
-        criteria.extend(["NOT", "FROM", term])
     return criteria
+
+
+def _is_excluded(sender: str, terms: tuple[str, ...]) -> bool:
+    """Whether a sender (display name and address) contains an exclusion."""
+    folded = sender.casefold()
+    return any(term.strip().casefold() in folded for term in terms)
 
 
 @dataclass
@@ -470,20 +480,49 @@ def _header_date(envelope: Any) -> date | None:
     return value.date() if isinstance(value, datetime) else None
 
 
-def _summarize(
-    client: Any, uids: list[int], selector: Selector
-) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    dates: list[date] = []
+def _read_senders(
+    client: Any, uids: list[int]
+) -> dict[int, tuple[str, date | None]]:
+    """Sender and header date of each message, by UID."""
+    found: dict[int, tuple[str, date | None]] = {}
     for chunk in _chunks(uids, FETCH_CHUNK):
-        for data in client.fetch(chunk, ["ENVELOPE"]).values():
+        for uid, data in client.fetch(chunk, ["ENVELOPE"]).items():
             envelope = data.get(b"ENVELOPE")
-            if envelope is None:
-                continue
-            rows.append({"sender": _format_sender(envelope)})
-            header = _header_date(envelope)
-            if header is not None:
-                dates.append(header)
+            if envelope is not None:
+                found[int(uid)] = (_format_sender(envelope), _header_date(envelope))
+    return found
+
+
+def _apply_exclusions(
+    uids: list[int],
+    read: dict[int, tuple[str, date | None]],
+    terms: tuple[str, ...],
+) -> tuple[list[int], int, int]:
+    """Drop excluded senders. Returns (kept, excluded, unreadable).
+
+    A message whose sender could not be read is left out as well: it cannot
+    be shown not to be one the caller asked to keep.
+    """
+    if not terms:
+        return uids, 0, 0
+    kept: list[int] = []
+    excluded = unreadable = 0
+    for uid in uids:
+        sender = read.get(uid, ("", None))[0]
+        if not sender:
+            unreadable += 1
+        elif _is_excluded(sender, terms):
+            excluded += 1
+        else:
+            kept.append(uid)
+    return kept, excluded, unreadable
+
+
+def _summarize(
+    read: dict[int, tuple[str, date | None]], uids: list[int], selector: Selector
+) -> dict[str, Any]:
+    rows = [{"sender": read[u][0]} for u in uids if u in read]
+    dates = [d for u in uids if u in read and (d := read[u][1]) is not None]
 
     lower = date.fromisoformat(selector.date_from) if selector.date_from else None
     upper = date.fromisoformat(selector.date_to) if selector.date_to else None
@@ -565,10 +604,22 @@ def preview(
         if not uids and not pending:
             return result
         if len(uids) > ceiling:
+            # Counted before exclusions: reading every sender of a set this
+            # size is what the ceiling is there to avoid.
             result.update(over_limit=True, limit=ceiling)
             return result
         if uids:
-            result.update(_summarize(client, uids, selector))
+            read = _read_senders(client, uids)
+            uids, excluded, unreadable = _apply_exclusions(
+                uids, read, selector.sender_not_contains
+            )
+            result["matched"] = len(uids)
+            if selector.sender_not_contains:
+                result["excluded_by_sender"] = excluded
+                result["sender_unreadable_left_out"] = unreadable
+            if not uids and not pending:
+                return result
+            result.update(_summarize(read, uids, selector))
 
     result["preview_id"] = store.put(
         account=account,
