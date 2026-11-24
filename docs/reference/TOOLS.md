@@ -602,7 +602,7 @@ Use this pair for large moves (hundreds or thousands of messages). The server ru
 - `source_mailbox` (string, required): Mailbox to move messages out of
 - `destination_mailbox` (string, required): Mailbox to move them into. Must exist and differ from the source
 - `sender_contains` (string, optional): Only messages whose sender contains this text
-- `sender_not_contains` (list of strings, optional): Exclude messages whose sender contains any of these
+- `sender_not_contains` (list of strings, optional): Exclude messages whose sender (display name or address, any case) contains any of these. The preview applies this itself from the senders it reads back, and reports `excluded_by_sender`; it is not sent to the server, because iCloud times out on a negated sender search. The 5,000 ceiling is counted before exclusions
 - `subject_contains` (string, optional): Only messages whose subject contains this text
 - `date_from` / `date_to` (string, optional): Inclusive bounds, `YYYY-MM-DD`
 - `read_status` (boolean, optional): Only read (`true`) or unread (`false`)
