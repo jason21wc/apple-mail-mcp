@@ -8,7 +8,11 @@ on:
 
 jobs:
   unit-tests:
-    runs-on: macos-latest
+    # Linux, not macOS: the unit suite mocks all Mail and Keychain I/O, and
+    # GitHub's macOS arm64 runners were repeatedly unavailable ("job was not
+    # acquired by Runner"), cancelling runs after 15 minutes with no step
+    # executed. The macOS leg below still runs when a machine is free.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -48,6 +52,25 @@ jobs:
 
       - name: Docs drift check
         run: ./scripts/check_docs.sh
+
+  unit-tests-macos:
+    # The platform the server actually runs on. Not required: it must not
+    # block a merge when GitHub has no macOS machine to give.
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+
+      - run: uv python install 3.10
+
+      - run: uv sync --dev
+
+      - name: Unit tests
+        run: uv run pytest tests/ -m "not integration and not e2e and not benchmark" -q
+        timeout-minutes: 3
 
   test-summary:
     runs-on: ubuntu-latest

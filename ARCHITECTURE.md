@@ -66,7 +66,9 @@ caller carry every message id through its own context; a bulk job of a few
 thousand messages needed hundreds of calls. These two let the server select
 with an IMAP SEARCH, show the result, hold that exact UID set in memory, and
 then move only that set. It uses MOVE or, where the server lacks it (iCloud), the UIDPLUS
-copy-flag-expunge sequence. It is IMAP-only with no AppleScript fallback, refuses
+copy-flag-expunge sequence. Commit calls are bounded by elapsed time and every
+UIDPLUS chunk is journalled to disk first, because a client that times out
+can restart this process mid-move (observed 2026-11-23). It is IMAP-only with no AppleScript fallback, refuses
 Gmail, and does not touch `mail_connector.py` (ADR-3). It reuses four private
 helpers from `imap_connector.py` and three from `mail_connector.py` (connector
 construction), which is the sync cost to watch. It is an upstream candidate

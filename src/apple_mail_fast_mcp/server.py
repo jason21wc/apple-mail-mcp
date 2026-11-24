@@ -3,6 +3,7 @@ FastMCP server for Apple Mail integration.
 """
 
 import argparse
+import asyncio
 import atexit
 import logging
 import os
@@ -1847,17 +1848,26 @@ def _query_move_ceiling() -> int:
     return value if value > 0 else query_moves.DEFAULT_CEILING
 
 
-def _query_move_receipts_path() -> Path:
-    """Receipt log location, resolved at call time (APPLE_MAIL_MCP_HOME)."""
+def _query_move_home() -> Path:
+    """App data directory, resolved at call time (APPLE_MAIL_MCP_HOME)."""
     home_override = os.environ.get("APPLE_MAIL_MCP_HOME")
-    base = Path(home_override) if home_override else Path.home() / ".apple_mail_mcp"
-    return base / "query_move_receipts.jsonl"
+    return Path(home_override) if home_override else Path.home() / ".apple_mail_mcp"
+
+
+def _query_move_receipts_path() -> Path:
+    return _query_move_home() / "query_move_receipts.jsonl"
+
+
+def _query_move_journal_path() -> Path:
+    return _query_move_home() / "query_move_journal.json"
 
 
 _QUERY_MOVE_ERROR_TYPES: tuple[tuple[type[Exception], str], ...] = (
     (query_moves.PreviewNotFoundError, "preview_not_found"),
     (query_moves.PreviewTooLargeError, "max_count_exceeded"),
     (query_moves.SelectionStaleError, "selection_stale"),
+    (query_moves.JournalUnreadableError, "journal_unreadable"),
+    (query_moves.CommitInProgressError, "commit_in_progress"),
     (query_moves.QueryMoveUnsupportedError, "unsupported_account"),
     (MailImapMoveUnsupportedError, "imap_move_unsupported"),
     (MailKeychainError, "imap_required"),
@@ -1937,7 +1947,12 @@ def preview_move_by_query(
         received date, so a few header dates can fall outside the window);
         ``distinct_senders``; ``senders`` (up to 50, with counts);
         ``other_senders_count``; ``expires_in_seconds``;
-        ``max_per_commit_call``.
+        ``max_per_commit_call``; ``commit_time_budget_seconds``;
+        ``flagged_deleted_skipped`` (matching messages already flagged
+        deleted, left out); ``interrupted_pending`` (when present, messages
+        an earlier interrupted commit left half-moved; the next commit on
+        this mailbox settles them, and a ``preview_id`` is issued for that
+        even when ``matched`` is 0).
 
     Example:
         >>> preview_move_by_query(
@@ -1974,6 +1989,7 @@ def preview_move_by_query(
             destination_mailbox=destination_mailbox,
             selector=selector,
             ceiling=_query_move_ceiling(),
+            journal_path=_query_move_journal_path(),
         )
         operation_logger.log_operation(
             operation,
@@ -2005,9 +2021,11 @@ async def commit_move_by_query(
     Move the messages held by a ``preview_move_by_query`` result.
 
     Moves exactly the previewed messages. Mail that arrived after the preview
-    is never included. Each call moves at most 1,000 messages; when
-    ``outcome`` is ``"more"``, call again with the same ``preview_id`` until
-    it is ``"complete"``.
+    is never included. Each call works for about 20 seconds and then returns;
+    when ``outcome`` is ``"more"``, call again with the same ``preview_id``
+    until it is ``"complete"``. Expect many calls for a large set. If a call
+    errors or times out, do not assume nothing moved: preview again and
+    compare counts before continuing.
 
     Args:
         preview_id: From ``preview_move_by_query``. Valid for 15 minutes.
@@ -2028,6 +2046,12 @@ async def commit_move_by_query(
           a confirmed reply. On servers using UIDPLUS (including iCloud), a
           failed call may have copied messages still present in the source.
           Inspect the destination before retrying to avoid duplicate copies.
+
+        ``resumed`` (when present) counts messages whose removal an earlier
+        interrupted call left unfinished and this call completed.
+        ``held_back_uncertain`` counts messages left in place because an
+        earlier copy of them may or may not have landed; check the
+        destination by hand before moving those.
 
     Moving to a Trash mailbox asks the user to confirm first, on the same
     terms as ``delete_messages``.
@@ -2076,25 +2100,36 @@ async def commit_move_by_query(
             if cancel_err:
                 return cancel_err
 
-        result = query_moves.commit(
+        # In a worker thread: the move is blocking network I/O, and holding
+        # the event loop for its whole length leaves the server unable to
+        # answer anything else, which a client can read as a dead server.
+        result = await asyncio.to_thread(
+            query_moves.commit,
             query_moves.connector_for(mail, entry.account),
             _query_move_store,
             preview_id=preview_id,
             max_count=max_count,
             receipts_path=_query_move_receipts_path(),
+            journal_path=_query_move_journal_path(),
         )
-        operation_logger.log_operation(
-            operation,
-            {
-                "account": entry.account,
-                "source_mailbox": entry.source_mailbox,
-                "destination_mailbox": entry.destination_mailbox,
-                "moved": result["moved"],
-                "remaining": result["remaining"],
-                "outcome": result["outcome"],
-            },
-            "success" if result["outcome"] != "failed" else "failure",
-        )
+        # Mail has already moved. A logging failure must not replace that
+        # result with an error the caller would read as "nothing happened".
+        try:
+            operation_logger.log_operation(
+                operation,
+                {
+                    "account": entry.account,
+                    "source_mailbox": entry.source_mailbox,
+                    "destination_mailbox": entry.destination_mailbox,
+                    "moved": result["moved"],
+                    "remaining": result["remaining"],
+                    "outcome": result["outcome"],
+                },
+                "success" if result["outcome"] != "failed" else "failure",
+            )
+        except Exception as log_exc:  # noqa: BLE001
+            logger.error("commit_move_by_query audit log failed: %s", log_exc)
+            result["audit_log_error"] = str(log_exc)
         if result["outcome"] == "failed":
             return {"success": False, "error_type": "imap_error", **result}
         return {"success": True, **result}

@@ -49,9 +49,11 @@ success:false. This does not certify sends or every other mail operation.
 Move the messages held by a ``preview_move_by_query`` result.
 
 Moves exactly the previewed messages. Mail that arrived after the preview
-is never included. Each call moves at most 1,000 messages; when
-``outcome`` is ``"more"``, call again with the same ``preview_id`` until
-it is ``"complete"``.
+is never included. Each call works for about 20 seconds and then returns;
+when ``outcome`` is ``"more"``, call again with the same ``preview_id``
+until it is ``"complete"``. Expect many calls for a large set. If a call
+errors or times out, do not assume nothing moved: preview again and
+compare counts before continuing.
 
 **Parameters:**
 
