@@ -44,6 +44,8 @@ EXPECTED_TOOLS = {
     "update_message",
     "preview_move_by_query",
     "commit_move_by_query",
+    "preview_attachment_export",
+    "commit_attachment_export",
     "save_attachments",
     "get_attachment_content",
     "create_mailbox",
