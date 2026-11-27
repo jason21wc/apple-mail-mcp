@@ -233,30 +233,39 @@ ids) to fetch bodies for specific messages.
 
 ### get_statistics
 
-Aggregate inbox statistics over a mailbox and time window.
+Count what a mailbox holds, grouped, without returning the messages.
 
-A read-only analytics roll-up computed from a single ``search_messages``
-pass — message volume, read/unread/flagged counts, read ratio, and the
-top senders (by full address or domain). This is the consolidated
-inbox-stats tool; per-folder unread counts live on ``list_mailboxes``
-and are not duplicated here.
+A read-only roll-up: message volume, read/unread/flagged counts, read
+ratio, and counts grouped by sender address, sender domain, subject
+pattern or day. Use it instead of ``search_messages`` to see what a
+mailbox holds; it returns a handful of groups, not a row per message.
+Per-folder unread counts live on ``list_mailboxes``.
 
-The window defaults to the last ~30 days (``received_within_hours=720``);
-pass ``date_from``/``date_to`` for an explicit range. Stats are computed
-over at most ``scan_limit`` of the most recent messages in the window —
-``window_fully_covered`` is ``False`` when the window held more than that,
-so the numbers are a recent-sample rather than a silent truncation.
+With no dates and no ``received_within_hours`` the window is the last 30
+days. Pass ``date_from``/``date_to`` for an explicit range (then no
+30-day cut is applied). Counts cover at most ``scan_limit`` of the most
+recent matching messages; ``window_fully_covered`` is ``False`` when
+there were more, or when the time budget ran out, so the numbers are a
+recent sample rather than a silent truncation.
+
+``by="subject"``, ``by="day"`` and any ``scan_limit`` above 500 read
+over IMAP only, in bounded chunks. They fail with ``imap_required``
+rather than fall back to AppleScript, which can leave Mail.app
+unresponsive on a large mailbox. On a mailbox of tens of thousands,
+keep the date range narrow.
 
 **Parameters:**
 
 - `account` (string, required): Mail.app account name (e.g. "Gmail"). Required.
 - `mailbox` (string, optional) (default: 'INBOX'): Mailbox to summarize (default "INBOX").
-- `received_within_hours` (integer, optional) (default: 720): Window size in hours (default 720 ≈ 30 days).
-- `date_from` (string, optional): ISO date lower bound (composes with the window).
-- `date_to` (string, optional): ISO date upper bound.
-- `by` (string, optional) (default: 'address'): Group top senders by "address" (default) or "domain".
-- `top_senders_limit` (integer, optional) (default: 10): How many top senders to return (default 10).
-- `scan_limit` (integer, optional) (default: 500): Max messages aggregated (default 500; bounds cost).
+- `received_within_hours` (integer, optional): Window size in hours. Default: 720 (30 days) when no dates are given, otherwise none. Composes with the dates.
+- `date_from` (string, optional): Inclusive lower bound, YYYY-MM-DD.
+- `date_to` (string, optional): Inclusive upper bound, YYYY-MM-DD.
+- `by` (string, optional) (default: 'address'): "address" (default), "domain", "subject" or "day". "subject" groups by pattern: numbers and dates in the subject become "#", so a daily report is one group. "day" is the received day.
+- `top_senders_limit` (integer, optional) (default: 10): How many senders or groups to return (default 10).
+- `scan_limit` (integer, optional) (default: 500): Most messages counted (default 500, at most 20,000).
+- `sender_contains` (string, optional): Only messages whose sender contains this. Use a full address on iCloud; its search can miss domain fragments.
+- `subject_contains` (string, optional): Only messages whose subject contains this.
 
 ### get_template
 

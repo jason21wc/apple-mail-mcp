@@ -59,6 +59,16 @@ The fork is deliberately thin. **Two behavioral modifications, both in
    single-source `_mark_untrusted()` helper on every content-returning tool
    (`get_messages`, `get_attachment_content`, `search_messages`, `get_thread`).
 
+A third, smaller one (added 2026-11-27): **`get_statistics` grouped counts.**
+`by` gains `"subject"` and `"day"`, the tool gains `sender_contains` and
+`subject_contains`, and `scan_limit` may go to 20,000. Those groupings, and
+any scan above 500, are read by the fork-local `search_summary.py` over IMAP
+only, in chunks under a time budget; they fail with `imap_required` rather
+than fall back to AppleScript. It exists because checking what a
+38,000-message mailbox holds through `search_messages` returned thousands of
+rows or hung Mail.app. The default 30-day window now applies only when no
+dates are given. Calls that used the old defaults behave as before.
+
 **One fork-local capability, in its own module (added 2026-11-22):**
 `query_moves.py` plus two tool registrations in `server.py`,
 `preview_move_by_query` and `commit_move_by_query`. The ID-list tools make the

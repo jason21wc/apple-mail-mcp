@@ -320,9 +320,14 @@ full = get_messages(ids)
 **Errors:** `account_not_found` (the `account` hint names no known account), `validation_error` (control characters in `mailbox`), `anchor_lookup_incomplete` (a probe failed, so absence was never established — retryable).
 ### get_statistics
 
-Aggregate inbox statistics over a mailbox and time window — message volume, read/unread/flagged counts, read ratio, and top senders (by address or domain). A read-only roll-up computed from a single `search_messages` pass; per-folder unread counts live on `list_mailboxes` and are not duplicated here.
+Count what a mailbox holds, grouped, without returning the messages: message volume, read/unread/flagged counts, read ratio, and counts by sender address, sender domain, subject pattern or day. Use it instead of `search_messages` to see what a mailbox holds; it returns a handful of groups, not a row per message. Per-folder unread counts live on `list_mailboxes` and are not duplicated here.
 
-Stats are computed over at most `scan_limit` of the most recent messages in the window. `window_fully_covered` is `false` when the window held more than that — so the numbers are a recent sample, not a silent truncation.
+Counts cover at most `scan_limit` of the most recent matching messages. `window_fully_covered` is `false` when there were more (or the time budget ran out) — so the numbers are a recent sample, not a silent truncation.
+
+**Two paths (fork-local extension):**
+
+- `by="address"` or `"domain"` with `scan_limit` up to 500 uses the ordinary search path, as before.
+- `by="subject"`, `by="day"`, or any `scan_limit` above 500 reads over **IMAP only**: envelopes, flags and received dates in chunks of 100, newest first. No new chunk is started after about 20 seconds; a read that stalls can add up to 20 more before it times out. If the connection drops part-way, the counts read so far are returned with `interrupted: true`. It fails with `imap_required` rather than fall back to AppleScript, which can leave Mail.app unresponsive on a large mailbox. On a mailbox of tens of thousands, keep the date range narrow. This path marks its response `content_is_untrusted` (subjects are mail content).
 
 **Parameters:**
 
@@ -330,12 +335,14 @@ Stats are computed over at most `scan_limit` of the most recent messages in the 
 |-----------|------|----------|---------|-------------|
 | `account` | string | Yes | - | Account name (e.g. "Gmail"). |
 | `mailbox` | string | No | "INBOX" | Mailbox to summarize. |
-| `received_within_hours` | integer | No | 720 | Window size in hours (720 ≈ 30 days). |
-| `date_from` | string | No | None | ISO date lower bound (composes with the window). |
-| `date_to` | string | No | None | ISO date upper bound. |
-| `by` | string | No | "address" | Group top senders by `"address"` or `"domain"`. |
-| `top_senders_limit` | integer | No | 10 | How many top senders to return. |
-| `scan_limit` | integer | No | 500 | Max messages aggregated (bounds cost). |
+| `received_within_hours` | integer | No | None | Window size in hours. With no dates and no value here the window is 720 hours (30 days); when dates are given no 30-day cut is applied. Composes with the dates. |
+| `date_from` | string | No | None | Inclusive lower bound, YYYY-MM-DD. |
+| `date_to` | string | No | None | Inclusive upper bound, YYYY-MM-DD. |
+| `by` | string | No | "address" | `"address"`, `"domain"`, `"subject"` or `"day"`. `"subject"` groups by pattern: numbers and dates become `#`, and `Re:`/`Fwd:` prefixes are dropped, so a daily report is one group. `"day"` is the received day. |
+| `top_senders_limit` | integer | No | 10 | How many senders or groups to return. |
+| `scan_limit` | integer | No | 500 | Most messages counted, at most 20,000. |
+| `sender_contains` | string | No | None | Only messages whose sender contains this. Use a full address on iCloud; its search can miss domain fragments. |
+| `subject_contains` | string | No | None | Only messages whose subject contains this. |
 
 **Returns:**
 
@@ -345,6 +352,7 @@ Stats are computed over at most `scan_limit` of the most recent messages in the 
   "statistics": {
     "account": "Gmail", "mailbox": "INBOX",
     "window": {"from": null, "to": null, "within_hours": 720},
+    "by": "address",
     "scanned": 312, "window_fully_covered": true,
     "total": 312, "unread": 47, "flagged": 5, "read_ratio": 0.849,
     "top_senders": [
@@ -355,6 +363,30 @@ Stats are computed over at most `scan_limit` of the most recent messages in the 
 }
 ```
 
+On the IMAP-only path `total` is the full match count (not just what was read), and the statistics also carry the groups:
+
+```json
+{
+  "success": true,
+  "statistics": {
+    "account": "iCloud", "mailbox": "Reports",
+    "window": {"from": "2026-05-01", "to": "2026-05-07", "within_hours": null},
+    "by": "subject",
+    "scanned": 28, "window_fully_covered": true,
+    "total": 28, "unread": 0, "flagged": 0, "read_ratio": 1.0,
+    "top_senders": [{"address": "reports@example.com", "count": 28}],
+    "groups": [
+      {"key": "Daily Closing Report # from host#.example.com", "count": 7},
+      {"key": "Credit Card Activity # from host#.example.com", "count": 7}
+    ],
+    "other_groups": 2, "other_count": 14
+  },
+  "content_is_untrusted": true
+}
+```
+
+`groups` are most frequent first (newest first for `by="day"`). `other_groups` and `other_count` are what did not fit in `top_senders_limit`. Day keys are this machine's local day, which can differ by one from the day the server's date filters use for a message near midnight. With `received_within_hours` and `window_fully_covered: false`, `total` is an upper bound, because messages that were not read could not be checked against the hour.
+
 **Examples:**
 
 ```python
@@ -363,10 +395,22 @@ get_statistics(account="Gmail")
 
 # Group by sending domain over the last week
 get_statistics(account="Gmail", by="domain", received_within_hours=168)
+
+# What kinds of mail does one week of a large mailbox hold?
+get_statistics(account="iCloud", mailbox="Reports", by="subject",
+               date_from="2026-05-01", date_to="2026-05-07", scan_limit=2000)
+
+# How many arrived each day from one sender?
+get_statistics(account="iCloud", mailbox="Reports", by="day",
+               sender_contains="reports@example.com", date_from="2026-05-01")
 ```
 
 **Error Codes:**
 
+- `validation_error`: unknown `by`, `scan_limit` outside 1 to 20,000, a blank filter, or a bad date
+- `imap_required`: the IMAP-only path was asked for and IMAP is not set up for the account
+- `account_not_found`, `not_found`: account or mailbox not found (IMAP-only path)
+- `imap_error`: IMAP failed (IMAP-only path; there is no fallback)
 - `unknown`: Unexpected error occurred
 
 ---
