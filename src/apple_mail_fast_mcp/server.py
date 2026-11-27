@@ -2295,11 +2295,14 @@ def save_attachments(
     Args:
         message_id: Message ID from search results
         save_directory: Directory path to save attachments. ``~`` is
-            expanded. The directory must already exist — it is not created to
+            expanded. The directory must already exist; it is not created.
         attachment_indices: Specific attachment indices to save (0-based), None for all
         output_filename: Custom filename for the saved attachment (fork mod #2).
             Only valid when saving exactly one attachment (one entry in
-            ``attachment_indices``). The name is sanitized for path safety.
+            ``attachment_indices``). The name is kept as written, spaces
+            included; only directory parts, ``\\`` and ``:``, control
+            characters and leading dots are removed, so the file always
+            lands inside ``save_directory``.
         overwrite: If False (default) and the destination file
             already exists, the save is refused with
             error_type='already_exists' and the existing file is
@@ -2332,7 +2335,7 @@ def save_attachments(
     """
     from pathlib import Path
 
-    from .utils import sanitize_filename
+    from .utils import sanitize_output_filename
 
     try:
         rate_err = check_rate_limit("save_attachments", {"message_id": message_id})
@@ -2381,7 +2384,7 @@ def save_attachments(
                     ),
                     "error_type": "validation_error",
                 }
-            output_filename = sanitize_filename(output_filename)
+            output_filename = sanitize_output_filename(output_filename)
 
         logger.info(
             f"Saving attachments from message {message_id} to {save_directory}"
