@@ -247,10 +247,29 @@ def make_body_safe(content: str, max_bytes: int) -> tuple[str, bool, int]:
 
 _MAX_FILENAME_BYTES = 255
 
-# Characters that change the direction text is displayed in.
-_BIDI_CONTROLS = frozenset(
-    "؜‎‏‪‫‬‭‮⁦⁧⁨⁩"
-)
+# Joiners that some scripts and emoji sequences need inside a word. Every
+# other invisible formatting character is dropped from a file name.
+_KEPT_FORMAT_CHARS = frozenset("\u200c\u200d")
+
+
+def _output_char(ch: str) -> str:
+    """One character of a caller-chosen file name, made safe to show.
+
+    Invisible characters are how a name lies about itself: a direction
+    override makes ``invoice<RLO>fdp.exe`` display as ``invoiceexe.pdf``, a
+    zero-width space makes two different names look the same, and a run of
+    blank look-alikes pushes the real extension out of view.
+    """
+    import unicodedata
+
+    category = unicodedata.category(ch)
+    if ch in "\\:/" or category == "Cc":
+        return "_"
+    if category in ("Zl", "Zp") or (category == "Cf" and ch not in _KEPT_FORMAT_CHARS):
+        return ""
+    if category == "Zs" or ch == "\u2800":  # any blank becomes a plain space
+        return " "
+    return ch
 
 
 def sanitize_output_filename(filename: str) -> str:
@@ -286,13 +305,9 @@ def sanitize_output_filename(filename: str) -> str:
 
     name = unicodedata.normalize("NFC", filename).replace("\x00", "")
     name = Path(name).name
-    name = "".join(
-        "_" if ch in "\\:/" or unicodedata.category(ch) == "Cc" else ch
-        for ch in name
-        # Direction overrides are dropped: they make "invoice[RLO]fdp.exe"
-        # display as "invoiceexe.pdf".
-        if ch not in _BIDI_CONTROLS
-    )
+    name = "".join(_output_char(ch) for ch in name)
+    while "  " in name:  # a long run of blanks hides what follows it
+        name = name.replace("  ", " ")
     name = name.lstrip(". ").rstrip(". ")
 
     if len(name.encode("utf-8")) > _MAX_FILENAME_BYTES:

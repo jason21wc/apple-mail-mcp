@@ -67,6 +67,22 @@ class TestSanitizeOutputFilename:
         assert sanitize_output_filename("invoice‮fdp.exe") == "invoicefdp.exe"
         assert sanitize_output_filename("a‎‏b⁦c⁩.txt") == "abc.txt"
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("export_manifest​.csv", "export_manifest.csv"),  # zero-width space
+            ("a﻿b­c.txt", "abc.txt"),                   # BOM, soft hyphen
+            ("a b c.txt", "abc.txt"),                   # line separators
+            ("invoice.pdf" + "⠀" * 60 + ".exe", "invoice.pdf .exe"),
+            ("a b　c.txt", "a b c.txt"),                 # other blanks
+            ("too      many   spaces.txt", "too many spaces.txt"),
+        ],
+    )
+    def test_invisible_characters_cannot_disguise_a_name(
+        self, name: str, expected: str
+    ) -> None:
+        assert sanitize_output_filename(name) == expected
+
     def test_joiners_that_scripts_and_emoji_need_are_kept(self) -> None:
         name = "می‌خواهم.txt"  # zero-width non-joiner, part of the word
         assert sanitize_output_filename(name) == name

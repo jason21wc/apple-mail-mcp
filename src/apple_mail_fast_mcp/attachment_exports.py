@@ -156,6 +156,13 @@ PATTERN_COST_LIMIT = 100_000
 """Most ways ``subject_pattern`` may be able to match one subject, by a
 worst-case estimate. See ``_pattern_cost``."""
 
+PATTERN_DEPTH_LIMIT = 4
+"""Deepest nesting of groups, choices and repeats in ``subject_pattern``."""
+
+FETCH_FAILURE_LIMIT = 3
+"""A message whose own fetch has failed this many times is recorded as an
+error and passed over, so it cannot hold up everything behind it."""
+
 SOLO_MESSAGE_BYTES = 4 * 1024 * 1024
 """A message above this is fetched on its own, as the first work of a call,
 so the time it takes is not added to a call that is already part-way."""
@@ -299,7 +306,7 @@ _NODE_NAMES = {
 }
 
 
-def _pattern_cost(items: Any) -> int:
+def _pattern_cost(items: Any, depth: int = 0) -> int:
     """A worst-case count of the ways a pattern can match one subject.
 
     Python's ``re`` backtracks and has no timeout, so a pattern is accepted
@@ -313,6 +320,12 @@ def _pattern_cost(items: Any) -> int:
     is refused. The pattern is applied from the start of the subject, which
     is what keeps this bound from being multiplied again by every position.
     """
+    if depth > PATTERN_DEPTH_LIMIT:
+        # The bound below counts ways to match, not the work each one takes;
+        # deeply nested groups make every step expensive.
+        raise ValueError(
+            f"subject_pattern: groups are nested more than {PATTERN_DEPTH_LIMIT} deep"
+        )
     cost = 1
     for op, value in items:
         name = str(op)
@@ -323,13 +336,15 @@ def _pattern_cost(items: Any) -> int:
                     "subject_pattern: a repeat inside a repeat (or a choice "
                     "inside a repeat) is not allowed; it can take far too long"
                 )
-            _pattern_cost(inner)  # still checks what the repeat contains
+            _pattern_cost(inner, depth + 1)  # still checks what it contains
             if low != high:
                 cost *= max(1, min(int(high), SUBJECT_LIMIT) - int(low) + 1)
         elif name == "SUBPATTERN":
-            cost *= _pattern_cost(value[3])
+            cost *= _pattern_cost(value[3], depth + 1)
         elif name == "BRANCH":
-            cost *= max(1, sum(_pattern_cost(branch) for branch in value[1]))
+            cost *= max(
+                1, sum(_pattern_cost(branch, depth + 1) for branch in value[1])
+            )
         elif name not in _PLAIN_NODES:
             what = _NODE_NAMES.get(name, name.lower().replace("_", " "))
             raise ValueError(f"subject_pattern: {what} is not allowed")
@@ -534,6 +549,7 @@ class ExportEntry:
     # Matches whose subject does not fit the pattern, with the fields for
     # their manifest row. They are recorded without downloading the message.
     unmatched: dict[int, dict[str, Any]] = field(default_factory=dict)
+    fetch_failures: dict[int, int] = field(default_factory=dict)
     expires_at: float = 0.0
     batch_size: int = MAX_BATCH
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -623,7 +639,9 @@ def _csv_cell(value: Any) -> str:
     characters is run as a formula when the file is opened.
     """
     text = "" if value is None else str(value)
-    if text[:1] in _FORMULA_LEADS:
+    # A value that itself begins with a quote is quoted too, so reading the
+    # cell back is never ambiguous.
+    if text[:1] in _FORMULA_LEADS or text[:1] == "'":
         return "'" + text
     return text
 
@@ -641,7 +659,7 @@ def _stamp() -> str:
 def _csv_uncell(text: str | None) -> str:
     """Undo ``_csv_cell`` when the manifest is read back."""
     text = text or ""
-    if text[:1] == "'" and text[1:2] in _FORMULA_LEADS:
+    if text[:1] == "'" and (text[1:2] in _FORMULA_LEADS or text[1:2] == "'"):
         return text[1:]
     return text
 
@@ -834,9 +852,14 @@ def _text(value: str) -> str:
     """Text from mail, made safe to encode.
 
     A header can decode to a lone surrogate, which cannot be written to a
-    file name or the manifest; it becomes a replacement character.
+    file name or the manifest; it becomes a replacement character. Control
+    characters become spaces: a NUL in a subject would otherwise make the
+    manifest unreadable for every later run.
     """
-    return value.encode("utf-8", "replace").decode("utf-8")
+    cleaned = value.encode("utf-8", "replace").decode("utf-8")
+    return "".join(
+        " " if ord(ch) < 32 or 127 <= ord(ch) < 160 else ch for ch in cleaned
+    )
 
 
 class _WindowsInterrupted(Exception):
@@ -1266,6 +1289,7 @@ def _export_message(
             folders, filename = render_path(entry.naming, values, name=name, index=index)
             _refuse_reserved(folders, filename)
             parent = _make_folders(entry.save_directory, folders)
+            _refuse_own_file(entry.save_directory, parent / filename)
             status, where = _place(parent / filename, payload, digest, entry.if_exists)
         except OSError as exc:
             progress.counts["errors"] += 1
@@ -1340,6 +1364,40 @@ def _refuse_reserved(folders: tuple[str, ...], filename: str) -> None:
             raise OSError(f"{part!r} is a name the export keeps for itself")
 
 
+def _refuse_own_file(root: Path, target: Path) -> None:
+    """The same guard by identity, for filesystems whose name matching the
+    name check cannot predict (ones that ignore certain characters)."""
+    for name in (MANIFEST_NAME, LOCK_NAME):
+        try:
+            same = os.path.samefile(target, root / name)
+        except OSError:
+            continue  # one of the two does not exist
+        if same:
+            raise OSError(f"{target.name!r} is a file the export keeps for itself")
+
+
+def _require_own_manifest(directory: Path) -> None:
+    """Refuse, before anything is written, a manifest this module did not write."""
+    path = directory / MANIFEST_NAME
+    if not os.path.lexists(path):
+        return
+    descriptor = _open_inside(directory, MANIFEST_NAME, os.O_RDONLY)
+    try:
+        with os.fdopen(descriptor, "r", newline="", encoding="utf-8",
+                       errors="replace") as handle:
+            first = handle.readline()
+            header = next(csv.reader([first]), []) if first else list(MANIFEST_FIELDS)
+    except OSError as exc:
+        raise ExportDirectoryError(
+            f"could not read the manifest: {exc.strerror or exc}"
+        ) from exc
+    if tuple(header) != MANIFEST_FIELDS:
+        raise ExportDirectoryError(
+            f"{MANIFEST_NAME} in the save directory is not a manifest this "
+            f"tool wrote; move it aside and try again"
+        )
+
+
 def _next_batch(entry: ExportEntry, raw_cap: int) -> tuple[list[int], list[int]]:
     """The next UIDs to fetch, and those before them that need no fetch.
 
@@ -1397,7 +1455,10 @@ def _learn_sizes(client: Any, entry: ExportEntry) -> None:
     Without it a message of unknown size would be fetched blind, whatever
     it weighs.
     """
-    unknown = [u for u in entry.remaining[:MAX_BATCH] if entry.sizes.get(u, 0) <= 0]
+    # The next messages that will actually be fetched: those recorded
+    # without a download do not count towards the batch.
+    upcoming = [u for u in entry.remaining if u not in entry.unmatched][:MAX_BATCH]
+    unknown = [u for u in upcoming if entry.sizes.get(u, 0) <= 0]
     if not unknown:
         return
     fetched = client.fetch(unknown, ["RFC822.SIZE"])
@@ -1433,6 +1494,7 @@ def _run(
     # A base64 body is about a third larger than what it carries.
     raw_cap = min(int(max_attachment_bytes * 1.4) + 1024 * 1024, BULK_MESSAGE_BYTES)
     started = clock()
+    in_flight: list[int] = []
     try:
         with connector._session() as client, _socket_timeout(client):
             selected = client.select_folder(entry.mailbox, readonly=True)
@@ -1454,12 +1516,14 @@ def _run(
                     # A large message is the first work of a call, never
                     # added to one that has already used part of its time.
                     break
-                rows = [_unfetched_row(entry, uid, progress) for uid in unfetched]
                 began = clock()
+                in_flight = batch
                 fetched = (
                     client.fetch(batch, ["BODY.PEEK[]", "ENVELOPE", "INTERNALDATE"])
                     if batch else {}
                 )
+                in_flight = []
+                rows = [_unfetched_row(entry, uid, progress) for uid in unfetched]
                 exported = 0
                 for uid in batch:
                     if exported and clock() - started >= time_budget * 2:
@@ -1481,10 +1545,40 @@ def _run(
         raise
     except Exception as exc:  # noqa: BLE001 - reported to the caller
         progress.error = str(exc) or type(exc).__name__
-        if _is_timeout(exc):
-            progress.timed_out = True
-            entry.batch_size = max(1, entry.batch_size // 2)
+        progress.timed_out = _is_timeout(exc)
+        # Smaller next time, whatever went wrong: that is also what narrows
+        # a failure down to the one message causing it.
+        entry.batch_size = max(1, entry.batch_size // 2)
+        if len(in_flight) == 1:
+            _note_fetch_failure(entry, in_flight[0], progress)
     return progress
+
+
+def _note_fetch_failure(entry: ExportEntry, uid: int, progress: _Progress) -> None:
+    """Count a failed fetch of one message; give up on it after a few.
+
+    Without this, a message the server cannot deliver would fail every call
+    and nothing behind it would ever be exported.
+    """
+    failures = entry.fetch_failures.get(uid, 0) + 1
+    entry.fetch_failures[uid] = failures
+    if failures < FETCH_FAILURE_LIMIT or uid not in entry.remaining:
+        return
+    row = {
+        "exported_at": _stamp(),
+        "account": entry.account,
+        "mailbox": entry.mailbox,
+        "uidvalidity": entry.uidvalidity,
+        "uid": uid,
+        "export_key": entry.export_key,
+        "status": "error",
+        "note": f"could not be fetched after {failures} attempts",
+    }
+    with contextlib.suppress(ExportDirectoryError):
+        _append_manifest(entry.save_directory, [row])
+    entry.remaining.remove(uid)
+    progress.counts["errors"] += 1
+    progress.done += 1
 
 
 def commit(
@@ -1518,6 +1612,7 @@ def commit(
             )
         _check_directory(entry.save_directory)
         with _directory_lock(entry.save_directory):
+            _require_own_manifest(entry.save_directory)
             progress = _run(
                 connector, store, preview_id, entry,
                 max_attachment_bytes, time_budget, clock,

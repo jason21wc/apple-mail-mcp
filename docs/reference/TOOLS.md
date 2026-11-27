@@ -771,7 +771,7 @@ preview_attachment_export(
 - It is applied **from the start of the subject** (as if it began with `^`). To match further in, begin it with `.*?`.
 - Subjects are cut to 300 characters first; the pattern may be at most 200.
 - Only plain constructs are accepted: text, character classes, anchors, groups, choices and repeats. Lookahead, lookbehind, backreferences, atomic groups and possessive repeats are refused.
-- A repeat may not contain another repeat or a choice (`(a+)+`, `(a|b)*`).
+- A repeat may not contain another repeat or a choice (`(a+)+`, `(a|b)*`), and groups may be nested at most four deep.
 - The number of ways the pattern could match is bounded: one or two open-ended repeats (`.*`, `.+?`, `\w+`) are fine; a third, or a long row of optional parts or choices, is refused with a message saying so.
 - A group the templates do not use may be optional or empty. A group they do use must match something, or the message is recorded `pattern_no_match`.
 
@@ -845,6 +845,7 @@ So a message with a failed attachment is tried again, deleting a file exports it
 - Messages over 16 MB are not downloaded by a bulk export: one fetch cannot be interrupted, and a larger one could outlast the client. They are recorded `too_large`; use `save_attachments` for them.
 - The server's per-attachment byte cap also applies (`APPLE_MAIL_MCP_MAX_ATTACHMENT_BYTES`, default 100 MB).
 - At most 200 attachments are exported from one message.
+- A message whose own fetch fails three times is recorded as an `error` and passed over, so it cannot hold up the messages behind it.
 - A call starts no new batch after about 20 seconds, and stops writing a batch it has fetched after about 40. One stalled read can add up to 20 seconds before it times out.
 - Not registered when the server runs with `--read-only` (it writes files); the preview is.
 
@@ -964,7 +965,7 @@ Save attachments from a message to a directory.
 | `message_id` | string | Yes | - | Message ID to save attachments from |
 | `save_directory` | string | Yes | - | Directory path to save attachments. `~` is expanded. Must already exist — the tool does not create it (`directory_not_found` otherwise). |
 | `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
-| `output_filename` | string | No | None | **Fork extension.** Save under this name instead of the attachment's own. The name is kept as written, spaces and non-English letters included (`Daily Closing Report 2026.05.04.txt` stays exactly that). Only what could move the file or break a file name is removed: directory parts (`../../x` becomes `x`), `\` and `:`, control characters, and leading dots. Requires exactly one entry in `attachment_indices`. For many messages at once use `preview_attachment_export` / `commit_attachment_export`. |
+| `output_filename` | string | No | None | **Fork extension.** Save under this name instead of the attachment's own. The name is kept as written, spaces and non-English letters included (`Daily Closing Report 2026.05.04.txt` stays exactly that). Only what could move the file or break a file name is removed: directory parts (`../../x` becomes `x`), `\` and `:`, control and invisible formatting characters (which can make a name display as something it is not), and leading dots; runs of blanks become one space. Requires exactly one entry in `attachment_indices`. For many messages at once use `preview_attachment_export` / `commit_attachment_export`. |
 | `overwrite` | bool | No | `false` | Only meaningful with `output_filename`. Default is **no-clobber**: an existing destination is left untouched and the call returns `error_type: "already_exists"`. `true` replaces it atomically. |
 | `account` | string | No | None | Mail.app account name or UUID. With `mailbox`, takes the IMAP fast path (one fetch). Pass the same values you read the message with so attachment ordering matches. |
 | `mailbox` | string | No | None | Folder the message lives in (e.g. "INBOX"), used with `account` for the IMAP fast path. |

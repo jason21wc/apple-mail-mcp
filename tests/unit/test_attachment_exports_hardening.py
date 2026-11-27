@@ -87,6 +87,36 @@ class TestReservedNames:
             _commit(conn, store, preview["preview_id"])
         assert (tmp_path / ax.MANIFEST_NAME).read_bytes() == foreign
 
+    def test_a_foreign_manifest_is_refused_before_any_file_is_written(
+        self, tmp_path: Path
+    ) -> None:
+        conn = FakeConnector(StrictClient(_reports(2)))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path)
+        (tmp_path / ax.MANIFEST_NAME).write_bytes(b"a,b\r\n1,2\r\n")
+        with pytest.raises(ax.ExportDirectoryError):
+            _commit(conn, store, preview["preview_id"])
+        assert _files(tmp_path) == []
+        assert not any("BODY.PEEK[]" in parts for _, parts in conn.client.fetches)
+
+    def test_a_name_the_filesystem_treats_as_the_manifest_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """Some filesystems ignore certain characters when comparing names,
+        which a check on the name alone cannot predict. A hard link stands
+        in for that here: a different name, the same file."""
+        messages = {1: _message(1, SUBJECT, attachments=[("alias.csv", b"forged")])}
+        conn = FakeConnector(StrictClient(messages))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path, naming=_plain(), if_exists="overwrite")
+        ax._append_manifest(tmp_path, [{"status": "saved", "uid": 99}])
+        os.link(tmp_path / ax.MANIFEST_NAME, tmp_path / "alias.csv")
+        before = (tmp_path / ax.MANIFEST_NAME).read_bytes()
+        out = _commit(conn, store, preview["preview_id"])
+        assert out["errors"] == 1
+        assert out["overwritten"] == 0
+        assert (tmp_path / ax.MANIFEST_NAME).read_bytes().startswith(before)
+
     @pytest.mark.parametrize("name", [ax.MANIFEST_NAME, ax.LOCK_NAME])
     def test_own_files_are_never_opened_through_a_symlink(
         self, tmp_path: Path, name: str
@@ -146,6 +176,18 @@ class TestPatternCost:
     )
     def test_ordinary_patterns_are_accepted(self, pattern: str) -> None:
         ax.build_naming(filename_template="{name}", subject_pattern=pattern)
+
+    def test_deep_nesting_is_refused(self) -> None:
+        """The bound counts ways to match, not the work each takes. Seventy
+        nested groups made one subject take seconds while staying under it."""
+        deep = ".?" * 16 + "(?:" + "(" * 78 + "." + ")" * 78 + "){284}Z"
+        with pytest.raises(ValueError, match="nested"):
+            ax.build_naming(filename_template="{name}", subject_pattern=deep)
+        with pytest.raises(ValueError, match="nested"):
+            ax.build_naming(
+                filename_template="{name}", subject_pattern="(((((a)))))",
+            )
+        ax.build_naming(filename_template="{name}", subject_pattern="(((a)))")
 
     def test_the_worst_accepted_pattern_is_still_quick(self) -> None:
         """Two open-ended repeats is the most that is allowed. On a subject
@@ -271,6 +313,64 @@ class TestOneMessageCannotStopTheExport:
         assert "empty body" in row["note"]
         assert row["message_id"]  # still says which message
 
+    def test_a_nul_in_a_subject_does_not_poison_the_manifest(
+        self, tmp_path: Path
+    ) -> None:
+        """A NUL written to the manifest made every later read of it fail."""
+        messages = _reports(2)
+        messages[1]["subject"] = "Credit Card\x00 Activity\x07 04May26 from x"
+        out, _, _ = _export(tmp_path, messages)
+        assert out["saved"] == 2
+        raw = (tmp_path / ax.MANIFEST_NAME).read_bytes()
+        assert b"\x00" not in raw and b"\x07" not in raw
+        again = _preview(FakeConnector(StrictClient(messages)), ax.ExportStore(), tmp_path)
+        assert "manifest_unreadable" not in again
+        assert again["already_exported"] == 2
+
+    def test_a_message_the_server_will_not_deliver_is_given_up_on(
+        self, tmp_path: Path
+    ) -> None:
+        """Its fetch failed on every call, the batch never advanced, and
+        nothing behind it was ever exported."""
+        conn = FakeConnector(StrictClient(_reports(4)))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path)
+        pid = preview["preview_id"]
+        real_fetch = conn.client.fetch
+
+        def fetch(uids: list[int], parts: list[str]) -> Any:
+            if "BODY.PEEK[]" in parts and 2 in uids:
+                raise OSError("connection reset")
+            return real_fetch(uids, parts)
+
+        conn.client.fetch = fetch  # type: ignore[method-assign]
+        outcomes = []
+        for _ in range(12):
+            out = _commit(conn, store, pid)
+            outcomes.append(out["outcome"])
+            if out["outcome"] == "complete":
+                break
+        assert outcomes[-1] == "complete"
+        assert len(_files(tmp_path)) == 3
+        bad = [r for r in _manifest(tmp_path) if r["status"] == "error"]
+        assert [r["uid"] for r in bad] == ["2"]
+        assert "could not be fetched" in bad[0]["note"]
+
+    def test_a_failed_call_does_not_count_rows_it_never_wrote(
+        self, tmp_path: Path
+    ) -> None:
+        messages = {1: _message(1, "Welcome to the portal"), **{
+            u + 1: m for u, m in _reports(2).items()
+        }}
+        conn = FakeConnector(StrictClient(messages))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path)
+        conn.client.fail_fetch_on = 1
+        out = _commit(conn, store, preview["preview_id"])
+        assert out["outcome"] == "failed"
+        assert out["pattern_no_match"] == 0
+        assert out["messages_done"] == 0
+
     def test_a_message_built_with_thousands_of_parts_is_capped(
         self, tmp_path: Path
     ) -> None:
@@ -356,6 +456,26 @@ class TestLargeMessages:
             i for i, p in enumerate(parts) if "BODY.PEEK[]" in p
         )
         assert all(size > 0 for size in entry.sizes.values())
+
+    def test_sizes_are_read_for_the_messages_actually_about_to_be_fetched(
+        self, tmp_path: Path
+    ) -> None:
+        """Messages recorded without a download sat in front and used up the
+        look-ahead, so the unsized ones behind them were fetched blind."""
+        messages = {u: _message(u, "Welcome to the portal") for u in range(1, 13)}
+        for uid, row in _reports(3).items():
+            messages[20 + uid] = row
+        conn = FakeConnector(StrictClient(messages))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path)
+        entry = store.get(preview["preview_id"])
+        for uid in (21, 22, 23):
+            entry.sizes[uid] = 0
+        out = _commit(conn, store, preview["preview_id"])
+        assert out["saved"] == 3
+        assert out["pattern_no_match"] == 12
+        assert ([21, 22, 23], ["RFC822.SIZE"]) in conn.client.fetches
+        assert all(entry.sizes[u] > 0 for u in (21, 22, 23))
 
     def test_writing_that_runs_long_leaves_the_rest_for_the_next_call(
         self, tmp_path: Path
@@ -487,6 +607,26 @@ class TestResumeIsNotFooled:
         _export(tmp_path, messages)
         assert _manifest(tmp_path)[0]["message_id"].startswith(f"'{lead}")
         again = _preview(FakeConnector(StrictClient(messages)), ax.ExportStore(), tmp_path)
+        assert again["already_exported"] == 1
+
+    @pytest.mark.parametrize(
+        "value", ["=x", "'=x", "''=x", "'", "''", "'plain", "plain", "-1", "'-1", ""]
+    )
+    def test_a_cell_reads_back_as_exactly_what_was_written(self, value: str) -> None:
+        """A value that itself began with a quote and an equals sign used to
+        read back without its quote, as a different value."""
+        assert ax._csv_uncell(ax._csv_cell(value)) == value
+
+    def test_an_attachment_name_beginning_with_a_quote_still_resumes(
+        self, tmp_path: Path
+    ) -> None:
+        messages = {1: _message(1, SUBJECT, attachments=[("'=x.pdf", b"x")])}
+        _export(tmp_path, messages, naming=_plain())
+        assert _files(tmp_path) == ["'=x.pdf"]
+        again = _preview(
+            FakeConnector(StrictClient(messages)), ax.ExportStore(), tmp_path,
+            naming=_plain(),
+        )
         assert again["already_exported"] == 1
 
     def test_a_saved_path_that_looks_like_a_formula_still_resumes(
