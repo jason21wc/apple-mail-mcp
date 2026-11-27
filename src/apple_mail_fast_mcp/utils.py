@@ -247,6 +247,11 @@ def make_body_safe(content: str, max_bytes: int) -> tuple[str, bool, int]:
 
 _MAX_FILENAME_BYTES = 255
 
+# Characters that change the direction text is displayed in.
+_BIDI_CONTROLS = frozenset(
+    "؜‎‏‪‫‬‭‮⁦⁧⁨⁩"
+)
+
 
 def sanitize_output_filename(filename: str) -> str:
     """Make a caller-chosen file name safe without mangling it. Fork-local.
@@ -284,6 +289,9 @@ def sanitize_output_filename(filename: str) -> str:
     name = "".join(
         "_" if ch in "\\:/" or unicodedata.category(ch) == "Cc" else ch
         for ch in name
+        # Direction overrides are dropped: they make "invoice[RLO]fdp.exe"
+        # display as "invoiceexe.pdf".
+        if ch not in _BIDI_CONTROLS
     )
     name = name.lstrip(". ").rstrip(". ")
 

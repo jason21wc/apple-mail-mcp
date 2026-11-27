@@ -61,6 +61,16 @@ class TestSanitizeOutputFilename:
         assert char not in out
         assert out.startswith("my") and out.endswith("report.txt")
 
+    def test_direction_overrides_are_removed(self) -> None:
+        """With a right-to-left override, ``invoice<RLO>fdp.exe`` is shown as
+        ``invoiceexe.pdf``: the name must not be able to lie about its type."""
+        assert sanitize_output_filename("invoice‮fdp.exe") == "invoicefdp.exe"
+        assert sanitize_output_filename("a‎‏b⁦c⁩.txt") == "abc.txt"
+
+    def test_joiners_that_scripts_and_emoji_need_are_kept(self) -> None:
+        name = "می‌خواهم.txt"  # zero-width non-joiner, part of the word
+        assert sanitize_output_filename(name) == name
+
     def test_leading_dots_are_stripped_so_nothing_is_hidden(self) -> None:
         assert sanitize_output_filename(".hidden report.txt") == "hidden report.txt"
         assert sanitize_output_filename("...x") == "x"

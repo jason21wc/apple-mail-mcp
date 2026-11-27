@@ -123,6 +123,36 @@ class TestPreviewTool:
         out = await _preview(tmp_path)
         assert out["error_type"] == "imap_required"
 
+    async def test_a_bad_argument_is_reported_before_imap_is_even_tried(
+        self, backend: FakeConnector, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The connector is built on first use, after validation, so the
+        caller learns about the argument rather than a missing password."""
+        built: list[str] = []
+
+        def no_imap(account: str) -> Any:
+            built.append(account)
+            raise MailKeychainEntryNotFoundError("no password stored")
+
+        monkeypatch.setattr(server, "_export_connector", no_imap)
+        out = await _preview(tmp_path, if_exists="clobber")
+        assert out["error_type"] == "validation_error"
+        assert built == []
+
+    async def test_the_connector_is_built_once_per_call(
+        self, backend: FakeConnector, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built: list[str] = []
+
+        def counting(account: str) -> Any:
+            built.append(account)
+            return backend
+
+        monkeypatch.setattr(server, "_export_connector", counting)
+        out = await _preview(tmp_path)
+        assert out["success"] is True
+        assert built == ["iCloud"]
+
     async def test_test_mode_blocks_a_real_account(
         self, backend: FakeConnector, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -170,6 +200,16 @@ class TestCommitTool:
         assert out["saved"] == 4
         assert out["remaining"] == 4
         assert out["server_slow"] is True
+
+    async def test_a_problem_with_the_directory_is_not_called_an_imap_error(
+        self, backend: FakeConnector, tmp_path: Path
+    ) -> None:
+        preview = await _preview(tmp_path)
+        (tmp_path / attachment_exports.MANIFEST_NAME).write_bytes(b"not,ours\r\n1,2\r\n")
+        out = await server.commit_attachment_export(preview["preview_id"], max_count=10)
+        assert out["success"] is False
+        assert out["error_type"] == "directory_error"
+        assert "not a manifest" in out["error"]
 
     async def test_audit_log_failure_does_not_hide_the_result(
         self, backend: FakeConnector, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

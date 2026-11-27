@@ -2040,6 +2040,44 @@ def _export_connector(account: str) -> Any:
     return query_moves.connector_for(mail, account)
 
 
+class _LazyExportConnector:
+    """Builds the real connector on first use.
+
+    Building it asks Mail.app for the account and reads the Keychain, which
+    can block. Doing that on first use puts it inside the worker thread and
+    after the arguments have been validated, so a bad argument is reported
+    as that rather than as a missing password.
+    """
+
+    def __init__(self, account: str) -> None:
+        self._account = account
+        self._real: Any = None
+
+    def _resolved(self) -> Any:
+        if self._real is None:
+            self._real = _export_connector(self._account)
+        return self._real
+
+    def _session(self) -> Any:
+        return self._resolved()._session()
+
+    @property
+    def _host(self) -> Any:
+        return getattr(self._resolved(), "_host", None)
+
+    @property
+    def _email(self) -> Any:
+        return getattr(self._resolved(), "_email", None)
+
+
+def _export_error(operation: str, exc: Exception) -> dict[str, Any]:
+    """Like ``_query_move_error``, with the save directory's own failures."""
+    if isinstance(exc, attachment_exports.ExportDirectoryError):
+        logger.error("%s failed (directory_error): %s", operation, exc)
+        return {"success": False, "error": str(exc), "error_type": "directory_error"}
+    return _query_move_error(operation, exc)
+
+
 @_tool(
     {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
@@ -2092,10 +2130,13 @@ async def preview_attachment_export(
         subfolder_template: Optional folders beneath save_directory, using
             the same tokens, separated by "/", for example
             "{received:%Y}/{sender}".
-        subject_pattern: A regular expression applied to each subject; its
-            named groups become tokens. A group named ``date`` feeds
+        subject_pattern: A regular expression applied to each subject from
+            its start (begin it with ``.*?`` to match further in); its named
+            groups become tokens. A group named ``date`` feeds
             {subject_date}. A message whose subject does not match is not
-            exported and not guessed at.
+            exported and not guessed at. Keep it simple: lookarounds,
+            backreferences, a repeat inside a repeat, and more than two
+            open-ended repeats (``.*``, ``.+``) are refused.
         subject_date_format: Layout of the ``date`` group, for example
             "%d%b%y" for 04May26.
         if_exists: What to do when a different file is already at the target
@@ -2160,7 +2201,7 @@ async def preview_attachment_export(
         )
         result = await asyncio.to_thread(
             attachment_exports.preview,
-            _export_connector(account),
+            _LazyExportConnector(account),
             _export_store,
             account=account,
             mailbox=mailbox,
@@ -2180,7 +2221,7 @@ async def preview_attachment_export(
             has_content=bool(result.get("sample_paths") or result.get("senders")),
         )
     except Exception as e:
-        return _query_move_error(operation, e)
+        return _export_error(operation, e)
 
 
 def _export_directory(save_directory: str) -> tuple[dict[str, Any] | None, Path]:
@@ -2270,7 +2311,7 @@ async def commit_attachment_export(preview_id: str, max_count: int) -> dict[str,
 
         result = await asyncio.to_thread(
             attachment_exports.commit,
-            _export_connector(entry.account),
+            _LazyExportConnector(entry.account),
             _export_store,
             preview_id=preview_id,
             max_count=max_count,
@@ -2296,7 +2337,7 @@ async def commit_attachment_export(preview_id: str, max_count: int) -> dict[str,
             return {"success": False, "error_type": "imap_error", **result}
         return {"success": True, **result}
     except Exception as e:
-        return _query_move_error(operation, e)
+        return _export_error(operation, e)
 
 
 @_tool(

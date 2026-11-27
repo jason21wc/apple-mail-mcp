@@ -687,7 +687,7 @@ Use this with `commit_attachment_export` to save the attachments of hundreds or 
 - `attachment_name_contains` (string, optional): Only attachments whose own name contains this, any case (for example `.pdf`).
 - `filename_template` (string, optional, default `{name}`): Name for each saved file. See tokens below.
 - `subfolder_template` (string, optional): Folders beneath `save_directory`, parts separated by `/`, using the same tokens.
-- `subject_pattern` (string, optional): A regular expression applied to each subject. Its named groups become tokens; a group named `date` feeds `{subject_date}`.
+- `subject_pattern` (string, optional): A regular expression applied to each subject, from its start. Its named groups become tokens; a group named `date` feeds `{subject_date}`. See "Pattern rules" below.
 - `subject_date_format` (string, optional): Layout of the `date` group, for example `%d%b%y` for `04May26`.
 - `if_exists` (string, optional, default `skip`): What to do when a **different** file is already at the target name: `skip` (not written, counted as a name collision), `suffix` (saved as `name (2).ext`), or `overwrite`. A file with identical content is never written twice, whichever is chosen.
 
@@ -764,7 +764,23 @@ preview_attachment_export(
 - `account_not_found`, `not_found`: account or mailbox not found
 - `imap_error`: IMAP failed (there is no fallback)
 
-**Pattern limits.** `subject_pattern` comes from the caller, never from mail. It may be at most 200 characters, and lookahead, lookbehind, backreferences, and a repeat or a choice inside a repeat (for example `(a+)+`) are refused, because such patterns can take extremely long on a crafted subject. Subjects are cut to 300 characters before matching.
+- `directory_error`: a file in `save_directory` that the export needs (its manifest or lock) cannot be used
+
+**Pattern rules.** `subject_pattern` comes from the caller, never from mail, but it is run against subjects anyone can send, and Python's regular expressions have no timeout. So:
+
+- It is applied **from the start of the subject** (as if it began with `^`). To match further in, begin it with `.*?`.
+- Subjects are cut to 300 characters first; the pattern may be at most 200.
+- Only plain constructs are accepted: text, character classes, anchors, groups, choices and repeats. Lookahead, lookbehind, backreferences, atomic groups and possessive repeats are refused.
+- A repeat may not contain another repeat or a choice (`(a+)+`, `(a|b)*`).
+- The number of ways the pattern could match is bounded: one or two open-ended repeats (`.*`, `.+?`, `\w+`) are fine; a third, or a long row of optional parts or choices, is refused with a message saying so.
+- A group the templates do not use may be optional or empty. A group they do use must match something, or the message is recorded `pattern_no_match`.
+
+**Other notes.**
+
+- `filename_template` is a file name, not a path: `/` and `\` in it are an error. Folders go in `subfolder_template`.
+- `{received}` and `{sent}` are in this machine's local time.
+- `manifest_unreadable: true` means a file named `export_manifest.csv` is there but is not one this tool wrote (or cannot be read); nothing is treated as already exported, and the commit will refuse until it is moved aside.
+- `windows_unavailable: true` can accompany `over_limit` when the date ranges could not be worked out.
 
 ---
 
@@ -807,20 +823,29 @@ Downloads the previewed messages a slice at a time and writes their attachments 
 - `outcome`: `"more"` (call again), `"complete"`, or `"failed"` (`error` says why; the batch in flight was not recorded and the next call fetches it again).
 - `saved`, `renamed`, `overwritten`: files written. `identical_existing`: the same content was already there, so nothing was written.
 - `name_collisions`: a **different** file was already at that name and `if_exists` was `skip`. It was not written. Check this on every run; the manifest rows with status `name_collision` say which.
-- `no_matching_attachment`, `pattern_no_match`, `too_large`, `missing` (gone since the preview), `errors` (could not be written): messages or attachments that produced no file. Each has a manifest row.
+- `no_matching_attachment`, `pattern_no_match`, `too_large`, `missing` (gone since the preview), `errors`: messages or attachments that produced no file. Each has a manifest row. `errors` covers anything that could not be exported: a file that could not be written, a message that could not be parsed or came back with an empty body, a name the export keeps for itself, or more than 200 attachments on one message (the first 200 are exported).
 - `server_slow: true` with `retry_after_seconds` after a timeout: wait before calling again.
 
-**The manifest.** `export_manifest.csv` in `save_directory`, one row per attachment (or one per message that produced no file): `exported_at, account, mailbox, uidvalidity, uid, message_id, subject, date_received, sender, attachment_index, attachment_name, saved_path, size, sha256, status, note`. `saved_path` is relative to `save_directory`. To check an export, compare the rows whose status is `saved`, `renamed`, `overwritten` or `identical_existing` against the files (size and sha256). A cell that begins with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'`, so a subject cannot run as a formula when the file is opened in a spreadsheet.
+**The manifest.** `export_manifest.csv` in `save_directory`, one row per attachment (or one per message that produced no file): `exported_at, account, mailbox, uidvalidity, uid, message_id, subject, date_received, sender, attachment_index, attachment_name, saved_path, size, sha256, status, note, export_key`. `saved_path` is relative to `save_directory`. `export_key` is a short fingerprint of the naming and filter settings the row was made with. To check an export, compare the rows whose status is `saved`, `renamed`, `overwritten` or `identical_existing` against the files (size and sha256). A cell that begins with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'`, so a subject cannot run as a formula when the file is opened in a spreadsheet.
 
-**Resuming.** A server restart drops pending previews (they are held in memory). Preview again with the same arguments: with `if_exists="skip"` the preview leaves out every message the manifest shows as exported whose files are still present at the recorded size, so only what is left is downloaded. The files are the authority; the manifest only says which message made which file. It is matched by Message-ID, so it still works after the mail has been moved to another mailbox. Delete a file and its message is exported again. To export the same messages under different names, use a different directory.
+**Resuming.** A server restart drops pending previews (they are held in memory). Preview again with the same arguments: with `if_exists="skip"` the preview leaves out messages an earlier run finished, so only what is left is downloaded. The files are the authority; the manifest only says which message made which file. A message is left out only when, in its most recent manifest rows made with the **same naming and filter settings**:
 
-**Where files can go.** Only inside `save_directory`. Each folder and file name is cleaned on its own; folders are created one level at a time and never through a symlink; a path that resolves outside the directory is refused and recorded as an error.
+- at least one file was saved, and every such file is still inside the directory at the recorded size;
+- nothing was left undone (no `error` or `name_collision` row);
+- the Message-ID **and** the received time both match (a sender can choose a Message-ID, not the time the server received it).
+
+So a message with a failed attachment is tried again, deleting a file exports its message again, and changing a template or the attachment filter exports everything again under the new settings. Matching does not depend on the mailbox, so it still works after the mail has been moved.
+
+**Where files can go.** Only inside `save_directory`. Each folder and file name is cleaned on its own; folders are created one level at a time and never through a symlink; a path that resolves outside the directory is refused and recorded as an error. An attachment cannot take the manifest's or the lock file's name (in any letter case); that is recorded as an error too. The manifest and lock are never opened through a symlink.
 
 **Limits:**
 
 - 2,000 messages per preview; one commit at a time per preview and per save directory (`commit_in_progress`).
-- Up to 10 messages or about 8 MB per fetch; the batch shrinks after a slow one and grows back after fast ones.
-- The server's per-attachment byte cap applies (`APPLE_MAIL_MCP_MAX_ATTACHMENT_BYTES`, default 100 MB); larger ones are recorded `too_large`.
+- Up to 10 messages or about 8 MB per fetch; the batch shrinks after a slow one and grows back after fast ones. A message over 4 MB is fetched on its own at the start of a call.
+- Messages over 16 MB are not downloaded by a bulk export: one fetch cannot be interrupted, and a larger one could outlast the client. They are recorded `too_large`; use `save_attachments` for them.
+- The server's per-attachment byte cap also applies (`APPLE_MAIL_MCP_MAX_ATTACHMENT_BYTES`, default 100 MB).
+- At most 200 attachments are exported from one message.
+- A call starts no new batch after about 20 seconds, and stops writing a batch it has fetched after about 40. One stalled read can add up to 20 seconds before it times out.
 - Not registered when the server runs with `--read-only` (it writes files); the preview is.
 
 **Error Types:**
@@ -829,7 +854,8 @@ Downloads the previewed messages a slice at a time and writes their attachments 
 - `max_count_exceeded`: the preview holds more than `max_count`
 - `selection_stale`: the mailbox was rebuilt, or the account now points at a different server
 - `commit_in_progress`: another commit is working on this preview or this directory
-- `validation_error`: `save_directory` no longer exists
+- `validation_error`: `save_directory` no longer exists or cannot be written to
+- `directory_error`: the manifest or lock file in `save_directory` cannot be used (for example another file has the manifest's name)
 - `imap_required`, `account_not_found`, `not_found`: as for the preview
 - `imap_error`: IMAP failed part-way (`outcome: "failed"`, with the counts so far)
 

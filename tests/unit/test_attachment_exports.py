@@ -90,6 +90,8 @@ class StrictClient:
         self.searches: list[list[Any]] = []
         self.fail_fetch_on: int | None = None  # 1-based body-fetch number
         self._body_fetches = 0
+        self.hide_size_once = False  # the first size read reports nothing
+        self.empty_body: set[int] = set()  # UIDs answered with no body
 
     def select_folder(self, name: str, readonly: bool = False) -> dict[bytes, Any]:
         self.selected.append((name, readonly))
@@ -120,11 +122,13 @@ class StrictClient:
                 )
             if "INTERNALDATE" in parts:
                 data[b"INTERNALDATE"] = row["received"]
-            if "RFC822.SIZE" in parts:
+            if "RFC822.SIZE" in parts and not self.hide_size_once:
                 data[b"RFC822.SIZE"] = len(row["raw"])
             if "BODY.PEEK[]" in parts:
-                data[b"BODY[]"] = row["raw"]
+                data[b"BODY[]"] = b"" if uid in self.empty_body else row["raw"]
             out[uid] = data
+        if "RFC822.SIZE" in parts:
+            self.hide_size_once = False
         return out
 
 

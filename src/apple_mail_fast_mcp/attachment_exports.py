@@ -135,7 +135,30 @@ MANIFEST_FIELDS = (
     "exported_at", "account", "mailbox", "uidvalidity", "uid", "message_id",
     "subject", "date_received", "sender", "attachment_index",
     "attachment_name", "saved_path", "size", "sha256", "status", "note",
+    "export_key",
 )
+
+_FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
+"""A spreadsheet runs a cell that begins with one of these as a formula."""
+
+# Statuses that mean a message still has something left to do.
+_UNFINISHED_STATUSES = frozenset({"error", "name_collision"})
+
+BULK_MESSAGE_BYTES = 16 * 1024 * 1024
+"""Largest message a bulk export downloads. One fetch cannot be interrupted,
+and at a few megabits a second anything larger risks outlasting the client.
+Larger messages are recorded ``too_large``; use ``save_attachments`` for them."""
+
+MAX_ATTACHMENTS_PER_MESSAGE = 200
+"""Most attachments exported from one message."""
+
+PATTERN_COST_LIMIT = 100_000
+"""Most ways ``subject_pattern`` may be able to match one subject, by a
+worst-case estimate. See ``_pattern_cost``."""
+
+SOLO_MESSAGE_BYTES = 4 * 1024 * 1024
+"""A message above this is fetched on its own, as the first work of a call,
+so the time it takes is not added to a call that is already part-way."""
 
 IF_EXISTS = ("skip", "suffix", "overwrite")
 
@@ -181,6 +204,7 @@ class Naming:
     subfolders: tuple[_Template, ...]
     pattern: re.Pattern[str] | None
     date_format: str | None
+    source: tuple[str, ...] = ()  # the options as given, for ``export_key``
 
     @property
     def tokens(self) -> frozenset[str]:
@@ -264,28 +288,58 @@ def _repeats(op: Any, value: Any) -> bool:
     return False
 
 
-def _check_pattern_shape(items: Any, inside_repeat: bool = False) -> None:
-    """Refuse the constructs that make a pattern take exponential time."""
+_PLAIN_NODES = frozenset({"LITERAL", "NOT_LITERAL", "ANY", "IN", "AT"})
+_NODE_NAMES = {
+    "ASSERT": "lookahead and lookbehind",
+    "ASSERT_NOT": "lookahead and lookbehind",
+    "GROUPREF": "a backreference",
+    "GROUPREF_EXISTS": "a conditional group",
+    "ATOMIC_GROUP": "an atomic group",
+    "POSSESSIVE_REPEAT": "a possessive repeat",
+}
+
+
+def _pattern_cost(items: Any) -> int:
+    """A worst-case count of the ways a pattern can match one subject.
+
+    Python's ``re`` backtracks and has no timeout, so a pattern is accepted
+    only if this bound is small. Only plain constructs are allowed (text,
+    character classes, anchors, groups, choices, repeats); anything else is
+    refused by name. A repeat may not contain another repeat or a choice.
+    Each variable repeat multiplies the bound by the number of lengths it
+    can take (an open-ended one by the length a subject is cut to), and
+    each choice by its number of alternatives. So ``.+?`` is fine, two
+    open-ended repeats are fine, and ``a*a*a*`` or a row of optional groups
+    is refused. The pattern is applied from the start of the subject, which
+    is what keeps this bound from being multiplied again by every position.
+    """
+    cost = 1
     for op, value in items:
         name = str(op)
-        if name in ("ASSERT", "ASSERT_NOT"):
-            raise ValueError("subject_pattern: lookahead and lookbehind are not allowed")
-        if name in ("GROUPREF", "GROUPREF_EXISTS"):
-            raise ValueError("subject_pattern: backreferences are not allowed")
-        if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
-            _low, high, inner = value
-            wide = high > 1
-            if wide and (_has_repeat(inner) or any(str(o) == "BRANCH" for o, _ in _flat(inner))):
+        if name in ("MAX_REPEAT", "MIN_REPEAT"):
+            low, high, inner = value
+            if _has_repeat(inner) or any(str(o) == "BRANCH" for o, _ in _flat(inner)):
                 raise ValueError(
                     "subject_pattern: a repeat inside a repeat (or a choice "
                     "inside a repeat) is not allowed; it can take far too long"
                 )
-            _check_pattern_shape(inner, inside_repeat or wide)
+            _pattern_cost(inner)  # still checks what the repeat contains
+            if low != high:
+                cost *= max(1, min(int(high), SUBJECT_LIMIT) - int(low) + 1)
         elif name == "SUBPATTERN":
-            _check_pattern_shape(value[3], inside_repeat)
+            cost *= _pattern_cost(value[3])
         elif name == "BRANCH":
-            for branch in value[1]:
-                _check_pattern_shape(branch, inside_repeat)
+            cost *= max(1, sum(_pattern_cost(branch) for branch in value[1]))
+        elif name not in _PLAIN_NODES:
+            what = _NODE_NAMES.get(name, name.lower().replace("_", " "))
+            raise ValueError(f"subject_pattern: {what} is not allowed")
+        if cost > PATTERN_COST_LIMIT:
+            raise ValueError(
+                "subject_pattern could take far too long on an awkward "
+                "subject: use fewer open-ended repeats (such as .* or +), "
+                "optional parts and choices. One or two are fine."
+            )
+    return cost
 
 
 def _flat(items: Any) -> Iterator[tuple[Any, Any]]:
@@ -302,7 +356,7 @@ def _compile_pattern(pattern: str) -> re.Pattern[str]:
         raise ValueError(f"subject_pattern is longer than {PATTERN_LIMIT} characters")
     try:
         compiled = re.compile(pattern)
-        _check_pattern_shape(_pattern_tree(pattern))
+        _pattern_cost(_pattern_tree(pattern))
     except re.error as exc:
         raise ValueError(f"subject_pattern is not a valid pattern: {exc}") from exc
     clash = (set(compiled.groupindex) & (_TEXT_TOKENS | _DATE_TOKENS)) - {"date"}
@@ -324,6 +378,11 @@ def build_naming(
     pattern = _compile_pattern(subject_pattern) if subject_pattern is not None else None
     groups = frozenset(pattern.groupindex) - {"date"} if pattern else frozenset()
 
+    if "/" in filename_template or "\\" in filename_template:
+        raise ValueError(
+            "filename_template is a file name, not a path; put folders in "
+            "subfolder_template"
+        )
     filename = _parse_template(filename_template, "filename_template", groups)
     subfolders: list[_Template] = []
     if subfolder_template is not None:
@@ -334,7 +393,13 @@ def build_naming(
                     "folder names: no leading slash, no empty part, no . or .."
                 )
             subfolders.append(_parse_template(part, "subfolder_template", groups))
-    naming = Naming(filename, tuple(subfolders), pattern, subject_date_format)
+    naming = Naming(
+        filename, tuple(subfolders), pattern, subject_date_format,
+        source=(
+            filename_template, subfolder_template or "",
+            subject_pattern or "", subject_date_format or "",
+        ),
+    )
 
     if "subject_date" in naming.tokens:
         if pattern is None or "date" not in pattern.groupindex:
@@ -386,12 +451,20 @@ def message_values(
         "sent": sent,
     }
     if naming.pattern is not None:
-        match = naming.pattern.search(subject)
+        # From the start of the subject, not anywhere in it: see _pattern_cost.
+        match = naming.pattern.match(subject)
         if match is None:
             return None
+        used = naming.tokens
         for group, text in match.groupdict().items():
-            if text is None:
-                return None
+            needed = group in used or (group == "date" and "subject_date" in used)
+            if text is None or not text.strip():
+                # A group the names depend on gave nothing: no export. One
+                # the templates never use (an optional group, the other side
+                # of a choice) is simply ignored.
+                if needed:
+                    return None
+                continue
             if group == "date":
                 if naming.date_format:
                     try:
@@ -458,9 +531,28 @@ class ExportEntry:
     naming: Naming
     attachment_name_contains: str | None
     if_exists: str
+    # Matches whose subject does not fit the pattern, with the fields for
+    # their manifest row. They are recorded without downloading the message.
+    unmatched: dict[int, dict[str, Any]] = field(default_factory=dict)
     expires_at: float = 0.0
     batch_size: int = MAX_BATCH
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    @property
+    def export_key(self) -> str:
+        return export_key(self.naming, self.attachment_name_contains)
+
+
+def export_key(naming: Naming, attachment_name_contains: str | None) -> str:
+    """A short fingerprint of the naming and filter settings.
+
+    Written on every manifest row. A rerun only trusts rows made with the
+    same settings, so changing a template exports everything again instead
+    of skipping it.
+    """
+    wanted = (attachment_name_contains or "").strip().casefold()
+    text = "\x1f".join((*naming.source, wanted))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
 class ExportStore:
@@ -531,17 +623,54 @@ def _csv_cell(value: Any) -> str:
     characters is run as a formula when the file is opened.
     """
     text = "" if value is None else str(value)
-    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+    if text[:1] in _FORMULA_LEADS:
         return "'" + text
     return text
+
+
+def _stamp() -> str:
+    """When a row was written, to the microsecond.
+
+    All rows of one message from one run share a stamp, and a later run of
+    the same message has a later one: that is how a rerun tells the most
+    recent attempt from older ones, even seconds apart.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _csv_uncell(text: str | None) -> str:
+    """Undo ``_csv_cell`` when the manifest is read back."""
+    text = text or ""
+    if text[:1] == "'" and text[1:2] in _FORMULA_LEADS:
+        return text[1:]
+    return text
+
+
+class ExportDirectoryError(ExportError):
+    """The save directory cannot be written to."""
+
+
+def _open_inside(directory: Path, name: str, flags: int) -> int:
+    """Open one of this module's own files in ``directory``, never a symlink.
+
+    A link planted at the manifest's or the lock's name would otherwise have
+    its target written to.
+    """
+    try:
+        return os.open(directory / name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        raise ExportDirectoryError(
+            f"cannot write {name} in the save directory: {exc.strerror or exc}"
+        ) from exc
 
 
 @contextlib.contextmanager
 def _directory_lock(directory: Path) -> Iterator[None]:
     """One export at a time per save directory, across processes."""
-    with open(directory / LOCK_NAME, "w") as handle:
+    descriptor = _open_inside(directory, LOCK_NAME, os.O_CREAT | os.O_RDWR)
+    try:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise CommitInProgressError(
                 "another export into this directory is still running; wait "
@@ -550,54 +679,118 @@ def _directory_lock(directory: Path) -> Iterator[None]:
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _append_manifest(directory: Path, rows: list[dict[str, Any]]) -> None:
+    """Append rows. Raises ExportDirectoryError if they cannot be written."""
     if not rows:
         return
-    path = directory / MANIFEST_NAME
-    new = not path.exists() or path.stat().st_size == 0
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
-        if new:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow({key: _csv_cell(row.get(key, "")) for key in MANIFEST_FIELDS})
-        handle.flush()
-        os.fsync(handle.fileno())
+    descriptor = _open_inside(
+        directory, MANIFEST_NAME, os.O_CREAT | os.O_RDWR | os.O_APPEND
+    )
+    try:
+        with os.fdopen(descriptor, "r+", newline="", encoding="utf-8",
+                       errors="backslashreplace") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if size:
+                handle.seek(0)
+                header = next(csv.reader([handle.readline()]), [])
+                if tuple(header) != MANIFEST_FIELDS:
+                    raise ExportDirectoryError(
+                        f"{MANIFEST_NAME} in the save directory is not a "
+                        f"manifest this tool wrote; move it aside and try again"
+                    )
+                # A row cut short by a crash must not run into the next one.
+                handle.seek(size - 1)
+                if handle.read(1) not in ("\n", "\r"):
+                    handle.write("\r\n")
+            writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
+            if not size:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {key: _csv_cell(row.get(key, "")) for key in MANIFEST_FIELDS}
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise ExportDirectoryError(
+            f"could not write the manifest: {exc.strerror or exc}"
+        ) from exc
 
 
-def _exported_message_ids(directory: Path) -> tuple[set[str], bool]:
-    """Message-IDs whose files the manifest names and the disk still has.
+def _latest_rows(
+    path: Path, export_key: str
+) -> dict[tuple[str, str], tuple[str, list[dict[str, str]]]] | None:
+    """Each message's most recent rows for these settings; None if not ours."""
+    latest: dict[tuple[str, str], tuple[str, list[dict[str, str]]]] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != MANIFEST_FIELDS:
+            return None
+        for row in reader:
+            message_id = _csv_uncell(row.get("message_id")).strip()
+            if not message_id or row.get("export_key") != export_key:
+                continue
+            # Message-IDs are chosen by the sender, so one alone could be
+            # used to make another message look done. The received time is
+            # set by the server and survives a move between mailboxes.
+            key = (message_id, (row.get("date_received") or "").strip())
+            stamp = row.get("exported_at") or ""
+            known = latest.get(key)
+            if known is None or stamp > known[0]:
+                latest[key] = (stamp, [row])
+            elif stamp == known[0]:
+                known[1].append(row)
+    return latest
 
-    Returns (ids, unreadable). A message counts only if every file row it
-    has points at a file inside ``directory`` that exists at the recorded
-    size. The manifest is evidence, not the authority: the files are.
+
+def _exported_message_ids(
+    directory: Path, export_key: str
+) -> tuple[set[tuple[str, str]], bool]:
+    """Messages that an earlier run with the same settings finished.
+
+    Returns (keys, unreadable), each key a (Message-ID, received time) pair.
+    The manifest is evidence, not the authority: the files are. A message
+    counts as done only if, in its most recent rows written with these same
+    naming and filter settings,
+
+    * at least one file was saved,
+    * every such file is inside ``directory`` and still there at the
+      recorded size, and
+    * nothing was left undone (no ``error`` or ``name_collision`` row).
+
+    So a message one of whose attachments failed is tried again, and so is
+    every message when the templates or the attachment filter change.
     """
     path = directory / MANIFEST_NAME
-    if not path.exists():
+    if path.is_symlink() or not path.exists():
         return set(), False
-    by_message: dict[str, list[dict[str, str]]] = {}
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                message_id = (row.get("message_id") or "").strip()
-                if message_id:
-                    by_message.setdefault(message_id, []).append(row)
+        latest = _latest_rows(path, export_key)
     except (OSError, UnicodeDecodeError, csv.Error):
         return set(), True
+    if latest is None:
+        return set(), True  # not a manifest this module wrote
     root = directory.resolve()
-    done: set[str] = set()
-    for message_id, rows in by_message.items():
+    done: set[tuple[str, str]] = set()
+    for done_key, (_, rows) in latest.items():
+        statuses = {r.get("status") for r in rows}
         files = [r for r in rows if r.get("status") in _FILE_STATUSES]
-        if files and all(_file_still_there(root, r) for r in files):
-            done.add(message_id)
+        if (
+            files
+            and not statuses & _UNFINISHED_STATUSES
+            and all(_file_still_there(root, r) for r in files)
+        ):
+            done.add(done_key)
     return done, False
 
 
 def _file_still_there(root: Path, row: dict[str, str]) -> bool:
-    relative = row.get("saved_path") or ""
+    relative = _csv_uncell(row.get("saved_path"))
     try:
         size = int(row.get("size") or "")
         target = root / relative
@@ -616,6 +809,8 @@ def _check_directory(save_directory: Path) -> Path:
         raise ValueError(
             f"save_directory does not exist or is not a directory: {save_directory}"
         )
+    if not os.access(save_directory, os.W_OK | os.X_OK):
+        raise ValueError(f"save_directory is not writable: {save_directory}")
     return save_directory.resolve()
 
 
@@ -625,12 +820,23 @@ def _envelope_fields(data: dict[bytes, Any]) -> dict[str, Any]:
     sent = getattr(envelope, "date", None)
     sender = _format_sender(envelope) if envelope is not None else ""
     return {
-        "subject": _decode_mime_header(getattr(envelope, "subject", None)),
-        "sender": extract_address(sender) or sender,
+        "subject": _text(_decode_mime_header(getattr(envelope, "subject", None))),
+        "sender": _text(extract_address(sender) or sender),
         "received": received if isinstance(received, datetime) else None,
         "sent": sent if isinstance(sent, datetime) else None,
-        "message_id": _strip_brackets(_decode(getattr(envelope, "message_id", None))),
+        "message_id": _text(
+            _strip_brackets(_decode(getattr(envelope, "message_id", None)))
+        ),
     }
+
+
+def _text(value: str) -> str:
+    """Text from mail, made safe to encode.
+
+    A header can decode to a lone surrogate, which cannot be written to a
+    file name or the manifest; it becomes a replacement character.
+    """
+    return value.encode("utf-8", "replace").decode("utf-8")
 
 
 class _WindowsInterrupted(Exception):
@@ -756,15 +962,18 @@ class _Plan:
     remaining: list[int] = field(default_factory=list)
     samples: list[str] = field(default_factory=list)
     targets: Counter[str] = field(default_factory=Counter)
+    unmatched: dict[int, dict[str, Any]] = field(default_factory=dict)
     no_match: int = 0
     already: int = 0
+    over_budget: bool = False
 
 
 def _plan(
     uids: list[int],
     read: dict[int, dict[str, Any]],
-    done_ids: set[str],
+    done_ids: set[tuple[str, str]],
     naming: Naming,
+    expired: Callable[[], bool],
 ) -> _Plan:
     plan = _Plan()
     for uid in uids:
@@ -772,16 +981,22 @@ def _plan(
         if fields is None:
             plan.remaining.append(uid)  # settled at commit, from the body fetch
             continue
-        if fields["message_id"] and fields["message_id"] in done_ids:
+        key = (fields["message_id"], _message_columns(fields)["date_received"])
+        if key[0] and key[1] and key in done_ids:
             plan.already += 1
             continue
         plan.remaining.append(uid)
+        if expired():
+            # Applying the pattern to every subject has taken too long.
+            plan.over_budget = True
+            return plan
         values = message_values(
             subject=fields["subject"], sender=fields["sender"],
             received=fields["received"], sent=fields["sent"], uid=uid, naming=naming,
         )
         if values is None:
             plan.no_match += 1
+            plan.unmatched[uid] = fields
             continue
         # The attachment's own name is not known until the body is read;
         # NAME and .EXT stand in for it here.
@@ -818,11 +1033,20 @@ def _preview(
         return result
     uidvalidity = found.uidvalidity
 
-    done_ids: set[str] = set()
+    done_ids: set[tuple[str, str]] = set()
     unreadable = False
     if if_exists == "skip":
-        done_ids, unreadable = _exported_message_ids(directory)
-    plan = _plan(uids, read, done_ids, naming)
+        done_ids, unreadable = _exported_message_ids(
+            directory, export_key(naming, attachment_name_contains)
+        )
+    plan_started = clock()
+    plan = _plan(
+        uids, read, done_ids, naming,
+        expired=lambda: clock() - plan_started >= budget,
+    )
+    if plan.over_budget:
+        result["over_budget"] = True
+        return result
     remaining = plan.remaining
 
     dates = [f["received"].date() for f in read.values() if f["received"]]
@@ -859,6 +1083,7 @@ def _preview(
         naming=naming,
         attachment_name_contains=attachment_name_contains,
         if_exists=if_exists,
+        unmatched=plan.unmatched,
     ))
     result["expires_in_seconds"] = int(store.ttl)
     result["commit_time_budget_seconds"] = int(TIME_BUDGET_SECONDS)
@@ -885,7 +1110,10 @@ def _attachments(raw: bytes) -> list[tuple[str, bytes]]:
 
     Same enumeration ``save_attachments`` uses, so the indices agree.
     """
-    return [(name, payload) for name, _main, _sub, payload in extract_attachment_payloads(raw)]
+    return [
+        (_text(name), payload)
+        for name, _main, _sub, payload in extract_attachment_payloads(raw)
+    ]
 
 
 def _make_folders(root: Path, folders: tuple[str, ...]) -> Path:
@@ -981,23 +1209,24 @@ def _export_message(
 ) -> list[dict[str, Any]]:
     """Export one message's attachments. Returns its manifest rows."""
     base: dict[str, Any] = {
-        "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "exported_at": _stamp(),
         "account": entry.account,
         "mailbox": entry.mailbox,
         "uidvalidity": entry.uidvalidity,
         "uid": uid,
     }
-    raw = data.get(b"BODY[]") if data else None
-    if not data or not isinstance(raw, (bytes, bytearray)) or not raw:
+    base["export_key"] = entry.export_key
+    if not data or data.get(b"ENVELOPE") is None:
         progress.counts["missing"] += 1
         return [{**base, "status": "missing", "note": "gone since the preview"}]
     fields = _envelope_fields(data)
-    base.update(
-        message_id=fields["message_id"],
-        subject=fields["subject"],
-        sender=fields["sender"],
-        date_received=fields["received"].isoformat() if fields["received"] else "",
-    )
+    base.update(_message_columns(fields))
+    raw = data.get(b"BODY[]")
+    if not isinstance(raw, (bytes, bytearray)) or not raw:
+        # The message is there but the server sent no body for it. Say so;
+        # calling it "gone" would be wrong, and it is worth another try.
+        progress.counts["errors"] += 1
+        return [{**base, "status": "error", "note": "the server returned an empty body"}]
     values = message_values(
         subject=fields["subject"], sender=fields["sender"],
         received=fields["received"], sent=fields["sent"], uid=uid, naming=entry.naming,
@@ -1013,6 +1242,16 @@ def _export_message(
 
     wanted = (entry.attachment_name_contains or "").strip().casefold()
     rows: list[dict[str, Any]] = []
+    if len(attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
+        # A message built to carry tens of thousands of parts would turn one
+        # call into that many files and folders.
+        progress.counts["errors"] += 1
+        rows.append({
+            **base, "status": "error",
+            "note": f"{len(attachments)} attachments; only the first "
+                    f"{MAX_ATTACHMENTS_PER_MESSAGE} were considered",
+        })
+        attachments = attachments[:MAX_ATTACHMENTS_PER_MESSAGE]
     for index, (name, payload) in enumerate(attachments):
         if wanted and wanted not in name.casefold():
             continue
@@ -1025,6 +1264,7 @@ def _export_message(
         digest = hashlib.sha256(payload).hexdigest()
         try:
             folders, filename = render_path(entry.naming, values, name=name, index=index)
+            _refuse_reserved(folders, filename)
             parent = _make_folders(entry.save_directory, folders)
             status, where = _place(parent / filename, payload, digest, entry.if_exists)
         except OSError as exc:
@@ -1047,23 +1287,129 @@ def _export_message(
     return rows
 
 
+def _export_one(
+    entry: ExportEntry,
+    uid: int,
+    data: dict[bytes, Any] | None,
+    max_attachment_bytes: int,
+    progress: _Progress,
+) -> list[dict[str, Any]]:
+    """``_export_message``, with any surprise turned into an ``error`` row.
+
+    One message that cannot be handled must not stop the export: it would
+    fail the same way on every retry and nothing after it would ever run.
+    """
+    try:
+        return _export_message(entry, uid, data, max_attachment_bytes, progress)
+    except Exception as exc:  # noqa: BLE001 - recorded, and the run goes on
+        logger.warning("export of one message failed: %s", type(exc).__name__)
+        progress.counts["errors"] += 1
+        return [{
+            "exported_at": _stamp(),
+            "account": entry.account,
+            "mailbox": entry.mailbox,
+            "uidvalidity": entry.uidvalidity,
+            "uid": uid,
+            "export_key": entry.export_key,
+            "status": "error",
+            "note": f"could not be exported: {type(exc).__name__}",
+        }]
+
+
+def _message_columns(fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "message_id": fields["message_id"],
+        "subject": fields["subject"],
+        "sender": fields["sender"],
+        "date_received": fields["received"].isoformat() if fields["received"] else "",
+    }
+
+
+_RESERVED_NAMES = frozenset({MANIFEST_NAME.casefold(), LOCK_NAME.casefold()})
+
+
+def _refuse_reserved(folders: tuple[str, ...], filename: str) -> None:
+    """Keep exported files out of this module's own names.
+
+    An attachment called ``export_manifest.csv`` would otherwise become, or
+    replace, the manifest (the filesystem is case-insensitive).
+    """
+    for part in (*folders, filename):
+        folded = part.casefold()
+        if folded in _RESERVED_NAMES or folded.startswith(".export-"):
+            raise OSError(f"{part!r} is a name the export keeps for itself")
+
+
 def _next_batch(entry: ExportEntry, raw_cap: int) -> tuple[list[int], list[int]]:
-    """The next UIDs to fetch, and any at the front too large to fetch."""
+    """The next UIDs to fetch, and those before them that need no fetch.
+
+    Always an exact prefix of ``entry.remaining``: first the run of UIDs to
+    record without a fetch (too large, or a subject already known not to fit
+    the pattern), then the batch. A message above ``SOLO_MESSAGE_BYTES`` is
+    a batch of its own.
+    """
     batch: list[int] = []
-    oversized: list[int] = []
+    unfetched: list[int] = []
     total = 0
     for uid in entry.remaining:
         size = entry.sizes.get(uid, 0)
-        if size > raw_cap:
+        if size > raw_cap or uid in entry.unmatched:
             if batch:
                 break
-            oversized.append(uid)
+            unfetched.append(uid)
             continue
+        if size > SOLO_MESSAGE_BYTES:
+            if not batch:
+                batch.append(uid)
+            break
         if batch and (len(batch) >= entry.batch_size or total + size > BATCH_BYTES):
             break
         batch.append(uid)
         total += size
-    return batch, oversized
+    return batch, unfetched
+
+
+def _unfetched_row(entry: ExportEntry, uid: int, progress: _Progress) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "exported_at": _stamp(),
+        "account": entry.account,
+        "mailbox": entry.mailbox,
+        "uidvalidity": entry.uidvalidity,
+        "uid": uid,
+        "export_key": entry.export_key,
+    }
+    fields = entry.unmatched.get(uid)
+    if fields is not None:
+        progress.counts["pattern_no_match"] += 1
+        return {**row, **_message_columns(fields), "status": "pattern_no_match"}
+    progress.counts["too_large"] += 1
+    return {
+        **row,
+        "size": entry.sizes.get(uid, 0),
+        "status": "too_large",
+        "note": "message too large for a bulk export; use save_attachments",
+    }
+
+
+def _learn_sizes(client: Any, entry: ExportEntry) -> None:
+    """Find the size of upcoming messages the preview could not size.
+
+    Without it a message of unknown size would be fetched blind, whatever
+    it weighs.
+    """
+    unknown = [u for u in entry.remaining[:MAX_BATCH] if entry.sizes.get(u, 0) <= 0]
+    if not unknown:
+        return
+    fetched = client.fetch(unknown, ["RFC822.SIZE"])
+    for uid in unknown:
+        data = fetched.get(uid)
+        size = data.get(b"RFC822.SIZE") if data else None
+        if data is None:
+            entry.sizes[uid] = 1  # gone: the body fetch will record it
+        elif isinstance(size, int) and size > 0:
+            entry.sizes[uid] = size
+        else:
+            entry.sizes[uid] = BULK_MESSAGE_BYTES + 1  # will not say: skip it
 
 
 def _next_size(size: int, took: float) -> int:
@@ -1085,7 +1431,7 @@ def _run(
 ) -> _Progress:
     progress = _Progress()
     # A base64 body is about a third larger than what it carries.
-    raw_cap = int(max_attachment_bytes * 1.4) + 1024 * 1024
+    raw_cap = min(int(max_attachment_bytes * 1.4) + 1024 * 1024, BULK_MESSAGE_BYTES)
     started = clock()
     try:
         with connector._session() as client, _socket_timeout(client):
@@ -1099,28 +1445,33 @@ def _run(
             while entry.remaining:
                 if progress.done and clock() - started >= time_budget:
                     break
-                batch, oversized = _next_batch(entry, raw_cap)
-                rows: list[dict[str, Any]] = []
-                for uid in oversized:
-                    progress.counts["too_large"] += 1
-                    rows.append({
-                        "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        "account": entry.account, "mailbox": entry.mailbox,
-                        "uidvalidity": entry.uidvalidity, "uid": uid,
-                        "size": entry.sizes.get(uid, 0), "status": "too_large",
-                        "note": "message larger than the attachment limit",
-                    })
+                _learn_sizes(client, entry)
+                batch, unfetched = _next_batch(entry, raw_cap)
+                solo = len(batch) == 1 and (
+                    entry.sizes.get(batch[0], 0) > SOLO_MESSAGE_BYTES
+                )
+                if solo and progress.done:
+                    # A large message is the first work of a call, never
+                    # added to one that has already used part of its time.
+                    break
+                rows = [_unfetched_row(entry, uid, progress) for uid in unfetched]
                 began = clock()
                 fetched = (
                     client.fetch(batch, ["BODY.PEEK[]", "ENVELOPE", "INTERNALDATE"])
                     if batch else {}
                 )
+                exported = 0
                 for uid in batch:
-                    rows.extend(_export_message(
+                    if exported and clock() - started >= time_budget * 2:
+                        # Fetched but not yet written: left for the next
+                        # call rather than run past what a client waits.
+                        break
+                    rows.extend(_export_one(
                         entry, uid, fetched.get(uid), max_attachment_bytes, progress
                     ))
+                    exported += 1
                 _append_manifest(entry.save_directory, rows)
-                handled = len(oversized) + len(batch)
+                handled = len(unfetched) + exported
                 entry.remaining = entry.remaining[handled:]
                 progress.done += handled
                 took = clock() - began
