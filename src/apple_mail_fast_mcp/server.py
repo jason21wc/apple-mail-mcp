@@ -1822,7 +1822,12 @@ def preview_move_by_query(
 
     Returns:
         ``matched`` (count); ``preview_id`` (null when nothing matched or the
-        set is above the server limit, in which case ``over_limit`` is true);
+        set is above the server limit, in which case ``over_limit`` is true
+        and ``suggested_windows`` lists date ranges expected to fit: preview
+        each range on its own, with its ``date_from`` / ``date_to``. Their
+        ``approx_matched`` is an estimate, and a range marked ``over_limit``
+        holds a single day (its ``day``) that needs another filter. ``windows_unavailable``
+        appears instead when the ranges could not be worked out);
         ``oldest_date`` / ``newest_date`` (header dates);
         ``header_dates_outside_window`` (date filters use the server's
         received date, so a few header dates can fall outside the window);
