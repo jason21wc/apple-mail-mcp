@@ -208,6 +208,264 @@ class TestNoAttachmentIsNotDownloaded:
         assert _body_fetches(conn) == [[1]]
 
 
+_TEXT = (b"text", b"plain", (b"charset", b"utf-8"), None, None, b"7bit", 100, 5)
+_HTML = (b"text", b"html", (b"charset", b"utf-8"), None, None, b"7bit", 300, 9)
+
+
+class TestOnlyAPlainAnswerSkipsADownload:
+    """The listing of a message's parts and the parser that produces the
+    saved bytes do not agree on every message. A skip decided on the
+    listing's word would leave a real attachment out for good, recorded as
+    "no attachment", so every doubtful shape must mean "download it"."""
+
+    @pytest.mark.parametrize(
+        "structure",
+        [
+            _TEXT,
+            (_TEXT, _HTML, b"alternative"),
+            ([_TEXT, _HTML], b"alternative"),                 # imapclient's own shape
+            ((_TEXT, _HTML, b"alternative"), _TEXT, b"mixed"),
+            (b"text", b"plain", None, None, None, b"7bit", 10, 1),
+            (b"text", b"plain", (), None, None, b"7bit", 10, 1, None, (b"inline", None), None),
+        ],
+    )
+    def test_plain_mail_has_nothing_to_save(self, structure: Any) -> None:
+        assert ax._has_no_attachments(structure) is True
+
+    @pytest.mark.parametrize(
+        "structure",
+        [
+            # An ordinary attachment.
+            (_TEXT, (b"application", b"pdf", (b"name", b"x.pdf"), None, None,
+                     b"base64", 2048, None, (b"attachment", (b"filename", b"x.pdf"))),
+             b"mixed"),
+            # Inline, named only in its Content-Type: an attachment to the
+            # parser, invisible to the listing.
+            (_TEXT, (b"application", b"pdf", (b"name", b"x.pdf"), None, None,
+                     b"base64", 2048, None, (b"inline", None)), b"mixed"),
+            # No disposition at all, but a Content-Type name.
+            (b"application", b"pdf", (b"NAME", b"x.pdf"), None, None, b"base64", 2048),
+            # Inline with an RFC 2231 name the listing does not recognise.
+            (_TEXT, (b"application", b"pdf", (), None, None, b"base64", 2048, None,
+                     (b"inline", (b"filename*", b"utf-8''R%C3%A9sum%C3%A9.pdf"))),
+             b"mixed"),
+            # A Content-Type name in RFC 2231 form.
+            (b"application", b"pdf", (b"name*", b"utf-8''x.pdf"), None, None, b"base64", 9),
+            # Attachment disposition with no name at all.
+            (b"application", b"octet-stream", (), None, None, b"base64", 9, None,
+             (b"ATTACHMENT", None)),
+            # A forwarded message.
+            (_TEXT, (b"message", b"rfc822", (), None, None, b"7bit", 900), b"mixed"),
+            # Shapes that are not understood.
+            ([], b"mixed"),
+            ((), b"mixed"),
+            (_TEXT, "not a part", b"mixed")[1:],
+            (None, b"plain"),
+            (b"text", b"plain"),
+            (b"text", b"plain", "odd params", None, None, b"7bit", 10),
+            ([_TEXT, "junk"], b"mixed"),
+            "nonsense",
+            None,
+            (),
+        ],
+    )
+    def test_anything_else_is_downloaded(self, structure: Any) -> None:
+        assert ax._has_no_attachments(structure) is False
+
+    def test_very_deep_nesting_is_not_trusted(self) -> None:
+        structure: Any = _TEXT
+        for _ in range(40):
+            structure = (structure, b"mixed")
+        assert ax._has_no_attachments(structure) is False
+
+    def test_an_inline_part_named_in_its_content_type_is_exported(
+        self, tmp_path: Path
+    ) -> None:
+        """End to end: the server's listing looks like plain text plus an
+        inline part with only a Content-Type name. It must be downloaded."""
+        messages = {1: _message(1, "Inline pdf", attachments=[("x.pdf", b"pdf bytes")])}
+        conn = FakeConnector(StrictClient(messages))
+        real_fetch = conn.client.fetch
+
+        def fetch(uids: list[int], parts: list[str]) -> Any:
+            out = real_fetch(uids, parts)
+            if "BODYSTRUCTURE" in parts:
+                out[1][b"BODYSTRUCTURE"] = (
+                    _TEXT,
+                    (b"application", b"pdf", (b"name", b"x.pdf"), None, None,
+                     b"base64", 2048, None, (b"inline", None)),
+                    b"mixed",
+                )
+            return out
+
+        conn.client.fetch = fetch  # type: ignore[method-assign]
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path, naming=_plain())
+        out = _commit(conn, store, preview["preview_id"])
+        assert out["saved"] == 1
+        assert _files(tmp_path) == ["x.pdf"]
+
+
+class TestClassifyCannotStopTheExport:
+    def test_a_structure_the_server_chokes_on_falls_back_to_sizes(
+        self, tmp_path: Path
+    ) -> None:
+        """Otherwise the same read would fail on every call and nothing
+        behind that message would ever be exported."""
+        from imapclient.exceptions import IMAPClientError
+
+        messages = _reports(4)
+        conn = FakeConnector(StrictClient(messages))
+        real_fetch = conn.client.fetch
+
+        def fetch(uids: list[int], parts: list[str]) -> Any:
+            if "BODYSTRUCTURE" in parts:
+                raise IMAPClientError("fetch failed: BAD parse error")
+            return real_fetch(uids, parts)
+
+        conn.client.fetch = fetch  # type: ignore[method-assign]
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path)
+        entry = store.get(preview["preview_id"])
+        for uid in entry.remaining:
+            entry.sizes[uid] = 0
+        out = _commit(conn, store, preview["preview_id"])
+        assert out["outcome"] == "complete"
+        assert out["saved"] == 4
+        assert all(size > 0 for size in entry.sizes.values())
+
+    def test_a_broken_connection_while_asking_is_a_failed_call(
+        self, tmp_path: Path
+    ) -> None:
+        conn = FakeConnector(StrictClient(_reports(4)))
+        real_fetch = conn.client.fetch
+
+        def fetch(uids: list[int], parts: list[str]) -> Any:
+            if "BODYSTRUCTURE" in parts:
+                raise TimeoutError("timed out")
+            return real_fetch(uids, parts)
+
+        conn.client.fetch = fetch  # type: ignore[method-assign]
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path)
+        out = _commit(conn, store, preview["preview_id"])
+        assert out["outcome"] == "failed"
+        assert out["server_slow"] is True
+        assert out["remaining"] == 4
+        assert conn.left_with[-1] is not None
+
+    def test_a_known_size_is_not_forgotten_when_a_reply_is_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """A large message left out of one reply used to be given size 1 and
+        then fetched in an ordinary batch, past the bulk limit."""
+        messages = _reports(3)
+        conn = FakeConnector(StrictClient(messages))
+        real_fetch = conn.client.fetch
+
+        def fetch(uids: list[int], parts: list[str]) -> Any:
+            out = real_fetch(uids, parts)
+            if "BODYSTRUCTURE" in parts:
+                out.pop(2, None)
+            return out
+
+        conn.client.fetch = fetch  # type: ignore[method-assign]
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path)
+        entry = store.get(preview["preview_id"])
+        entry.sizes[2] = ax.BULK_MESSAGE_BYTES + 1
+        out = _commit(conn, store, preview["preview_id"])
+        assert out["too_large"] == 1
+        assert 2 not in [u for batch in _body_fetches(conn) for u in batch]
+
+    def test_many_messages_over_several_calls(self, tmp_path: Path) -> None:
+        messages = _many(130)
+        for uid in range(1, 131, 3):
+            messages[uid] = _message(uid, f"Plain {uid}", attachments=[])
+        conn = FakeConnector(StrictClient(messages))
+        store = ax.ExportStore()
+        preview = _preview(
+            conn, store, tmp_path,
+            naming=ax.build_naming(filename_template="{uid} {name}"),
+        )
+        totals = {"saved": 0, "no_matching_attachment": 0}
+        for _ in range(300):  # a zero budget means one small step per call
+            out = _commit(conn, store, preview["preview_id"], time_budget=0.0)
+            for key in totals:
+                totals[key] += out[key]
+            if out["outcome"] == "complete":
+                break
+        assert out["outcome"] == "complete"
+        assert totals == {"saved": 86, "no_matching_attachment": 44}
+        assert len(_manifest(tmp_path)) == 130
+        asked = [u for uids, p in conn.client.fetches if "BODYSTRUCTURE" in p for u in uids]
+        assert sorted(asked) == list(range(1, 131))  # each asked about once
+
+
+class TestListingEdges:
+    def test_a_message_gone_since_the_preview_is_recorded_missing(
+        self, tmp_path: Path
+    ) -> None:
+        messages = _many(3)
+        conn = FakeConnector(StrictClient(messages))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path, naming=_plain(), manifest_only=True)
+        entry = store.get(preview["preview_id"])
+        del entry.fields[2]
+        del messages[2]
+        out = _commit(conn, store, preview["preview_id"])
+        assert (out["listed"], out["missing"]) == (2, 1)
+        assert out["outcome"] == "complete"
+
+    def test_a_rebuilt_mailbox_refuses(self, tmp_path: Path) -> None:
+        from apple_mail_fast_mcp import query_moves as qm
+
+        conn = FakeConnector(StrictClient(_many(3)))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path, naming=_plain(), manifest_only=True)
+        del store.get(preview["preview_id"]).fields[2]
+        conn.client.uidvalidity = 99
+        with pytest.raises(qm.SelectionStaleError):
+            _commit(conn, store, preview["preview_id"])
+
+    def test_an_older_manifest_without_the_new_columns_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        legacy = [f for f in ax.MANIFEST_FIELDS if f not in ("to", "cc")]
+        (tmp_path / ax.MANIFEST_NAME).write_text(",".join(legacy) + "\r\n", encoding="utf-8")
+        conn = FakeConnector(StrictClient(_many(2)))
+        store = ax.ExportStore()
+        preview = _preview(conn, store, tmp_path, naming=_plain(), manifest_only=True)
+        with pytest.raises(ax.ExportDirectoryError, match="not a manifest"):
+            _commit(conn, store, preview["preview_id"])
+
+
+class TestLockFollowsTheFolderNotItsSpelling:
+    def test_two_spellings_of_one_folder_take_the_same_lock(self, tmp_path: Path) -> None:
+        from apple_mail_fast_mcp import query_moves as qm
+
+        real = tmp_path / "Reports"
+        real.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        with ax._directory_lock(real):
+            with pytest.raises(qm.CommitInProgressError):
+                with ax._directory_lock(alias):
+                    pass
+
+    def test_a_lock_folder_that_cannot_be_made_is_a_directory_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        blocker = tmp_path / "home-is-a-file"
+        blocker.write_text("x")
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(blocker))
+        target = tmp_path / "exports"
+        target.mkdir()
+        with pytest.raises(ax.ExportDirectoryError, match="lock"):
+            with ax._directory_lock(target):
+                pass
+
+
 class TestHonestPreview:
     def test_duplicates_are_not_guessed_when_names_depend_on_the_attachment(
         self, tmp_path: Path

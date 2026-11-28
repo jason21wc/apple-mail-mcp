@@ -56,7 +56,6 @@ from . import date_windows
 from .draft_builder import extract_attachment_payloads
 from .exceptions import MailError
 from .imap_connector import (
-    _bodystructure_extract_attachments,
     _decode,
     _decode_mime_header,
     _format_address_list,
@@ -718,8 +717,12 @@ def _lock_directory() -> Path:
 def _directory_lock(directory: Path) -> Iterator[None]:
     """One export at a time per save directory, across processes."""
     locks = _lock_directory()
-    name = hashlib.sha256(str(directory).encode("utf-8")).hexdigest()[:24] + ".lock"
     try:
+        # Named for the folder itself (device and inode), not its path: one
+        # folder can be spelled several ways, in different letter case for
+        # a start, and each spelling must take the same lock.
+        info = os.stat(directory)
+        name = f"{info.st_dev}-{info.st_ino}.lock"
         locks.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
             locks / name,
@@ -1501,12 +1504,12 @@ def _require_own_manifest(directory: Path) -> None:
 
 
 def _next_batch(entry: ExportEntry, raw_cap: int) -> tuple[list[int], list[int]]:
-    """The next UIDs to fetch, and those before them that need no fetch.
+    """The next UIDs to fetch, and those among them that need no fetch.
 
-    Always an exact prefix of ``entry.remaining``: first the run of UIDs to
-    record without a fetch (too large, or a subject already known not to fit
-    the pattern), then the batch. A message above ``SOLO_MESSAGE_BYTES`` is
-    a batch of its own.
+    Both come from the front of ``entry.remaining``, interleaved as they
+    lie: UIDs to record without a fetch (too large, a subject already known
+    not to fit the pattern, or no attachments at all) and the batch to
+    download. A message above ``SOLO_MESSAGE_BYTES`` is a batch of its own.
     """
     batch: list[int] = []
     unfetched: list[int] = []
@@ -1516,8 +1519,9 @@ def _next_batch(entry: ExportEntry, raw_cap: int) -> tuple[list[int], list[int]]
             break  # not asked about yet: the next pass classifies it first
         size = entry.sizes.get(uid, 0)
         if size > raw_cap or uid in entry.unmatched or uid in entry.no_attachments:
-            if batch:
-                break
+            # Needs no download, wherever it sits among those that do: a
+            # mailbox of mixed mail would otherwise be fetched one or two
+            # messages at a time.
             unfetched.append(uid)
             continue
         if size > SOLO_MESSAGE_BYTES:
@@ -1572,18 +1576,28 @@ def _classify(client: Any, entry: ExportEntry) -> None:
     it are not decoded the way the saved names are, so a name filter is
     always settled from the downloaded message.
     """
-    ahead = [
-        u for u in entry.remaining[:CLASSIFY_AHEAD]
-        if u not in entry.unmatched and u not in entry.classified
-    ]
-    if not ahead:
-        return
-    fetched = client.fetch(ahead, ["BODYSTRUCTURE", "RFC822.SIZE"])
+    window = [u for u in entry.remaining[:CLASSIFY_AHEAD] if u not in entry.unmatched]
+    if not window or window[0] in entry.classified:
+        return  # the next message to fetch is already known about
+    ahead = [u for u in window if u not in entry.classified]
+    try:
+        fetched = client.fetch(ahead, ["BODYSTRUCTURE", "RFC822.SIZE"])
+    except (IMAPClientAbortError, OSError):
+        raise  # a broken connection: nothing more can be asked on it
+    except Exception as exc:  # noqa: BLE001 - one message's structure, say
+        # A structure the server or the parser chokes on must not stop the
+        # export for good. Ask for sizes alone and skip nothing.
+        logger.warning("structure read failed (%s); sizes only", type(exc).__name__)
+        fetched = {
+            uid: {b"RFC822.SIZE": data.get(b"RFC822.SIZE")}
+            for uid, data in client.fetch(ahead, ["RFC822.SIZE"]).items()
+        }
     for uid in ahead:
         entry.classified.add(uid)
         data = fetched.get(uid)
         if data is None:
-            entry.sizes[uid] = 1  # gone: the body fetch will record it
+            if entry.sizes.get(uid, 0) <= 0:
+                entry.sizes[uid] = 1  # gone: the body fetch will record it
             continue
         if entry.sizes.get(uid, 0) <= 0:
             size = data.get(b"RFC822.SIZE")
@@ -1596,13 +1610,64 @@ def _classify(client: Any, entry: ExportEntry) -> None:
 
 
 def _has_no_attachments(structure: Any) -> bool:
-    """True only on a positive answer; anything unclear means "download it"."""
-    if not isinstance(structure, tuple) or not structure:
-        return False
+    """True only when the structure plainly shows nothing that could be saved.
+
+    Deliberately stricter than the listing walker in ``imap_connector``:
+    that one and the parser that produces the saved bytes do not agree on
+    every message (an inline part named only in its Content-Type, or by an
+    RFC 2231 ``filename*``, is an attachment to the parser and not to the
+    listing). Skipping on the listing's word would leave such attachments
+    out for good, recorded as "no attachment". So a message is skipped only
+    if every part is a shape this function recognises and none carries any
+    sign of being a file: a disposition of ``attachment``, a disposition of
+    ``inline`` with any parameter, a Content-Type ``name``, or a
+    ``message/*`` type. Anything else is downloaded and settled from the
+    real bytes.
+    """
     try:
-        return _bodystructure_extract_attachments(structure) == []
+        return _plainly_no_files(structure, depth=0)
     except Exception:  # noqa: BLE001 - an odd structure: do not guess
         return False
+
+
+def _plainly_no_files(node: Any, depth: int) -> bool:
+    if depth > 20 or not isinstance(node, (tuple, list)) or not node:
+        return False
+    head = node[0]
+    if isinstance(head, list):  # imapclient's multipart: (parts, subtype, ...)
+        return bool(head) and all(_plainly_no_files(p, depth + 1) for p in head)
+    if isinstance(head, tuple):  # multipart as child tuples, then the subtype
+        children = []
+        for item in node:
+            if not isinstance(item, tuple):
+                break
+            children.append(item)
+        return all(_plainly_no_files(p, depth + 1) for p in children)
+    return _leaf_is_plain(node)
+
+
+def _leaf_is_plain(node: Any) -> bool:
+    """One part: a recognised shape with no sign of being a file."""
+    head = node[0]
+    if not isinstance(head, bytes) or len(node) < 7 or head.lower() == b"message":
+        return False
+    params = node[2]
+    if params is not None and not isinstance(params, (tuple, list)):
+        return False
+    if any(
+        isinstance(key, bytes) and key.lower().startswith(b"name")
+        for key in (params or ())[::2]
+    ):
+        return False  # a Content-Type name, plain or RFC 2231
+    return not any(_marks_a_file(extra) for extra in node[7:])
+
+
+def _marks_a_file(extra: Any) -> bool:
+    """Whether a trailing element is a disposition that means "a file"."""
+    if not isinstance(extra, (tuple, list)) or not extra or not isinstance(extra[0], bytes):
+        return False
+    kind = extra[0].lower()
+    return kind == b"attachment" or (kind == b"inline" and len(extra) > 1 and bool(extra[1]))
 
 
 def _next_size(size: int, took: float) -> int:
@@ -1667,9 +1732,9 @@ def _run(
                     ))
                     exported += 1
                 _append_manifest(entry.save_directory, rows)
-                handled = len(unfetched) + exported
-                entry.remaining = entry.remaining[handled:]
-                progress.done += handled
+                dealt_with = {*unfetched, *batch[:exported]}
+                entry.remaining = [u for u in entry.remaining if u not in dealt_with]
+                progress.done += len(dealt_with)
                 took = clock() - began
                 progress.slowest = max(progress.slowest, took)
                 entry.batch_size = _next_size(entry.batch_size, took)

@@ -809,7 +809,7 @@ preview_attachment_export(
 - `account_not_found`, `not_found`: account or mailbox not found
 - `imap_error`: IMAP failed (there is no fallback)
 
-- `directory_error`: a file in `save_directory` that the export needs (its manifest or lock) cannot be used
+- `directory_error`: the manifest in `save_directory`, or the export's lock in the app data folder, cannot be used
 
 **Pattern rules.** `subject_pattern` comes from the caller, never from mail, but it is run against subjects anyone can send, and Python's regular expressions have no timeout. So:
 
@@ -849,6 +849,7 @@ Downloads the previewed messages a slice at a time and writes their attachments 
   "total": 28,
   "messages_done": 20,
   "remaining": 8,
+  "listed": 0,
   "saved": 20,
   "identical_existing": 0,
   "name_collisions": 0,
@@ -867,13 +868,13 @@ Downloads the previewed messages a slice at a time and writes their attachments 
 
 - `outcome`: `"more"` (call again), `"complete"`, or `"failed"` (`error` says why; the batch in flight was not recorded and the next call fetches it again).
 - `listed`: rows written by a `manifest_only` preview. In that mode every other count is 0 apart from `missing`.
-- A message the server says has no attachments at all is recorded `no_matching_attachment` without being downloaded. A name filter is always settled from the downloaded message, because the names the server lists are not decoded the same way.
+- A message whose structure plainly shows nothing that could be saved (only text parts: no attachment, no named or inline-with-parameters part, no forwarded message) is recorded `no_matching_attachment` without being downloaded. Anything less clear is downloaded and settled from the real message, and so is every name filter.
 - `saved`, `renamed`, `overwritten`: files written. `identical_existing`: the same content was already there, so nothing was written.
 - `name_collisions`: a **different** file was already at that name and `if_exists` was `skip`. It was not written. Check this on every run; the manifest rows with status `name_collision` say which.
 - `no_matching_attachment`, `pattern_no_match`, `too_large`, `missing` (gone since the preview), `errors`: messages or attachments that produced no file. Each has a manifest row. `errors` covers anything that could not be exported: a file that could not be written, a message that could not be parsed or came back with an empty body, a name the export keeps for itself, or more than 200 attachments on one message (the first 200 are exported).
 - `server_slow: true` with `retry_after_seconds` after a timeout: wait before calling again.
 
-**The manifest.** `export_manifest.csv` in `save_directory`, one row per attachment (or one per message that produced no file): `exported_at, account, mailbox, uidvalidity, uid, message_id, subject, date_received, sender, to, cc, attachment_index, attachment_name, saved_path, size, sha256, status, note, export_key`. `saved_path` is relative to `save_directory`. A manifest written before the `to` and `cc` columns were added (2026-11-28) is refused as "not a manifest this tool wrote": move it aside or use a new folder. `export_key` is a short fingerprint of the naming and filter settings the row was made with. To check an export, compare the rows whose status is `saved`, `renamed`, `overwritten` or `identical_existing` against the files (size and sha256). A cell that begins with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'`, so a subject cannot run as a formula when the file is opened in a spreadsheet.
+**The manifest.** `export_manifest.csv` in `save_directory`, one row per attachment (or one per message that produced no file): `exported_at, account, mailbox, uidvalidity, uid, message_id, subject, date_received, sender, to, cc, attachment_index, attachment_name, saved_path, size, sha256, status, note, export_key`. `saved_path` is relative to `save_directory`. A manifest written before the `to` and `cc` columns were added (2026-11-27) is refused as "not a manifest this tool wrote": move it aside or use a new folder. `export_key` is a short fingerprint of the naming and filter settings the row was made with. To check an export, compare the rows whose status is `saved`, `renamed`, `overwritten` or `identical_existing` against the files (size and sha256). A cell that begins with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'`, so a subject cannot run as a formula when the file is opened in a spreadsheet.
 
 **Resuming.** A server restart drops pending previews (they are held in memory). Preview again with the same arguments: with `if_exists="skip"` the preview leaves out messages an earlier run finished, so only what is left is downloaded. The files are the authority; the manifest only says which message made which file. A message is left out only when, in its most recent manifest rows made with the **same naming and filter settings**:
 
@@ -905,7 +906,7 @@ So a message with a failed attachment is tried again, deleting a file exports it
 - `selection_stale`: the mailbox was rebuilt, or the account now points at a different server
 - `commit_in_progress`: another commit is working on this preview or this directory
 - `validation_error`: `save_directory` no longer exists or cannot be written to
-- `directory_error`: the manifest or lock file in `save_directory` cannot be used (for example another file has the manifest's name)
+- `directory_error`: the manifest in `save_directory` cannot be used (for example another file has its name, or it predates the `to` and `cc` columns), or the export's lock could not be created
 - `imap_required`, `account_not_found`, `not_found`: as for the preview
 - `imap_error`: IMAP failed part-way (`outcome: "failed"`, with the counts so far)
 
