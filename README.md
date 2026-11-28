@@ -13,7 +13,7 @@ An MCP server that provides programmatic access to Apple Mail, enabling AI assis
 Grouped by lifecycle:
 
 - **Discovery** — `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`: enumerate what's configured (no external cache — call per account).
-- **Read** — `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `get_attachment_content`, `get_template`, `render_template`: read messages/threads, aggregate inbox stats, pull an attachment's content inline, and render templates.
+- **Read** — `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `get_attachment_content`, `get_template`, `render_template`: read messages/threads, count what a mailbox holds by sender, subject pattern or day, pull an attachment's content inline, and render templates.
 - **Message actions** — `update_message` (read/flag/move in one pass), `delete_messages` (→ Trash), `save_attachments` (to disk, byte-capped).
 - **Bulk move by query** — `preview_move_by_query` (read-only: what a filter matches, held as an exact set) and `commit_move_by_query` (moves that set, about 20 seconds of work per call). IMAP only.
 - **Bulk attachment export by query** — `preview_attachment_export` (read-only: what a filter matches and where each file would go) and `commit_attachment_export` (downloads that set and saves the attachments under templated names, with a manifest CSV; about 20 seconds of work per call). Mail is only read. IMAP only.

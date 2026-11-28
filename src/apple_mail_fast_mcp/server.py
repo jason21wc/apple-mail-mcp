@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, TypeVar, cast
 
@@ -17,7 +18,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.server.elicitation import AcceptedElicitation
 from pydantic import BeforeValidator
 
-from . import attachment_exports, query_moves
+from . import attachment_exports, query_moves, search_summary
 from .drafts import DraftStateStore, SeedRecord
 from .exceptions import (
     MailAccountNotFoundError,
@@ -2475,51 +2476,171 @@ def get_thread(
         }
 
 
+_STATISTICS_DEFAULT_HOURS = 720
+"""The window when the caller gives neither dates nor hours: 30 days."""
+
+_STATISTICS_SEARCH_PATH_LIMIT = 500
+"""Above this many messages statistics are read over IMAP only. The ordinary
+search path can fall back to AppleScript, which is not safe at that size."""
+
+
+def _grouped_statistics(
+    *,
+    account: str,
+    mailbox: str,
+    received_within_hours: int | None,
+    date_from: str | None,
+    date_to: str | None,
+    by: str,
+    group_limit: int,
+    scan_limit: int,
+    sender_contains: str | None,
+    subject_contains: str | None,
+) -> dict[str, Any]:
+    """The IMAP-only side of ``get_statistics`` (fork-local).
+
+    Never falls back to AppleScript: a failure to reach IMAP is reported.
+    """
+    try:
+        if group_limit < 1:
+            raise ValueError("top_senders_limit must be at least 1")
+        since: datetime | None = None
+        search_from = date_from
+        lower = search_summary.parse_day(date_from, "date_from")
+        search_summary.parse_day(date_to, "date_to")
+        if received_within_hours is not None:
+            if received_within_hours <= 0:
+                raise ValueError("received_within_hours must be a positive integer")
+            since = datetime.now() - timedelta(hours=received_within_hours)
+            # The server filters by whole days, on its own clock: ask from a
+            # day early so a time-zone difference cannot drop a message, and
+            # apply the exact hour to the received dates as they are read.
+            cutoff_day = since.date() - timedelta(days=1)
+            if lower is None or cutoff_day > lower:
+                search_from = cutoff_day.isoformat()
+
+        summary = search_summary.summarize(
+            query_moves.connector_for(mail, account),
+            mailbox=mailbox,
+            by=by,
+            sender_contains=sender_contains,
+            subject_contains=subject_contains,
+            date_from=search_from,
+            date_to=date_to,
+            received_since=since,
+            scan_limit=scan_limit,
+            group_limit=group_limit,
+        )
+    except Exception as exc:  # noqa: BLE001 - mapped to a structured error
+        return _query_move_error("get_statistics", exc)
+
+    if by == "domain":
+        top_senders = [
+            {"domain": g["key"], "count": g["count"]}
+            for g in summary["groups"]
+            if g["key"] != search_summary.NO_SENDER
+        ]
+    else:
+        top_senders = summary["top_senders"]
+
+    counted = summary["scanned"]
+    unread = summary["unread"]
+    statistics = {
+        "account": account,
+        "mailbox": mailbox,
+        "window": {
+            "from": date_from,
+            "to": date_to,
+            "within_hours": received_within_hours,
+        },
+        "by": by,
+        "scanned": counted,
+        "window_fully_covered": summary["window_fully_covered"],
+        "total": summary["total"],
+        "unread": unread,
+        "flagged": summary["flagged"],
+        "read_ratio": round((counted - unread) / counted, 3) if counted else 0.0,
+        "top_senders": top_senders,
+        "groups": summary["groups"],
+        "other_groups": summary["other_groups"],
+        "other_count": summary["other_count"],
+    }
+    if summary.get("interrupted"):
+        # The connection dropped part-way: the counts cover what was read.
+        statistics["interrupted"] = True
+    operation_logger.log_operation(
+        "get_statistics", {"account": account, "mailbox": mailbox, "by": by}, "success"
+    )
+    return _mark_untrusted(
+        {"success": True, "statistics": statistics}, has_content=bool(summary["groups"])
+    )
+
+
 @_tool(
     {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
 def get_statistics(
     account: str,
     mailbox: str = "INBOX",
-    received_within_hours: int | None = 720,
+    received_within_hours: int | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     by: str = "address",
     top_senders_limit: int = 10,
     scan_limit: int = 500,
+    sender_contains: str | None = None,
+    subject_contains: str | None = None,
 ) -> dict[str, Any]:
-    """Aggregate inbox statistics over a mailbox and time window.
+    """Count what a mailbox holds, grouped, without returning the messages.
 
-    A read-only analytics roll-up computed from a single ``search_messages``
-    pass — message volume, read/unread/flagged counts, read ratio, and the
-    top senders (by full address or domain). This is the consolidated
-    inbox-stats tool; per-folder unread counts live on ``list_mailboxes``
-    and are not duplicated here.
+    A read-only roll-up: message volume, read/unread/flagged counts, read
+    ratio, and counts grouped by sender address, sender domain, subject
+    pattern or day. Use it instead of ``search_messages`` to see what a
+    mailbox holds; it returns a handful of groups, not a row per message.
+    Per-folder unread counts live on ``list_mailboxes``.
 
-    The window defaults to the last ~30 days (``received_within_hours=720``);
-    pass ``date_from``/``date_to`` for an explicit range. Stats are computed
-    over at most ``scan_limit`` of the most recent messages in the window —
-    ``window_fully_covered`` is ``False`` when the window held more than that,
-    so the numbers are a recent-sample rather than a silent truncation.
+    With no dates and no ``received_within_hours`` the window is the last 30
+    days. Pass ``date_from``/``date_to`` for an explicit range (then no
+    30-day cut is applied). Counts cover at most ``scan_limit`` of the most
+    recent matching messages; ``window_fully_covered`` is ``False`` when
+    there were more, or when the time budget ran out, so the numbers are a
+    recent sample rather than a silent truncation.
+
+    ``by="subject"``, ``by="day"`` and any ``scan_limit`` above 500 read
+    over IMAP only, in bounded chunks. They fail with ``imap_required``
+    rather than fall back to AppleScript, which can leave Mail.app
+    unresponsive on a large mailbox. On a mailbox of tens of thousands,
+    keep the date range narrow.
 
     Args:
         account: Mail.app account name (e.g. "Gmail"). Required.
         mailbox: Mailbox to summarize (default "INBOX").
-        received_within_hours: Window size in hours (default 720 ≈ 30 days).
-        date_from: ISO date lower bound (composes with the window).
-        date_to: ISO date upper bound.
-        by: Group top senders by "address" (default) or "domain".
-        top_senders_limit: How many top senders to return (default 10).
-        scan_limit: Max messages aggregated (default 500; bounds cost).
+        received_within_hours: Window size in hours. Default: 720 (30 days)
+            when no dates are given, otherwise none. Composes with the dates.
+        date_from: Inclusive lower bound, YYYY-MM-DD.
+        date_to: Inclusive upper bound, YYYY-MM-DD.
+        by: "address" (default), "domain", "subject" or "day". "subject"
+            groups by pattern: numbers and dates in the subject become "#",
+            so a daily report is one group. "day" is the received day.
+        top_senders_limit: How many senders or groups to return (default 10).
+        scan_limit: Most messages counted (default 500, at most 20,000).
+        sender_contains: Only messages whose sender contains this. Use a full
+            address on iCloud; its search can miss domain fragments.
+        subject_contains: Only messages whose subject contains this.
 
     Returns:
-        ``{"success": True, "statistics": {account, mailbox, window, scanned,
-        window_fully_covered, total, unread, flagged, read_ratio,
-        top_senders: [{address|domain, count}, ...]}}``.
+        ``{"success": True, "statistics": {account, mailbox, window, by,
+        scanned, window_fully_covered, total, unread, flagged, read_ratio,
+        top_senders: [{address|domain, count}, ...]}}``. On the IMAP-only
+        path ``total`` is the full match count and the statistics also carry
+        ``groups: [{key, count}, ...]`` (most frequent first; newest first
+        for "day"), ``other_groups`` and ``other_count`` (what did not fit
+        in ``top_senders_limit``).
 
     Example:
-        >>> get_statistics(account="Gmail")
-        {"success": True, "statistics": {"total": 312, "unread": 47, ...}}
+        >>> get_statistics(account="iCloud", mailbox="Reports", by="subject",
+        ...                date_from="2026-05-01", date_to="2026-05-07")
+        {"success": True, "statistics": {"total": 28, "groups": [...], ...}}
     """
     try:
         safety_err = check_test_mode_safety("get_statistics", account=account)
@@ -2532,14 +2653,41 @@ def get_statistics(
         if rate_err:
             return rate_err
 
+        if by not in search_summary.GROUPINGS:
+            raise ValueError(
+                f"by must be one of {', '.join(search_summary.GROUPINGS)}; got {by!r}"
+            )
+        if not 1 <= scan_limit <= search_summary.MAX_SCAN:
+            raise ValueError(
+                f"scan_limit must be between 1 and {search_summary.MAX_SCAN}"
+            )
+        if received_within_hours is None and date_from is None and date_to is None:
+            received_within_hours = _STATISTICS_DEFAULT_HOURS
+
         logger.info(
             f"Computing statistics for {account}/{mailbox} "
-            f"(within_hours={received_within_hours}, scan_limit={scan_limit})"
+            f"(by={by}, within_hours={received_within_hours}, scan_limit={scan_limit})"
         )
+
+        if by in ("subject", "day") or scan_limit > _STATISTICS_SEARCH_PATH_LIMIT:
+            return _grouped_statistics(
+                account=account,
+                mailbox=mailbox,
+                received_within_hours=received_within_hours,
+                date_from=date_from,
+                date_to=date_to,
+                by=by,
+                group_limit=top_senders_limit,
+                scan_limit=scan_limit,
+                sender_contains=sender_contains,
+                subject_contains=subject_contains,
+            )
 
         rows = mail.search_messages(
             account=account,
             mailbox=mailbox,
+            sender_contains=sender_contains,
+            subject_contains=subject_contains,
             date_from=date_from,
             date_to=date_to,
             received_within_hours=received_within_hours,
@@ -2559,6 +2707,7 @@ def get_statistics(
                 "to": date_to,
                 "within_hours": received_within_hours,
             },
+            "by": by,
             "scanned": total,
             # Equal to scan_limit ⇒ the window may hold more (recent sample).
             "window_fully_covered": total < scan_limit,
@@ -2575,6 +2724,9 @@ def get_statistics(
 
         return {"success": True, "statistics": statistics}
 
+    except ValueError as e:
+        logger.error(f"Invalid statistics request: {e}")
+        return {"success": False, "error": str(e), "error_type": "validation_error"}
     except Exception as e:
         logger.error(f"Error computing statistics: {e}")
         return {
