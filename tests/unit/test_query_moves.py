@@ -48,6 +48,8 @@ class FakeConnector:
         self.sessions = 0
         self._host = "imap.example.com"
         self._email = "me@example.com"
+        self._port = 993
+        self._account_id = "fixture-account"
 
     @contextmanager
     def _session(self) -> Iterator[MagicMock]:
@@ -1328,6 +1330,7 @@ class TestCommit:
             "host": "imap.example.com", "login": "me@example.com",
             "source_mailbox": "News",
             "destination_mailbox": "_To Delete", "uidvalidity": 999,
+            "account_id": "fixture-account", "port": 993,
             "uids": [1, 2], "stage": "copied",
         }]))
         conn, store, pid, client = self._ready([1, 2], capabilities=UIDPLUS_ONLY)
@@ -1385,3 +1388,81 @@ class TestCommit:
         assert out["moved"] == 1
         assert out["outcome"] == "complete"
         assert "receipt_error" in out
+
+
+@pytest.mark.parametrize(("field", "value"), [("_port", 1993), ("_account_id", "replacement")])
+def test_preview_rejects_changed_account_or_port_before_session(field, value):
+    conn = FakeConnector(_client([1]))
+    store = qm.PreviewStore()
+    pid = _preview(conn, store)["preview_id"]
+    sessions = conn.sessions
+    setattr(conn, field, value)
+    with pytest.raises(qm.SelectionStaleError):
+        qm.commit(conn, store, preview_id=pid, max_count=1)
+    assert conn.sessions == sessions
+
+
+@pytest.mark.parametrize("stage", ["copying", "copied"])
+@pytest.mark.parametrize("extra", [{}, {"port": 993, "account_id": "former-account"}])
+def test_unbound_journal_refuses_recovery_and_leaves_record(tmp_path, stage, extra):
+    conn = FakeConnector(_client([1], capabilities=UIDPLUS_ONLY))
+    store = qm.PreviewStore()
+    pid = _preview(conn, store)["preview_id"]
+    path = tmp_path / "journal.json"
+    record = {"host": conn._host, "login": conn._email, "source_mailbox": "News",
+              "uidvalidity": 7, "uids": [1], "stage": stage, **extra}
+    original = json.dumps([record])
+    path.write_text(original)
+    with pytest.raises(qm.JournalUnreadableError):
+        qm.commit(conn, store, preview_id=pid, max_count=1, journal_path=path)
+    assert path.read_text() == original
+    conn.client.copy.assert_not_called()
+    conn.client.add_flags.assert_not_called()
+    conn.client.uid_expunge.assert_not_called()
+
+
+def test_recovery_refuses_rebuilt_source_after_verifying_copies(tmp_path):
+    conn = FakeConnector(_client([1], capabilities=UIDPLUS_ONLY))
+    store = qm.PreviewStore()
+    pid = _preview(conn, store)["preview_id"]
+    journal = tmp_path / "journal.json"
+    client = conn.client
+    client.add_flags.side_effect = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        qm.commit(conn, store, preview_id=pid, max_count=1, journal_path=journal)
+    record = journal.read_bytes()
+    client.reset_mock()
+    client.select_folder.side_effect = [{b"UIDVALIDITY": value} for value in (7, 7, 8)]
+    client.add_flags.side_effect = AssertionError("stale source UID used")
+    with pytest.raises(qm.SelectionStaleError):
+        qm.commit(conn, store, preview_id=pid, max_count=1, journal_path=journal)
+    client.add_flags.assert_not_called()
+    client.uid_expunge.assert_not_called()
+    assert journal.read_bytes() == record
+
+
+@pytest.mark.parametrize("binding", [{}, {"account_id": "other", "port": 993}])
+def test_destination_guard_preserves_ambiguously_bound_copy(binding):
+    conn = FakeConnector(_client([1]))
+    store = qm.PreviewStore()
+    entry = store.get(_preview(conn, store)["preview_id"])
+    journal = qm.MoveJournal(None)
+    record = {"host": conn._host, "login": conn._email, "stage": "copying",
+              "source_mailbox": "another-source", "destination_mailbox": entry.destination_mailbox,
+              "dest_uidnext": 100, "uids": [1], **binding}
+    journal.add(record)
+    with pytest.raises(qm.JournalUnreadableError):
+        qm._guard_destination(journal, entry, (7, 110))
+    assert journal.load() == [record]
+
+
+def test_lost_copy_lookup_refuses_rebuilt_source_on_return(monkeypatch):
+    client = _client([1])
+    monkeypatch.setattr(qm, "_message_ids", lambda *_: {1: b"<fixture@test>"})
+    client.select_folder.side_effect = [{b"UIDVALIDITY": 7}, {b"UIDVALIDITY": 8}]
+    record = {"destination_mailbox": "dest", "dest_uidvalidity": 7, "uidvalidity": 7,
+              "dest_uidnext": 100, "dest_uidceil": 100}
+    with pytest.raises(qm.SelectionStaleError):
+        qm._locate_copies(client, record, [1], "News", set())
+    client.add_flags.assert_not_called()
+    client.uid_expunge.assert_not_called()

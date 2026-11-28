@@ -30,6 +30,7 @@ from tests.unit.test_query_moves import FakeConnector, _client
 pytestmark = pytest.mark.e2e
 
 EXPECTED_TOOLS = {
+    "check_account",
     # Discovery
     "list_accounts",
     "list_mailboxes",
@@ -148,6 +149,10 @@ _PREVIEW_ID = "__PREVIEW_ID__"
 
 # (tool_name, call_args, connector_method, connector_return_value)
 INVOCATION_CASES: list[tuple[str, dict[str, Any], str | None, Any]] = [
+    (
+        "check_account", {"account": "TestAccount"}, "check_account",
+        {"success": True, "imap": {"status": "available"}},
+    ),
     (
         "list_accounts",
         {},
@@ -320,7 +325,7 @@ class TestToolInvocation:
             uidvalidity=7,
             uids=[1, 2],
             selector={"sender_contains": "news@example.com"},
-            identity=(connector._host, connector._email),
+            identity=query_moves._identity(connector),
         )
 
     @pytest.mark.parametrize(

@@ -9,6 +9,34 @@ class MailError(Exception):
     pass
 
 
+class MailMutationOutcomeUnknownError(MailError):
+    """A dispatched mutation did not receive a conclusive acknowledgment.
+
+    Never include this in transport fallback tuples: replay may duplicate an
+    already-applied operation. Confirmed steps describe acknowledgments, not
+    completion of the entire requested operation.
+    """
+
+    def __init__(
+        self, *, operation: str, phase: str, requested: int,
+        confirmed_steps: tuple[str, ...] = (), mailbox: str | None = None,
+        candidate_draft_id: str | None = None,
+        confirmed_progress: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(
+            f"{operation} may have changed mail, but completion could not be "
+            f"confirmed during {phase}. Inspect the affected mailbox before "
+            "retrying; the operation was not replayed."
+        )
+        self.operation = operation
+        self.phase = phase
+        self.requested = requested
+        self.confirmed_steps = confirmed_steps
+        self.mailbox = mailbox
+        self.candidate_draft_id = candidate_draft_id
+        self.confirmed_progress = confirmed_progress
+
+
 class MailAccountNotFoundError(MailError):
     """Account does not exist."""
 
@@ -48,6 +76,27 @@ class MailImapRequiredError(MailError):
     the operation."""
 
     pass
+
+
+class MailNativeMoveIncompleteError(MailImapRequiredError):
+    """Some messages verifiably stayed in the source after native move."""
+
+    def __init__(
+        self, *, mailbox: str, requested: int,
+        confirmed_progress: dict[str, int], retry_message_ids: list[str],
+    ) -> None:
+        super().__init__(
+            f"Some messages stayed in the source after the move to {mailbox!r}. "
+            "Read/flag changes and other moves may already have completed. "
+            "Configure IMAP with `apple-mail-fast-mcp setup-imap --account <name>`, "
+            "resolve retry_message_ids to RFC Message-IDs and use a move-only update "
+            "with source_mailbox for those messages. "
+            "Do not replay the entire combined update."
+        )
+        self.mailbox = mailbox
+        self.requested = requested
+        self.confirmed_progress = confirmed_progress
+        self.retry_message_ids = retry_message_ids
 
 
 class MailAttachmentIndexError(MailError):

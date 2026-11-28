@@ -30,6 +30,7 @@ pytestmark = pytest.mark.e2e
 EXPECTED_TOOLS = {
     # Discovery
     "list_accounts",
+    "check_account",
     "list_mailboxes",
     "list_rules",
     "search_messages",

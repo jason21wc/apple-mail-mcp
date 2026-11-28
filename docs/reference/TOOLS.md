@@ -4,7 +4,7 @@ Complete reference for all MCP tools provided by the Apple Mail MCP server.
 
 ## Overview
 
-**Total Tools:** 25 (11 read-only, 14 mutating — see Classification below). See the [CHANGELOG](../../CHANGELOG.md) for the version history.
+See Classification below and the [CHANGELOG](../../CHANGELOG.md) for the version history.
 
 ## Tool annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`)
 
@@ -19,7 +19,7 @@ Every tool ships with the per-tool annotations the MCP 2025-03 spec defines so h
 
 **Classification:**
 
-- **Read-only:** `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `preview_move_by_query`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
+- **Read-only:** `check_account`, `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `preview_move_by_query`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
 - **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`, `save_template`, `commit_move_by_query`. All have `destructiveHint=true`, and `idempotentHint=true` except `commit_move_by_query` (each call moves the next slice of a preview). `save_attachments` and `save_template` are here because `overwrite=true` can replace state the caller did not create — the annotation describes capability, not the default path, which refuses to clobber.
 - **Mutating additive:** `create_mailbox`, `create_draft`, `create_rule`. All have `destructiveHint=false`. Idempotent except `create_draft` and `create_rule` (each call may create a new entity).
 
@@ -27,7 +27,67 @@ Counts are deliberately omitted — they are derivable and go stale. `make eval-
 
 **Host doesn't honor annotations?** Use the split-server config in the [README](../../README.md#optional-split-read--write-servers). Pass `--read-only` to one connector entry to expose only the read-only tools; pair with a second non-read-only entry. Claude Desktop's per-server permission UI then naturally groups them. The two approaches compose: annotations describe the model, the split-server flag enforces it client-side.
 
+## Raw-message retrieval limits
+
+IMAP raw MIME retrieval uses size preflight and bounded `BODY.PEEK` ranges.
+`APPLE_MAIL_MCP_MAX_RAW_MESSAGE_BYTES` sets a positive integer byte budget;
+the default is **500 MiB (524,288,000 bytes)**. A missing or inconsistent size,
+short/inconsistent range, or interrupted transfer is an explicit
+`message_read_incomplete` error. A declared or observed transfer beyond the
+budget returns `raw_message_too_large`. Neither error triggers an unbounded
+IMAP fetch or AppleScript fallback.
+
+This applies to message-body/raw reads, attachment retrieval, reply/forward
+source reads, and IMAP draft attachment preservation. Headers-only reads do not
+fetch the raw body. The budget is separate from the response-body, decoded
+inline attachment, and disk-save caps. It bounds payload/literal transfer,
+**not protocol framing or process memory**: MIME parsing and payload decoding
+can allocate additional copies.
+
+For unambiguous MIME structures, attachment tools retrieve only the selected
+part sections using bounded partial `BODY.PEEK` requests and decode only those
+parts. The server-reported enclosing message size must still pass the raw-message
+ceiling, and selected transfers share a cumulative allowance. Each selected
+section is checked against its reported size and end-of-section; this does not
+verify the size of unrequested sections. Forwarded `.eml` attachments,
+unsupported encodings, and ambiguous structures use the bounded canonical MIME
+path before any selected payload is fetched. A transfer, size, or decoding error
+does not trigger another retrieval path. Metadata-only requests never download
+payloads; incomplete structure metadata is an explicit error, not an empty list.
+
+A failed draft-preservation read keeps the original draft and reports
+`original_draft_id` on `update_draft`. Fix the source/read problem or deliberately
+adjust the budget before retrying; a limit failure is not evidence of absence.
+
 ## Phase 1 Tools (v0.1.0) - Core Foundation
+
+### check_account
+
+Diagnose one configured account without fetching messages or changing mail.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `account` | string | Yes | - | Current Mail.app account name or UUID; ambiguous names are rejected. |
+| `mailbox` | string | No | `INBOX` | Exact folder to examine read-only. |
+
+Uses the same account, endpoint, login, and credential precedence as normal
+operations. Opens a fresh unpooled connection for authentication, capabilities,
+and read-only mailbox examination. It does not search or fetch messages, update
+configuration, or alter the circuit breaker, even if that breaker is open.
+
+Returns `account`, `endpoint` (host/port), `credential` (source label and whether
+the name or UUID matched), `mail`, `imap`, `mailbox`, and `breaker` components.
+Credentials and raw server/Keychain errors are never returned. Capability output
+is limited to features relevant to this server. A missing credential, rejected
+login, or unavailable mailbox is a completed diagnostic: `success:true` with
+component `status`, `error_type`, and corrective `guidance`. Invalid input or an
+unresolved account returns `success:false`.
+
+Each diagnostic Keychain subprocess is bounded to 30 seconds. Network operations
+retain the production timeout settings. These limits do not establish a hard
+overall deadline, including DNS/TLS setup and multiple credential lookups. A
+successful diagnostic proves only the listed checks; it does not certify sends,
+attachments, mutations, or every client installation.
 
 ### search_messages
 
@@ -177,7 +237,7 @@ Retrieve full details of one or more messages, with bodies. Returns a list (alwa
 
 **Performance note (path-dependent cost):**
 
-For accounts configured with IMAP (via `apple-mail-fast-mcp setup-imap --account <name>`), `include_attachments` is essentially free — `BODYSTRUCTURE` bundles into the existing FETCH. For accounts without IMAP, the AppleScript fallback enumerates attachments per message — fine for small id lists (1-10) but can be slow on cold caches for larger lists. If you have a mix of IMAP-configured and non-IMAP accounts, expect variance. To opt out: pass `include_attachments=False`.
+For accounts configured with IMAP (via `apple-mail-fast-mcp setup-imap --account <name>`), metadata-only reads use `BODYSTRUCTURE` without fetching attachment payloads. For accounts without IMAP, the AppleScript fallback enumerates attachments per message — fine for small id lists (1-10) but can be slow on cold caches for larger lists. If you have a mix of IMAP-configured and non-IMAP accounts, expect variance. To opt out: pass `include_attachments=False`.
 
 **Returns:**
 
@@ -443,11 +503,17 @@ Patch one or more messages: change read state, flag color, and/or move to anothe
 | `source_mailbox` | string \| null | No | null | Optional narrow-path hint — narrows the AppleScript scan to one mailbox. Required to unlock the IMAP fast path on move-only patches (#149) — without it, the move runs via AppleScript even when IMAP is configured. |
 | `gmail_mode` | boolean | No | false | **Deprecated and ignored (#364).** The move strategy is chosen automatically; this flag does nothing. Slated for removal at v1.0 (#369). |
 
-> **Gmail label moves (#364).** The old `gmail_mode` copy+delete strategy silently routed Gmail INBOX→label moves through `[Gmail]/Trash` (stripping the destination label) and reported success anyway — data loss. It has been removed. Moves now run via IMAP `UID MOVE` when the account has IMAP configured (the reliable Gmail relabel); otherwise via a **verified** AppleScript `set mailbox`. If a move can't be confirmed (the Gmail silent-no-op), `update_message` returns `error_type: "imap_required"` instead of falsely succeeding — configure IMAP with `apple-mail-fast-mcp setup-imap --account <name>` and pass `source_mailbox`.
+> **Gmail label moves (#364).** The old `gmail_mode` copy+delete strategy silently routed Gmail INBOX→label moves through `[Gmail]/Trash` (stripping the destination label) and reported success anyway — data loss. It has been removed. Moves now run via IMAP `UID MOVE` when the account has IMAP configured (the reliable Gmail relabel); otherwise via a **verified** AppleScript `set mailbox`. If Mail verifies that a message stayed in its original mailbox (the Gmail silent-no-op), `update_message` returns `error_type: "imap_required"`. An unreadable or unexpected post-move mailbox is instead `mutation_outcome_unknown`.
 
 **Patch semantics:** caller specifies only the fields they want changed. At least one field parameter must be set; otherwise returns `validation_error`.
 
 **Order of operations:** read-state and flag changes apply first (in the source mailbox), then the move. IMAP requires the message to exist in the source folder for STORE before MOVE.
+
+**Incomplete moves:** combined updates apply read/flag properties before moving. A verified native no-op returns `imap_required`, `partial: true`, `retry_safe: false`, and `confirmed_progress`: counts of acknowledged `read_status`, `flag_index`, `flagged_status`, `moved`, `not_moved`, `not_found`, and `unknown` outcomes. The two flag counters are separate because Mail can acknowledge the index change before a flag-status change fails. Counts describe local acknowledgments, not proof of server synchronization. A later failure does not roll back earlier properties or messages.
+
+For a verified no-op, `retry_operation: "move_only"` and `retry_message_ids` identify only messages observed still in the source (`retry_id_type: "mail"` means numeric Mail IDs). Configure IMAP with `apple-mail-fast-mcp setup-imap --account <name>` if needed, obtain those messages' RFC Message-IDs with scoped `get_messages`, and retry only the move with `account` and `source_mailbox`. Repeating numeric IDs would still select AppleScript. Do not replay the whole combined update.
+
+**Uncertain mutation results:** loss of an IMAP MOVE/COPY/STORE/UID EXPUNGE/APPEND acknowledgment, an interrupted native move, or unreadable native move verification returns `mutation_outcome_unknown`, `partial: true`, and `retry_safe: false`; the server does not replay the operation through another transport. `phase` identifies the uncertain stage. `confirmed_steps` records completed IMAP stages; native `confirmed_progress`, when available, records local counts. Missing progress means unknown, not zero changes. Inspect the affected mailboxes before attempting another mutation. Draft APPEND failures may include `candidate_draft_id`; failed draft replacement also preserves and reports `original_draft_id`.
 
 **Move synchronization:** a move performed through AppleScript (including a numeric Mail.app ID) is verified using Mail's local state. Success does not guarantee that the IMAP server already sees the message in the destination mailbox. An immediate follow-up using an RFC Message-ID and the destination mailbox can therefore resolve no message and report zero updates while Mail synchronizes. When applying flags or read state with a move, prefer one combined `update_message` call, which applies those changes before moving. Separate IMAP-dependent operations require server visibility first; the server does not automatically wait for cross-path synchronization.
 
@@ -519,7 +585,8 @@ update_message(
 - `validation_error`: Too many IDs, no fields set, or missing `account` for move
 - `account_not_found`: `account` does not match a configured Mail.app account
 - `not_found`: `destination_mailbox` not found on the account
-- `imap_required`: A move could not be confirmed via AppleScript (the Gmail silent-no-op) and the account has no IMAP configured (#364). Run `apple-mail-fast-mcp setup-imap --account <name>` and pass `source_mailbox`.
+- `imap_required`: Mail verified that at least one move stayed in the source. Inspect `confirmed_progress` and follow the move-only retry guidance above. This can also occur with IMAP configured when numeric IDs or a combined patch selected AppleScript.
+- `mutation_outcome_unknown`: A mutation may have applied but its result could not be confirmed; inspect before retrying. No transport replay occurs.
 - `unknown`: Unexpected error occurred
 
 ---
@@ -612,7 +679,7 @@ Moves exactly the previewed messages. Mail that arrives after the preview is nev
 ```
 
 - `outcome`: `"complete"` (everything previewed has been handled), `"more"` (call again), or `"failed"` (IMAP failed part-way; `success` is `false`, `error` says why).
-- After a failure, `remaining` is recounted on a fresh connection, and `moved_unconfirmed` counts messages that left the source without a confirmed reply (the server applied a chunk but the reply was lost). If the recount also fails, `remaining` is `null` with `remaining_unverified: true`. Calling again is safe: each chunk is checked for presence before it is moved, so nothing moves twice. One exception on servers without `MOVE` (iCloud): if a call fails after the copy landed but before the originals were removed, the retry copies those messages again, leaving duplicates in the destination. Nothing is lost.
+- After a failure, the server recounts the source on a fresh connection. `moved_unconfirmed` counts messages absent from the source without a confirmed move reply. If the recount fails, `remaining` is `null` and `remaining_unverified` is `true`. On UIDPLUS servers, including iCloud, the journal controls which interrupted moves can resume, as described below.
 - `already_gone` counts previewed messages that were no longer in the source (for example moved by hand in the meantime).
 - `resumed` (when present) counts messages whose removal an earlier interrupted call left unfinished and this call completed. Their copy had already landed, so they are not copied again.
 - `server_slow` with `retry_after_seconds` (when present): the mail server has stopped keeping up, either because a step timed out or because a copy whose reply was lost may still land. Wait that long before the next call; calling sooner moves nothing.
@@ -637,8 +704,8 @@ The preview leaves out messages already flagged deleted and reports them as `fla
 **Error Types:**
 - `preview_not_found`: Unknown, completed, or expired `preview_id`, or the server restarted
 - `max_count_exceeded`: The previewed set is larger than `max_count`
-- `selection_stale`: The source mailbox was rebuilt since the preview (UIDVALIDITY changed). Preview again, or the account now resolves to a different server or login
-- `journal_unreadable`: The interrupted-move journal cannot be read; nothing moves until it is inspected
+- `selection_stale`: The source mailbox was rebuilt (UIDVALIDITY changed), or the resolved account UUID, IMAP host, port, or login changed. Preview again.
+- `journal_unreadable`: Inspect the interrupted-move journal and the affected mailboxes. An unreadable journal or an overlapping record without a matching account UUID and known port blocks recovery. Older records lack this identity information and require manual reconciliation.
 - `commit_in_progress`: Another commit call is still working on this preview, or another move into the same destination mailbox is running. Wait, then call or preview again
 - `confirmation_required` / `cancelled`: Trash destination not confirmed
 - `imap_required`, `unsupported_account`, `imap_move_unsupported`, `imap_error`: as for the preview
@@ -772,15 +839,21 @@ Save attachments from a message to a directory.
 |-----------|------|----------|---------|-------------|
 | `message_id` | string | Yes | - | Message ID to save attachments from |
 | `save_directory` | string | Yes | - | Directory path to save attachments. `~` is expanded. Must already exist — the tool does not create it (`directory_not_found` otherwise). |
-| `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
+| `attachment_indices` | list[int] | No | None | Specific zero-based attachment indices (None = all) |
 | `output_filename` | string | No | None | **Fork extension.** Save under this exact (sanitized) name instead of the attachment's own. Requires exactly one entry in `attachment_indices`. |
 | `overwrite` | bool | No | `false` | Only meaningful with `output_filename`. Default is **no-clobber**: an existing destination is left untouched and the call returns `error_type: "already_exists"`. `true` replaces it atomically. |
-| `account` | string | No | None | Mail.app account name or UUID. With `mailbox`, takes the IMAP fast path (one fetch). Pass the same values you read the message with so attachment ordering matches. |
+| `account` | string | No | None | Mail.app account name or UUID. With `mailbox`, enables IMAP for RFC Message-IDs; numeric Mail.app IDs use scoped native lookup. Pass the same scope used to read the message. |
 | `mailbox` | string | No | None | Folder the message lives in (e.g. "INBOX"), used with `account` for the IMAP fast path. |
 
 **Overwrite behavior:** the no-clobber guarantee applies to the `output_filename` path only, where the commit is an atomic `os.link` (so two concurrent saves cannot both win). The **bulk path** — no `output_filename`, saving attachments under their own names — writes through the connector and *does* overwrite same-named files in the destination. Save one attachment per call with `output_filename` when that matters. A directory at the destination is rejected with `error_type: "invalid_destination"` rather than nested into.
 
-**Performance (#371):** pass `account` + `mailbox` to fetch the message once over IMAP and write the bytes straight to disk. Without them, `save_attachments` falls back to an O(accounts × mailboxes) AppleScript scan whose unindexed `message id` lookup is ~20s/mailbox — on Gmail (dozens of labels) that can run for minutes and time out. Mirrors `get_attachment_content`'s fast path.
+**IMAP retrieval:** pass `account` + `mailbox` with an RFC Message-ID to use
+bounded selected-part retrieval where the MIME structure is unambiguous, otherwise
+bounded full-message retrieval. Only requested attachment payloads are decoded;
+original indices, caller selection order, collision filenames, and cap priority
+are preserved. Invalid save indices are ignored as before; an empty selection
+saves nothing. The raw-message budget can reject the enclosing message even
+when the requested attachment is small. See [raw retrieval limits](#raw-message-retrieval-limits).
 
 **Returns:**
 
@@ -789,15 +862,45 @@ Save attachments from a message to a directory.
   "success": true,
   "saved": 2,
   "directory": "/Users/me/Downloads",
-  "rejected": []
+  "rejected": [],
+  "attachments_found": 2,
+  "selected": 2,
+  "attempted": 2,
+  "failed": 0,
+  "failures": [],
+  "partial": false,
+  "reason": null
 }
 ```
 
-`saved` is the number of attachments written. `rejected` lists any attachments skipped by the byte
+`saved` is the number of acknowledged writes retained after size checks. `rejected` lists any attachments skipped by the byte
 caps (per-attachment default 100 MB, aggregate 500 MB per call — disk-fill DoS protection, #236),
 each as `{"name", "size", "reason"}` where reason is `per_attachment_cap` / `aggregate_cap` (pre-check)
 or `*_postwrite` (an oversized file deleted after writing). Override the caps with
 `APPLE_MAIL_MCP_MAX_ATTACHMENT_BYTES` / `APPLE_MAIL_MCP_MAX_TOTAL_ATTACHMENT_BYTES`.
+
+`attachments_found` counts canonical attachment slots; `selected` counts valid
+selection entries before caps (including repeated indices). `attempted` counts
+save targets. `failed` counts targets without a save acknowledgment, and
+`failures` identifies their original indices, names, and available error codes.
+A failed save can leave partial bytes; it does not establish that the file is
+unchanged. Local write failures never trigger a retry through another transport.
+Postwrite cleanup checks only acknowledged writes, protecting pre-existing files
+at destinations whose saves failed.
+
+Confirmed empty results distinguish `no_attachments`, `no_valid_selection`, and
+`all_rejected`. Cap-only exclusions preserve `success: true` and set `partial`.
+Any acknowledged per-target failure returns `success: false`,
+`error_type: "attachment_save_failed"`, `partial: true`, and `retry_safe: false`.
+An interrupted operation or malformed receipt instead returns
+`attachment_save_incomplete`, with `phase`, `targets`, and any known
+`acknowledged_writes`; unknown counts are omitted. Inspect the destination before
+retrying either failure. Metadata such as `downloaded: false` is not a diagnosis
+of why a save failed.
+
+With `output_filename`, a temporary save is counted only after the final atomic
+commit succeeds. A name collision preserves the destination. Cleanup or audit
+logging errors cannot replace an already established save result.
 
 **Examples:**
 
@@ -812,7 +915,7 @@ save_attachments(
 save_attachments(
     message_id="12345",
     save_directory="/Users/me/Downloads",
-    attachment_indices=[1, 3]  # Save 1st and 3rd only
+    attachment_indices=[0, 2]  # Save 1st and 3rd only
 )
 ```
 
@@ -834,7 +937,7 @@ Read **one** attachment's content inline, without writing it to disk — for "tr
 |-----------|------|----------|---------|-------------|
 | `message_id` | string | Yes | - | Message id as returned by `search_messages` / `get_messages` (RFC 5322 Message-ID on the IMAP path, Mail's internal id on the AppleScript path). |
 | `attachment_index` | integer | Yes | - | **0-based** index into the message's attachments, in the same order `get_attachments` / `get_messages(include_attachments=True)` report. |
-| `account` | string \| null | No | null | Mail.app account name or UUID. Supply it (with `mailbox`) for the faster IMAP path; pass the same value you read the message with so ordering matches. |
+| `account` | string \| null | No | null | Mail.app account name or UUID. With `mailbox`, enables IMAP for RFC Message-IDs; numeric Mail.app IDs retain native account/mailbox scope. Pass the same scope used to read the message. |
 | `mailbox` | string \| null | No | null | Folder the message lives in (for the IMAP path). |
 
 **Returns:**
@@ -852,6 +955,11 @@ Read **one** attachment's content inline, without writing it to disk — for "tr
 
 - **Encoding:** text-like types (`text/*`, `application/json`, `application/xml`, and `+json`/`+xml` suffixes) are returned as a UTF-8 string with `encoding: "text"`. Everything else — and any text type whose bytes aren't valid UTF-8 — is base64 with `encoding: "base64"`.
 - **No disk:** the IMAP path fetches and decodes the part in memory; the AppleScript fallback saves to a private temp dir, reads, and deletes it (no caller-managed file).
+
+**Raw retrieval:** IMAP decodes only the requested attachment index. The
+separate [raw-message transfer budget](#raw-message-retrieval-limits) applies
+before decoding; `raw_message_too_large` and `message_read_incomplete` do not
+fall back to AppleScript.
 
 **Size limit:** attachments over ~25 MB are rejected (`error_type: "attachment_too_large"`) — use `save_attachments` for large files. Override with `APPLE_MAIL_MCP_MAX_INLINE_ATTACHMENT_BYTES`.
 
@@ -1193,12 +1301,35 @@ that account has SMTP + IMAP credentials, `create_draft` now submits a clean,
 wrapper-free RFC 822 message (the same `build_draft_mime` output as the draft
 path) directly over the account's **SMTP** server, reusing the account's IMAP
 app-password (no separate SMTP credential). It falls back to the AppleScript
-send when SMTP isn't configured/reachable. In test mode (`MAIL_TEST_MODE`),
+send when SMTP is unavailable before submission starts (configuration, connection,
+or authentication failure). Once submission starts, rejection or uncertainty
+never triggers a send through another transport. In test mode (`MAIL_TEST_MODE`),
 the SMTP path re-verifies every **resolved** recipient — including reply-all
 recipients derived inside the connector — against the reserved-domain
 allowlist at the transport boundary and refuses the send
 (`error_type: "safety_violation"`) on a violation, closing the #175 class of
 bypass for the new transport.
+
+**SMTP outcomes:** a connection/protocol failure after submission begins returns
+`error_type: "mutation_outcome_unknown"`, `operation: "smtp_send"`,
+`phase: "submission"`, `partial: true`, and `retry_safe: false`.
+`requested` is the number of envelope recipients. `candidate_message_id`, when
+available, identifies the submitted MIME message for reconciliation; it does
+not prove delivery. Inspect delivery before retrying. SMTP acceptance itself
+means acceptance by the submission server, not final inbox delivery.
+
+Explicit sender, recipient, or DATA rejection returns `smtp_rejected`, the
+rejection `phase`, and status codes (`smtp_code` or per-recipient
+`refused_recipients` codes), without arbitrary server rejection text.
+`retry_safe: false` means correct the rejection before a new explicit send;
+the server does not switch transports to override it. Both failures preserve
+and report `original_draft_id` when sending an existing draft through
+`update_draft`.
+
+QUIT/close, Sent-copy, and post-send audit failures cannot erase accepted
+submission or trigger resend. An audit failure adds `audit_log_failed: true`
+and a warning while preserving the result. Partial recipient acceptance keeps
+its existing `delivery` details and retains the original draft on update.
 
 **Examples:**
 
@@ -1240,11 +1371,15 @@ create_draft(
 - `file_not_found`: An attachment path doesn't exist.
 - `html_requires_imap`: `body_html` was set but the clean IMAP path couldn't engage (no Keychain opt-in / IMAP credentials). HTML drafts are never silently downgraded to plain text.
 - `cancelled`: User declined the elicitation prompt (when `send_now=True`).
+- `mutation_outcome_unknown`: SMTP submission or draft APPEND may have applied but its acknowledgment is uncertain; inspect before retrying.
+- `smtp_rejected`: Explicit SMTP rejection; status codes are provided, and no native resend occurs.
 - `applescript_error`, `unknown`: Lower-level failures.
 
 ---
 
 ### update_draft
+
+An IMAP-created draft can be readable on the server before Mail.app indexes its Message-ID. The native lookup briefly polls Drafts before replacement or deletion. If Mail still cannot find the draft, verify the original in Drafts before trying again.
 
 Update an existing draft. Implemented as **create replacement, then remove original** —
 Mail.app forbids mutating saved drafts, so this tool reads the
@@ -1518,7 +1653,7 @@ List all configured email accounts in Apple Mail, with identity, type, and enabl
 
 **Field notes:**
 
-- `id`: Account UUID. Stable across display-name changes; future tools may accept this in place of `name`.
+- `id`: Account UUID. Stable across display-name changes; account-scoped tools accept it in place of `name`. Name and UUID resolve the same current configuration and credentials; ambiguous names are rejected.
 - `account_type`: One of `imap`, `pop`, `iCloud`, `hotmail`, `iCal`, `smtp`. Derived from Mail's internal type constant.
 - `enabled`: `false` for accounts the user has disabled in Mail.app preferences.
 
@@ -1690,7 +1825,10 @@ Breaking changes will only occur in major versions (1.0.0, 2.0.0, etc.).
   create another draft or send again. A partial SMTP send retains the original
   draft and names it in the result for recovery.
 - SMTP sends return `delivery.accepted_recipients`, `refused_recipients` (SMTP
-  code and message), and `partial`. Acceptance means the submission server
+  status codes only), and `partial`. Acceptance means the submission server
   accepted the recipient, not proof of final inbox delivery. A partial result
   must never be retried for the original full recipient list. SMTP teardown
-  errors do not discard an already accepted result.
+  errors do not discard an already accepted result. Lost submission replies return
+  `mutation_outcome_unknown`; explicit rejection returns `smtp_rejected`. Neither
+  permits automatic native resend. Audit failures preserve delivery details and
+  add `audit_log_failed: true`.

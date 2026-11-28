@@ -9,6 +9,9 @@ from apple_mail_fast_mcp.exceptions import (
     MailMessageNotFoundError,
 )
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+from tests.attachment_fixtures import selected_payloads_from_raw
+
+pytestmark = pytest.mark.usefixtures("_stub_transport_account_identity")
 
 
 class TestGetAttachments:
@@ -113,9 +116,10 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"document.pdf","mime_type":"application/pdf",'
             '"size":1,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
 
+        (tmp_path / "document.pdf").write_bytes(b"x")
         result = connector.save_attachments(
             message_id="12345",
             save_directory=tmp_path,
@@ -136,9 +140,12 @@ class TestSaveAttachments:
             '[{"name":"a.pdf","mime_type":"application/pdf","size":1,"downloaded":true},'
             '{"name":"b.pdf","mime_type":"application/pdf","size":2,"downloaded":true},'
             '{"name":"c.pdf","mime_type":"application/pdf","size":3,"downloaded":true}]',
-            "3",
+            '{"saved_positions":[0,1,2],"failures":[]}',
         ]
 
+        (tmp_path / "a.pdf").write_bytes(b"x")
+        (tmp_path / "b.pdf").write_bytes(b"x")
+        (tmp_path / "c.pdf").write_bytes(b"x")
         result = connector.save_attachments(
             message_id="12345",
             save_directory=tmp_path
@@ -180,8 +187,9 @@ class TestSaveAttachments:
             '"size":100,"downloaded":true},'
             '{"name":"b.bin","mime_type":"application/octet-stream",'
             '"size":100,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "a.bin").write_bytes(b"x")
         result = connector.save_attachments("12345", tmp_path)
         assert result["saved"] == 1
         assert [r["reason"] for r in result["rejected"]] == ["aggregate_cap"]
@@ -197,8 +205,9 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"unknown.bin","mime_type":"application/octet-stream",'
             '"size":0,"downloaded":false}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "unknown.bin").write_bytes(b"x")
         result = connector.save_attachments("12345", tmp_path)
         assert result["saved"] == 1
         assert result["rejected"] == []
@@ -215,7 +224,7 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"big.bin","mime_type":"application/octet-stream",'
             '"size":5,"downloaded":false}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
         # ...but the actual written file is 100 bytes (> 10-byte cap).
         written = tmp_path / "big.bin"
@@ -250,8 +259,9 @@ class TestSaveAttachments:
         mock_run.side_effect = [
             '[{"name":"../../outside.pdf","mime_type":"application/pdf",'
             '"size":3,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "outside.pdf").write_bytes(b"x")
         result = connector.save_attachments("12345", tmp_path)
         script = mock_run.call_args.args[0]
         assert result["saved"] == 1
@@ -365,8 +375,9 @@ class TestSaveAttachmentsPathTraversal:
         mock_run.side_effect = [
             '[{"name":"../../../../tmp/evil.sh","mime_type":"x",'
             '"size":1,"downloaded":true}]',
-            "1",
+            '{"saved_positions":[0],"failures":[]}',
         ]
+        (tmp_path / "evil.sh").write_bytes(b"x")
         result = connector.save_attachments(message_id="123", save_directory=tmp_path)
 
         assert result["saved"] == 1
@@ -422,7 +433,7 @@ class TestGetAttachmentContent:
         import contextlib
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)
@@ -432,13 +443,13 @@ class TestGetAttachmentContent:
         assert result["name"] == "notes.txt"
         assert result["mime_type"] == "text/plain"
         assert result["payload"] == b"hello from a text attachment\n"
-        mock_imap.fetch_raw_message.assert_called_once_with("<m@x>", "INBOX")
+        mock_imap.fetch_attachment_payloads.assert_called_once_with("<m@x>", "INBOX", indices=[0])
 
     def test_imap_path_binary_attachment(self, connector, tmp_path):
         import contextlib
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)
@@ -454,7 +465,7 @@ class TestGetAttachmentContent:
         from apple_mail_fast_mcp.exceptions import MailAttachmentIndexError
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)
@@ -470,7 +481,7 @@ class TestGetAttachmentContent:
         connector = AppleMailConnector(timeout=30, max_inline_attachment_bytes=4)
         raw = self._raw_with_attachments(tmp_path)
         mock_imap = MagicMock()
-        mock_imap.fetch_raw_message.return_value = raw
+        mock_imap.fetch_attachment_payloads.side_effect = selected_payloads_from_raw(raw)
         with contextlib.ExitStack() as stack:
             for p in self._imap_patches(connector, mock_imap):
                 stack.enter_context(p)

@@ -131,7 +131,12 @@ On first run, macOS will prompt for Automation access. Grant permission in:
 
 `search_messages` works out of the box via AppleScript. For large mailboxes (thousands of messages), AppleScript's `whose` clause can take 1–5 seconds per query. If you want faster server-side search, you can enable IMAP delegation per account by adding a Keychain entry.
 
-**How it works.** If credentials exist for an account, the server uses IMAP (fast, server-side SEARCH). Otherwise — or on any IMAP failure (offline, wrong password, timeout) — it silently falls back to AppleScript. You never lose functionality; you only gain speed when IMAP is configured and reachable. The normal opt-in is a Keychain entry (below); an environment-variable fallback ([further down](#environment-variable-fallback-uvx--headless--ci)) covers contexts where the Keychain isn't usable.
+Use `check_account(account, mailbox="INBOX")` to diagnose the selected endpoint,
+credential source, authentication, mailbox access, and circuit breaker. It uses
+a fresh connection and reads no messages. Completed unhealthy checks return
+component guidance; they do not change configuration or reset the breaker.
+
+**How it works.** Configured server-hosted accounts prefer IMAP. Native features and eligible pre-dispatch failures use AppleScript. Incomplete reads, resource-limit failures, and uncertain mutations are reported explicitly; fallback does not guarantee identical behavior or latency. The normal opt-in is a Keychain entry (below); an environment-variable fallback ([further down](#environment-variable-fallback-uvx--headless--ci)) covers contexts where the Keychain isn't usable.
 
 **One-time setup per account — the `setup-imap` subcommand walks you through it:**
 
@@ -170,7 +175,9 @@ APPLE_MAIL_MCP_IMAP_PASSWORD_<SUFFIX>
 | `Yahoo!` | `APPLE_MAIL_MCP_IMAP_PASSWORD_YAHOO` |
 | `My Gmail` | `APPLE_MAIL_MCP_IMAP_PASSWORD_MY_GMAIL` |
 
-When set to a non-empty value, the env var is used **in preference to** any Keychain entry for that account (it's checked first, with no `security` shell-out). An empty or whitespace-only value is ignored and the Keychain path is used. The lookup composes with the name↔UUID fallback, so an env var keyed on the account name is still found when a caller passes the account's UUID.
+When set to a non-empty value, the env var is used **in preference to** any Keychain entry for that account (it's checked first, with no `security` shell-out). An empty or whitespace-only value is ignored and the Keychain path is used. Callers can supply the current account name or UUID: both resolve the same current name first, then the UUID only if credentials are absent. Access denial and authentication failure do not select another credential. Duplicate account names are rejected rather than guessed.
+
+Login and server overrides likewise prefer the current name, then the UUID. A server override is selected as a whole record, so host and port cannot come from different records. Each operation uses one account snapshot; circuit breakers use the stable UUID. Renaming an account does not search historical names for configuration or credentials.
 
 > ⚠️ **Security tradeoff.** Environment variables are far less private than the Keychain — they're visible via `ps -E`, `launchctl getenv`, `/proc`-style introspection, and process crash dumps, and they're easy to leak into logs or shell history. **Use this only when the Keychain genuinely isn't an option** (uvx, Docker, CI, headless). For Claude Desktop and standard local installs, stick with `setup-imap` + Keychain.
 >
@@ -251,6 +258,7 @@ dual-emit message-ID scheme, the drafts lifecycle, and the IMAP thread tiers.
 - All inputs sanitized and AppleScript-escaped (defense against AppleScript injection)
 - Destructive operations require user confirmation via MCP elicitation; rate limits + audit logging on top
 - `save_attachments` is byte-capped (per-attachment + aggregate) against disk-fill DoS
+- IMAP raw-message reads have a separate 500 MiB transfer budget (`APPLE_MAIL_MCP_MAX_RAW_MESSAGE_BYTES`, positive integer bytes). Oversized or incomplete reads fail explicitly without unbounded fallback. This is a transfer limit, not a process-memory limit; see [raw retrieval limits](docs/reference/TOOLS.md#raw-message-retrieval-limits).
 
 Docs:
 - [SECURITY.md](SECURITY.md) — vulnerability-reporting policy

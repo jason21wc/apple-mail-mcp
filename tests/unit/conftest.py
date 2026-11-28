@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from apple_mail_fast_mcp.mail_connector import AppleMailConnector
+from apple_mail_fast_mcp.mail_connector import AppleMailConnector, _AccountIdentity
 from apple_mail_fast_mcp.security import rate_limiter
 
 
@@ -58,32 +58,21 @@ def _block_real_io(
     monkeypatch.setattr(subprocess, "run", _blocked)
 
 
-@pytest.fixture(autouse=True)
-def _no_applescript_keychain_fallback(
+@pytest.fixture
+def _stub_transport_account_identity(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Keep the unit suite off real AppleScript.
+    """Legacy transport tests isolate account resolution from their I/O seam.
 
-    On a Keychain miss, ``_get_imap_password_with_fallback`` calls
-    ``_alternative_account_identifier`` → ``list_accounts()`` → real
-    ``osascript`` (the #243 name↔UUID fallback). The ~14 keychain-miss
-    unit tests mock ``get_imap_password``/``_resolve_imap_config`` but not
-    that fallback, so each fired a live osascript call — ~0.85s locally but
-    ~30s in CI (Mail.app unresponsive), ballooning the suite to ~5 min
-    (#298). Stub it to ``None`` so the fallback re-raises the original
-    ``MailKeychainEntryNotFoundError`` (what those tests already assert)
-    without touching AppleScript.
-
-    Tests that exercise the real fallback (``TestKeychainDualFormLookup``)
-    mock ``list_accounts`` on the instance and opt out via the
-    ``real_account_fallback`` marker.
+    Identity contract tests opt out with real_account_fallback and supply a
+    real account snapshot. Here name=id preserves the generic account labels
+    used by pre-existing transport/configuration tests without live Mail reads.
     """
     if request.node.get_closest_marker("real_account_fallback"):
         return
     monkeypatch.setattr(
-        AppleMailConnector,
-        "_alternative_account_identifier",
-        lambda self, account: None,
+        AppleMailConnector, "_resolve_account_identity",
+        lambda self, account: _AccountIdentity(name=account, id=account),
     )
 
 

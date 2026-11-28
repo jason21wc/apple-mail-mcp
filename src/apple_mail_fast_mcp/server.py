@@ -9,7 +9,8 @@ import logging
 import os
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any, TypeVar, cast
 
@@ -18,6 +19,7 @@ from fastmcp.server.elicitation import AcceptedElicitation
 from pydantic import BeforeValidator
 
 from . import query_moves
+from .attachment_saves import MailAttachmentSaveIncompleteError, incomplete_response, save_response
 from .drafts import DraftStateStore, SeedRecord
 from .exceptions import (
     MailAccountNotFoundError,
@@ -36,6 +38,8 @@ from .exceptions import (
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
     MailMessageReadIncompleteError,
+    MailMutationOutcomeUnknownError,
+    MailNativeMoveIncompleteError,
     MailRuleNotFoundError,
     MailSafetyError,
     MailTemplateError,
@@ -49,6 +53,7 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
+from .raw_message import MailRawMessageLimitError
 from .security import (
     SEND_OPERATIONS,
     _injection_scan_enabled,
@@ -59,6 +64,7 @@ from .security import (
     validate_bulk_operation,
     validate_send_operation,
 )
+from .smtp_sender import MailSmtpSendOutcomeUnknownError, MailSmtpSendRejectedError
 from .templates import Template, TemplateStore
 from .utils import (
     DEFAULT_MAX_BODY_BYTES,
@@ -311,6 +317,39 @@ def list_accounts() -> dict[str, Any]:
             "error": str(e),
             "error_type": "unknown",
         }
+
+
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
+)
+def check_account(account: str, mailbox: str = "INBOX") -> dict[str, Any]:
+    """Diagnose one account without fetching or changing mail.
+
+    Accepts the current Mail.app name or UUID. Uses production configuration
+    and credential precedence, but a fresh unpooled IMAP connection. Reports
+    endpoint, credential-source label, Mail availability, authentication,
+    capabilities, read-only mailbox access, and circuit-breaker state without
+    changing that state. Keychain and network operations have individual
+    timeouts; there is no hard overall deadline. An unhealthy completed probe
+    returns success:true with component errors; invalid/unresolved input is
+    success:false. This does not certify sends or every other mail operation.
+    """
+    try:
+        safety_err = check_test_mode_safety("check_account", account=account)
+        if safety_err:
+            return safety_err
+        rate_err = check_rate_limit("check_account", {"account": account})
+        if rate_err:
+            return rate_err
+        result = mail.check_account(account, mailbox)
+        operation_logger.log_operation("check_account", {"account": account}, "success")
+        return result
+    except MailAccountNotFoundError:
+        return {"success": False, "error_type": "account_not_found", "error": "Account could not be resolved in Mail.app."}
+    except ValueError as exc:
+        return {"success": False, "error_type": "validation_error", "error": str(exc)}
+    except Exception:
+        return {"success": False, "error_type": "account_diagnostic_unavailable", "error": "Account discovery or the diagnostic could not complete. Check Mail.app and local access permissions."}
 
 
 @_tool(
@@ -1337,6 +1376,8 @@ def search_messages(
             response["warnings"] = warnings
         return _mark_untrusted(response, bool(messages))
 
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except (MailAccountNotFoundError, MailMailboxNotFoundError) as e:
         logger.error(f"Not found error: {e}")
         return {
@@ -1480,8 +1521,8 @@ def get_messages(
         # include_content=False — sender/subject are attacker-controlled too).
         return _mark_untrusted(response, bool(messages))
 
-    except MailMessageReadIncompleteError as e:
-        return {"success": False, "error": str(e), "error_type": "message_read_incomplete"}
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except MailAppleScriptError as e:
         logger.error(f"Error reading messages through AppleScript: {e}")
         return {
@@ -1669,6 +1710,8 @@ async def update_message(
             "requested": len(message_ids),
         }
 
+    except MailMutationOutcomeUnknownError as e:
+        return _mutation_error_response(e)
     except MailAccountNotFoundError as e:
         logger.error(f"Account not found: {e}")
         return {
@@ -1682,6 +1725,15 @@ async def update_message(
             "success": False,
             "error": str(e),
             "error_type": "not_found",
+        }
+    except MailNativeMoveIncompleteError as e:
+        return {
+            "success": False, "error": str(e), "error_type": "imap_required",
+            "partial": True, "partial_reason": "native_move_not_applied",
+            "retry_safe": False, "retry_operation": "move_only",
+            "retry_message_ids": e.retry_message_ids, "retry_id_type": "mail",
+            "requested": e.requested, "mailbox": e.mailbox,
+            "confirmed_progress": e.confirmed_progress,
         }
     except MailImapRequiredError as e:
         # #364: a Gmail label move that couldn't be verified needs IMAP.
@@ -1707,6 +1759,73 @@ async def update_message(
             "error": str(e),
             "error_type": "unknown",
         }
+
+
+@contextmanager
+def _attachment_staging_directory(directory: Path) -> Iterator[str]:
+    """Preserve the save result or primary read failure through cleanup errors."""
+    temporary = tempfile.TemporaryDirectory(dir=directory)
+    try:
+        yield temporary.name
+    finally:
+        try:
+            temporary.cleanup()
+        except Exception:
+            pass  # Cleanup must not replace a completed save or typed read error.
+
+
+def _commit_staged_attachment(
+    tmp_path: Path, save_path: Path, output_filename: str, overwrite: bool,
+) -> dict[str, Any] | None:
+    """Commit an acknowledged staged file and report its final destination outcome."""
+    try:
+        saved_files = list(tmp_path.iterdir())
+        if len(saved_files) != 1 or not saved_files[0].is_file():
+            raise MailAttachmentSaveIncompleteError("staging_receipt", 1, acknowledged_writes=1)
+
+        destination = save_path.resolve() / output_filename
+        is_directory = destination.is_dir()
+    except (OSError, RuntimeError) as exc:
+        raise MailAttachmentSaveIncompleteError("staging_receipt", 1, acknowledged_writes=1) from exc
+    if is_directory:
+        return {
+            "success": False,
+            "error": (
+                f"Destination exists and is a directory: "
+                f"{destination}"
+            ),
+            "error_type": "invalid_destination",
+            "saved": 0,
+            "filename": output_filename,
+            "directory": str(save_path),
+        }
+    # ADR-5 makes incremental retrieval depend on deterministic
+    # names plus an existence check, so the check has to be the
+    # commit itself — a separate exists() test leaves a TOCTOU
+    # window a concurrent save can land in. os.link is atomic
+    # and fails with FileExistsError if the name is taken; the
+    # staged file is discarded with the TemporaryDirectory.
+    try:
+        if overwrite:
+            os.replace(str(saved_files[0]), str(destination))
+        else:
+            os.link(str(saved_files[0]), str(destination))
+    except FileExistsError:
+        return {
+            "success": False,
+            "error": (
+                f"Refusing to overwrite existing file: "
+                f"{destination}. Pass overwrite=True to "
+                f"replace it."
+            ),
+            "error_type": "already_exists",
+            "saved": 0,
+            "filename": output_filename,
+            "directory": str(save_path),
+        }
+    except OSError as exc:
+        raise MailAttachmentSaveIncompleteError("final_commit", 1) from exc
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1801,7 +1920,7 @@ def preview_move_by_query(
     sender list are the only view of what will move. If the senders or the
     count are not what was intended, tighten the filters and preview again.
 
-    IMAP only. Not available for Gmail accounts.
+    Requires IMAP MOVE or UIDPLUS. Gmail accounts are unsupported.
 
     Args:
         account: Mail.app account name or UUID.
@@ -1933,7 +2052,7 @@ async def commit_move_by_query(
           ``remaining`` was recounted on a fresh connection (null with
           ``remaining_unverified`` when even that failed).
           ``moved_unconfirmed`` counts messages that left the source without
-          a confirmed reply. Calling again is safe: nothing is moved twice.
+          a confirmed reply.
 
         ``resumed`` (when present) counts messages whose removal an earlier
         interrupted call left unfinished and this call completed.
@@ -2305,21 +2424,16 @@ def save_attachments(
             error_type='already_exists' and the existing file is
             left untouched. Only meaningful alongside
             output_filename.
-        account: Mail.app account name or UUID. Supply it (with ``mailbox``)
-            to take the faster IMAP path — one fetch instead of an
-            account×mailbox AppleScript scan. Pass the same values you read
-            the message with so attachment ordering matches (#371). Strongly
-            recommended on Gmail, where the AppleScript fallback's unindexed
-            cross-scan can take minutes and time out.
-        mailbox: Folder the message lives in (e.g. "INBOX"), used with
-            ``account`` for the IMAP fast path.
+        account: Mail.app account name or UUID. Pass the account and mailbox
+            used to read the message to preserve its attachment ordering.
+        mailbox: Folder containing the message. Together with the account,
+            this scopes numeric Mail IDs and enables IMAP for RFC Message-IDs.
 
     Returns:
-        Dict with ``success``, ``saved`` (count written), ``directory``, and
-        ``rejected`` (attachments skipped by the per-attachment / aggregate
-        byte caps, each ``{name, size, reason}``; #236). When
-        ``output_filename`` was used and the file was written, also carries
-        ``filename`` (the final on-disk name).
+        Completed saves report attachments_found, selected, attempted, saved,
+        failed, failures, rejected, partial, reason, and directory. A successful
+        named save includes filename. An incomplete save reports its phase and
+        any known progress. Inspect the destination before retrying.
 
     Example:
         >>> save_attachments("12345", "/Users/me/Downloads")
@@ -2394,7 +2508,7 @@ def save_attachments(
             # Stage INSIDE the destination directory so the final commit is
             # a same-filesystem atomic operation (os.link/os.replace fail with
             # EXDEV across filesystems, which a system temp dir invites).
-            with tempfile.TemporaryDirectory(dir=save_path) as tmp_dir:
+            with _attachment_staging_directory(save_path) as tmp_dir:
                 tmp_path = Path(tmp_dir)
                 result = mail.save_attachments(
                     message_id=message_id,
@@ -2404,51 +2518,9 @@ def save_attachments(
                     mailbox=mailbox,
                 )
                 if result["saved"] == 1:
-                    saved_files = list(tmp_path.iterdir())
-                    if not saved_files:
-                        return {
-                            "success": False,
-                            "error": "Attachment reported saved but file not found",
-                            "error_type": "unknown",
-                        }
-                    destination = save_path.resolve() / output_filename
-                    # A directory at the destination is never a valid target:
-                    # shutil.move would nest the file INSIDE it and report
-                    # success, and os.replace cannot replace a directory.
-                    if destination.is_dir():
-                        return {
-                            "success": False,
-                            "error": (
-                                f"Destination exists and is a directory: "
-                                f"{destination}"
-                            ),
-                            "error_type": "invalid_destination",
-                            "filename": output_filename,
-                            "directory": str(save_path),
-                        }
-                    # ADR-5 makes incremental retrieval depend on deterministic
-                    # names plus an existence check, so the check has to be the
-                    # commit itself — a separate exists() test leaves a TOCTOU
-                    # window a concurrent save can land in. os.link is atomic
-                    # and fails with FileExistsError if the name is taken; the
-                    # staged file is discarded with the TemporaryDirectory.
-                    try:
-                        if overwrite:
-                            os.replace(str(saved_files[0]), str(destination))
-                        else:
-                            os.link(str(saved_files[0]), str(destination))
-                    except FileExistsError:
-                        return {
-                            "success": False,
-                            "error": (
-                                f"Refusing to overwrite existing file: "
-                                f"{destination}. Pass overwrite=True to "
-                                f"replace it."
-                            ),
-                            "error_type": "already_exists",
-                            "filename": output_filename,
-                            "directory": str(save_path),
-                        }
+                    failure = _commit_staged_attachment(tmp_path, save_path, output_filename, overwrite)
+                    if failure is not None:
+                        return failure
                     final_filename = output_filename
         else:
             result = mail.save_attachments(
@@ -2459,28 +2531,27 @@ def save_attachments(
                 mailbox=mailbox,
             )
 
-        operation_logger.log_operation(
-            "save_attachments",
-            {
-                "message_id": message_id,
-                "directory": save_directory,
-                "indices": attachment_indices,
-                "output_filename": output_filename,
-            },
-            "success"
-        )
-
-        response: dict[str, Any] = {
-            "success": True,
-            "saved": result["saved"],
-            "directory": save_directory,
-            # Attachments skipped/removed by the byte caps (#236), if any.
-            "rejected": result["rejected"],
-        }
+        response = save_response(result, save_directory)
+        try:
+            operation_logger.log_operation(
+                "save_attachments",
+                {"message_id": message_id, "directory": save_directory,
+                 "indices": attachment_indices, "output_filename": output_filename},
+                "success" if response["success"] else "failed",
+            )
+        except Exception:
+            response["audit_log_failed"] = True
+            response.setdefault("warnings", []).append(
+                "Attachment save results are known, but audit logging failed."
+            )
         if final_filename:
             response["filename"] = final_filename
         return response
 
+    except MailAttachmentSaveIncompleteError as e:
+        return incomplete_response(e)
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Validation error: {e}")
         return {
@@ -2579,6 +2650,8 @@ def get_attachment_content(
             True,
         )
 
+    except (MailRawMessageLimitError, MailMessageReadIncompleteError) as e:
+        return _bounded_read_error_response(e)
     except MailAttachmentIndexError as e:
         return {
             "success": False,
@@ -3096,6 +3169,8 @@ async def delete_messages(
             "permanent": permanent,
         }
 
+    except MailMutationOutcomeUnknownError as e:
+        return _mutation_error_response(e)
     except ValueError as e:
         logger.error(f"Validation error: {e}")
         return {
@@ -3399,6 +3474,85 @@ def _get_draft_state_store() -> DraftStateStore:
     return DraftStateStore()
 
 
+def _mutation_error_response(
+    error: MailMutationOutcomeUnknownError, *, original_draft_id: str | None = None,
+) -> dict[str, Any]:
+    """Expose uncertainty without claiming zero changes or inviting a replay."""
+    response: dict[str, Any] = {
+        "success": False, "error": str(error),
+        "error_type": "mutation_outcome_unknown", "partial": True,
+        "partial_reason": "mutation_unconfirmed", "retry_safe": False,
+        "operation": error.operation, "phase": error.phase,
+        "requested": error.requested,
+        "confirmed_steps": list(error.confirmed_steps),
+    }
+    if error.confirmed_progress is not None:
+        response["confirmed_progress"] = error.confirmed_progress
+    if error.mailbox is not None:
+        response["mailbox"] = error.mailbox
+    if error.candidate_draft_id is not None:
+        response["candidate_draft_id"] = error.candidate_draft_id
+    if original_draft_id is not None:
+        response["original_draft_id"] = original_draft_id
+    return response
+
+
+def _smtp_error_response(
+    error: MailSmtpSendOutcomeUnknownError | MailSmtpSendRejectedError,
+    *, original_draft_id: str | None = None,
+) -> dict[str, Any]:
+    """Expose submission status without leaking arbitrary SMTP response text."""
+    response: dict[str, Any] = {
+        "success": False, "error": str(error), "operation": "smtp_send",
+        "phase": error.phase, "requested": error.requested, "retry_safe": False,
+    }
+    if isinstance(error, MailSmtpSendOutcomeUnknownError):
+        response.update(error_type="mutation_outcome_unknown", partial=True,
+                        partial_reason="submission_unconfirmed")
+        if error.candidate_message_id is not None:
+            response["candidate_message_id"] = error.candidate_message_id
+    else:
+        response.update(error_type="smtp_rejected", partial=False)
+        if type(error.smtp_code) is int:
+            response["smtp_code"] = error.smtp_code
+        if error.refused_recipients:
+            response["refused_recipients"] = {
+                recipient: {"code": code}
+                for recipient, (code, _reason) in error.refused_recipients.items()
+                if type(code) is int
+            }
+    if original_draft_id is not None:
+        response["original_draft_id"] = original_draft_id
+    return response
+
+
+def _record_completed_draft(
+    response: dict[str, Any], operation: str, params: dict[str, Any], status: str,
+) -> None:
+    """A failed audit sink must not erase an already acknowledged mutation."""
+    try:
+        operation_logger.log_operation(operation, params, status)
+    except Exception:
+        response["audit_log_failed"] = True
+        response.setdefault("warnings", []).append(
+            "The operation completed but audit logging failed. Do not repeat a send."
+        )
+
+
+def _bounded_read_error_response(
+    error: MailRawMessageLimitError | MailMessageReadIncompleteError,
+    *, original_draft_id: str | None = None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "success": False, "error": str(error),
+        "error_type": ("raw_message_too_large" if isinstance(error, MailRawMessageLimitError)
+                       else "message_read_incomplete"),
+    }
+    if original_draft_id is not None:
+        response["original_draft_id"] = original_draft_id
+    return response
+
+
 def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
     """Map a draft exception to {success, error, error_type}."""
     if isinstance(e, MailDraftNotFoundError):
@@ -3412,13 +3566,21 @@ def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
     return {"success": False, "error": str(e), "error_type": et}
 
 
-def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
+def _draft_action_error(
+    op: str, e: Exception, *, original_draft_id: str | None = None,
+) -> dict[str, Any] | None:
     """Map a catchable draft-action exception to a response dict.
 
     Returns None if the exception isn't one we model here (caller should
     fall through to a generic ``unknown`` mapping). Centralizing this
     keeps the per-tool exception handling small enough to stay under
     the cyclomatic-complexity threshold."""
+    if isinstance(e, (MailRawMessageLimitError, MailMessageReadIncompleteError)):
+        return _bounded_read_error_response(e, original_draft_id=original_draft_id)
+    if isinstance(e, (MailSmtpSendOutcomeUnknownError, MailSmtpSendRejectedError)):
+        return _smtp_error_response(e, original_draft_id=original_draft_id)
+    if isinstance(e, MailMutationOutcomeUnknownError):
+        return _mutation_error_response(e, original_draft_id=original_draft_id)
     if isinstance(e, MailMessageNotFoundError):
         return {"success": False, "error": str(e), "error_type": "message_not_found"}
     if isinstance(e, MailAccountNotFoundError):
@@ -3507,7 +3669,10 @@ def _resolve_draft_attachments(
             raise MailDraftError("Could not preserve every attachment; original draft retained")
         return extracted, tempdir
     except Exception:
-        tempdir.cleanup()
+        try:
+            tempdir.cleanup()
+        except Exception:
+            pass  # Preserve the typed read/limit failure and original draft.
         raise
 
 
@@ -4010,16 +4175,6 @@ async def create_draft(
             draft_id, seed_kind, seed_id, reply_all, send_now,
         )
 
-        operation_logger.log_operation(
-            "create_draft",
-            {
-                "seed_kind": seed_kind,
-                "seed_id": seed_id,
-                "send_now": send_now,
-                "draft_id": draft_id,
-            },
-            "success",
-        )
         response: dict[str, Any] = {
             "success": True,
             "draft_id": draft_id,
@@ -4035,6 +4190,10 @@ async def create_draft(
             response["delivery"] = result["delivery"]
         if warnings:
             response["warnings"] = warnings
+        _record_completed_draft(
+            response, "create_draft", {"seed_kind": seed_kind, "seed_id": seed_id,
+                                       "send_now": send_now, "draft_id": draft_id}, "success",
+        )
         return response
 
     except Exception as e:
@@ -4092,8 +4251,8 @@ def _finish_draft_replacement(
                        "Inspect both drafts before cleanup; do not repeat a send.")
     if warning:
         response.update(partial=True, original_draft_id=draft_id, warnings=[warning])
-    operation_logger.log_operation(
-        "update_draft", {"old_draft_id": draft_id, "new_draft_id": new_draft_id,
+    _record_completed_draft(
+        response, "update_draft", {"old_draft_id": draft_id, "new_draft_id": new_draft_id,
                          "send_now": send_now}, "partial" if warning else "success",
     )
     return response
@@ -4265,7 +4424,7 @@ async def update_draft(
         )
 
     except Exception as e:
-        handled = _draft_action_error("update_draft", e)
+        handled = _draft_action_error("update_draft", e, original_draft_id=draft_id)
         if handled is not None:
             return handled
         logger.exception(f"Unexpected error in update_draft: {e}")

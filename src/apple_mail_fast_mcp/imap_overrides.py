@@ -155,6 +155,25 @@ def get_host_override(account: str) -> str | None:
     return None
 
 
+def get_server_override(account: str) -> dict[str, Any] | None:
+    """Return one validated override record, or None when no record exists.
+
+    Presence is distinct from populated fields: a partial name-keyed record
+    must not be combined with fields from a UUID-keyed record.
+    """
+    entry = _load_server().get(account)
+    if entry is None:
+        return None
+    result: dict[str, Any] = {}
+    host = entry.get("host")
+    if isinstance(host, str) and host.strip():
+        result["host"] = host.strip()
+    port = entry.get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+        result["port"] = port
+    return result
+
+
 def get_port_override(account: str) -> int | None:
     """Return the persisted IMAP port override for ``account``, or ``None``.
     Non-int / out-of-range values are treated as absent (``bool`` is a

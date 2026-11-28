@@ -34,19 +34,32 @@ from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
+from email.parser import BytesHeaderParser
 from typing import Any, cast
 
 from imapclient import DRAFT, IMAPClient
 from imapclient.exceptions import IMAPClientError, LoginError
 from imapclient.response_types import Envelope
 
-from .draft_builder import ForwardedAttachment, extract_attachment_payloads
+from .attachment_parts import decode_attachment_part, describe_attachment_parts
+from .draft_builder import ForwardedAttachment, count_attachment_parts, extract_attachment_payloads
 from .exceptions import (
     MailAnchorProbeIncompleteError,
     MailImapMoveUnsupportedError,
     MailImapTrashNotFoundError,
     MailMessageNotFoundError,
     MailMessageReadIncompleteError,
+    MailMutationOutcomeUnknownError,
+)
+from .raw_message import (
+    LiteralBudget,
+    MailRawMessageLimitError,
+    MailRawMessageReadError,
+    fetch_bounded_message,
+    fetch_bounded_section,
+    guarded_fetch,
+    preflight_message_size,
+    raw_message_budget,
 )
 from .utils import parse_rfc822_ids
 
@@ -98,6 +111,19 @@ _FLAG_FLAGGED = b"\\Flagged"
 _FLAG_ANSWERED = b"\\Answered"
 
 
+@dataclass
+class _MutationProgress:
+    """Acknowledgments observed during one non-idempotent operation."""
+
+    phase: str | None = None
+    confirmed_steps: list[str] = field(default_factory=list)
+    mailbox: str | None = None
+
+    def confirmed(self) -> None:
+        if self.phase is not None:
+            self.confirmed_steps.append(self.phase)
+
+
 # ---------------------------------------------------------------------------
 # Connection pool (issue #75)
 # ---------------------------------------------------------------------------
@@ -121,6 +147,8 @@ _POOL_INVALIDATE_EXCS: tuple[type[BaseException], ...] = (
     LoginError,
     IMAPClientError,
     OSError,
+    MailRawMessageLimitError,
+    MailRawMessageReadError,
 )
 
 
@@ -606,189 +634,67 @@ def _format_address_list(addrs: Any) -> str:
     return ", ".join(x for x in formatted if x)
 
 
-def _bodystructure_extract_attachments(
-    structure: Any,
-) -> list[dict[str, Any]]:
-    """Walk a BODYSTRUCTURE tuple and emit attachment metadata.
-
-    A part counts as an attachment if any of:
-    - Its disposition is ``attachment``.
-    - Its disposition is ``inline`` AND it has a ``filename`` param.
-    - It's a ``message/rfc822`` part (forwarded email — conventionally
-      an attachment per RFC 2046 §5.2.1, and the case Mail.app's
-      AppleScript surface sometimes silently drops).
-
-    Returns dicts with keys: ``name``, ``mime_type``, ``size``,
-    ``downloaded``. ``downloaded`` is always False on the IMAP path —
-    BODYSTRUCTURE returns metadata only, not body bytes, and Mail.app's
-    local cache state isn't observable from the protocol. Callers that
-    need the bytes invoke ``save_attachments`` (which fetches on demand).
-
-    The byte-fetch path (``get_attachment_content`` / ``save_attachments``)
-    indexes into this list by position, so its enumerator
-    (``draft_builder.extract_attachment_payloads``) MUST apply the SAME
-    inclusion predicate and document order as the ``_walk`` below
-    (attachment-disposition, inline-with-filename, or message/rfc822). Keep
-    the two in sync; the live integration test asserts they agree.
-    """
-    out: list[dict[str, Any]] = []
-
-    def _filename_from_params(params: Any, key_name: bytes) -> str | None:
-        """Pull a value out of a flat (k, v, k, v, ...) param tuple."""
-        if not isinstance(params, tuple):
-            return None
-        for i in range(0, len(params) - 1, 2):
-            k = params[i]
-            if isinstance(k, bytes) and k.lower() == key_name:
-                v = params[i + 1]
-                if isinstance(v, (bytes, bytearray)):
-                    return _decode(v)
-        return None
-
-    def _walk(s: Any) -> None:
-        if not isinstance(s, tuple) or not s:
-            return
-
-        # Multipart: IMAPClient groups the child parts in a LIST at
-        # position 0 — ``([child1, child2, ...], subtype, params, ...)``.
-        # (Real iCloud/Gmail BODYSTRUCTUREs take this shape; missing it
-        # silently dropped attachments on every multipart message.)
-        if isinstance(s[0], list):
-            for child in s[0]:
-                _walk(child)
-            return
-        # Defensive: some inputs nest children as direct tuple elements.
-        if isinstance(s[0], tuple):
-            for child in s:
-                if isinstance(child, tuple):
-                    _walk(child)
-            return
-
-        # Leaf. Spec positions: type, subtype, params, id, desc, encoding,
-        # size, [type-specific extras...], [disposition]. The disposition
-        # tuple, if present, sits at the trailing end — but its exact index
-        # varies (text has 'lines', message/rfc822 has envelope+body+lines,
-        # etc.). Scan trailing elements for a tuple whose head is one of
-        # the disposition keywords.
-        leaf = s
-        type_ = leaf[0] if isinstance(leaf[0], bytes) else b""
-        subtype = (
-            leaf[1] if len(leaf) > 1 and isinstance(leaf[1], bytes) else b""
-        )
-        ct_params = leaf[2] if len(leaf) > 2 else ()
-        size_field = leaf[6] if len(leaf) > 6 else 0
-
-        disp_kind: bytes | None = None
-        disp_filename: str | None = None
-        for elem in leaf:
-            if (
-                isinstance(elem, tuple)
-                and elem
-                and isinstance(elem[0], bytes)
-                and elem[0].lower() in (b"attachment", b"inline")
-            ):
-                disp_kind = elem[0].lower()
-                disp_params = elem[1] if len(elem) > 1 else ()
-                disp_filename = _filename_from_params(disp_params, b"filename")
-                break
-
-        is_rfc822 = (
-            type_.lower() == b"message" and subtype.lower() == b"rfc822"
-        )
-        is_attachment = (
-            disp_kind == b"attachment"
-            or (disp_kind == b"inline" and disp_filename is not None)
-            or is_rfc822
-        )
-        if not is_attachment:
-            return
-
-        # Filename precedence: disposition's filename → content-type's
-        # `name` param (legacy mailers) → empty string.
-        name = disp_filename or _filename_from_params(ct_params, b"name") or ""
-        mime_type = f"{_decode(type_)}/{_decode(subtype)}"
-
-        out.append({
-            "name": name,
-            "mime_type": mime_type,
-            "size": int(size_field) if isinstance(size_field, int) else 0,
-            "downloaded": False,
-        })
-
-    _walk(structure)
-    return out
+def _bodystructure_extract_attachments(structure: Any) -> list[dict[str, Any]]:
+    """Strict metadata only; incomplete structure never proves no attachments."""
+    return [part.metadata for part in describe_attachment_parts(structure)]
 
 
-def _disposition_marks_attachment(elem: Any) -> bool:
-    """True if a BODYSTRUCTURE element is a disposition tuple that marks an
-    attachment — ``attachment``, or ``inline`` carrying a ``filename`` param.
-
-    Disposition tuples look like ``(b"attachment", (b"filename", b"x.pdf"))``;
-    the params are a flat ``(key, value, key, value, ...)`` tuple.
-    """
-    if not (isinstance(elem, tuple) and elem and isinstance(elem[0], bytes)):
-        return False
-    disp = elem[0].lower()
-    if disp == b"attachment":
-        return True
-    if disp != b"inline":
-        return False
-    params = elem[1] if len(elem) > 1 else ()
-    if not isinstance(params, tuple):
-        return False
-    return any(
-        isinstance(params[i], bytes) and params[i].lower() == b"filename"
-        for i in range(0, len(params) - 1, 2)
-    )
+def _selected_attachment_indices(count: int, indices: list[int] | None) -> list[int]:
+    if indices is None:
+        return list(range(count))
+    return sorted({i for i in indices if type(i) is int and 0 <= i < count})
 
 
-def _leaf_has_attachment(structure: tuple[Any, ...]) -> bool:
-    """True if a leaf BODYSTRUCTURE part is an attachment.
+def _canonical_attachment_fallback(
+    client: Any, uid: int, indices: list[int] | None, limit: int, transfer: LiteralBudget,
+) -> tuple[int, dict[int, ForwardedAttachment]]:
+    raw = fetch_bounded_message(client, uid, budget=limit, transfer=transfer)
+    if indices is None:
+        payloads = extract_attachment_payloads(raw)
+        return len(payloads), dict(enumerate(payloads))
+    count = count_attachment_parts(raw)
+    selected = _selected_attachment_indices(count, indices)
+    return count, dict(zip(selected, extract_attachment_payloads(raw, indices=selected), strict=True))
 
-    A ``message/rfc822`` (forwarded email) part counts, matching
-    ``_bodystructure_extract_attachments`` — otherwise the has_attachment
-    search filter and the attachment list disagree (a forwarded-only message
-    would be filtered out yet report an attachment). Otherwise, any element
-    that is an attachment/inline-filename disposition tuple qualifies.
-    """
-    type_ = structure[0] if isinstance(structure[0], bytes) else b""
-    subtype = (
-        structure[1]
-        if len(structure) > 1 and isinstance(structure[1], bytes)
-        else b""
-    )
-    if type_.lower() == b"message" and subtype.lower() == b"rfc822":
-        return True
-    return any(_disposition_marks_attachment(elem) for elem in structure)
+
+def _fetch_attachment_payloads(
+    client: Any, uid: int, indices: list[int] | None,
+) -> tuple[int, dict[int, ForwardedAttachment]]:
+    limit = raw_message_budget()
+    transfer = LiteralBudget(limit)
+    # Preserve the whole-message ceiling even if only a tiny part is requested.
+    size = preflight_message_size(client, uid, limit, transfer)
+    rows = guarded_fetch(client, uid, [b"BODYSTRUCTURE"], transfer.remaining, transfer)
+    entry = rows.get(uid)
+    if not isinstance(entry, dict):
+        raise MailRawMessageReadError("IMAP omitted the selected UID from attachment metadata")
+    try:
+        parts = describe_attachment_parts(entry.get(b"BODYSTRUCTURE"))
+    except MailMessageReadIncompleteError:
+        if indices == []:
+            raise  # Cannot report a count, and empty selection forbids payload reads.
+        return _canonical_attachment_fallback(client, uid, indices, limit, transfer)
+    selected = _selected_attachment_indices(len(parts), indices)
+    if any(not parts[index].optimized for index in selected):
+        return _canonical_attachment_fallback(client, uid, indices, limit, transfer)
+    encoded_total = sum(parts[index].encoded_size for index in selected)
+    if encoded_total > size:
+        raise MailRawMessageReadError("Attachment sizes exceed the advertised message size")
+    if encoded_total > transfer.remaining:
+        raise MailRawMessageLimitError("Selected attachments exceed the remaining transfer allowance")
+    payloads: dict[int, ForwardedAttachment] = {}
+    for index in selected:
+        part = parts[index]
+        encoded = fetch_bounded_section(client, uid, part.section, part.encoded_size,
+                                        budget=limit, transfer=transfer)
+        payloads[index] = (part.filename or "attachment", part.maintype, part.subtype,
+                           decode_attachment_part(part, encoded))
+    return len(parts), payloads
 
 
 def _bodystructure_has_attachment(structure: Any) -> bool:
-    """Walk an IMAPClient-parsed BODYSTRUCTURE tree and detect attachments.
-
-    IMAPClient represents multipart as a tuple ``(part_tuple, ..., subtype)``
-    where each ``part_tuple`` is either another multipart (starts with a
-    tuple) or a leaf (starts with bytes like ``b"text"``, ``b"application"``).
-
-    A message "has an attachment" if any leaf carries a disposition of
-    ``attachment`` or ``inline`` with a ``filename`` parameter (see
-    ``_leaf_has_attachment``).
-    """
-    if not isinstance(structure, tuple) or not structure:
-        return False
-
-    # Multipart — children grouped in a list at position 0 (IMAPClient).
-    if isinstance(structure[0], list):
-        return any(
-            _bodystructure_has_attachment(child) for child in structure[0]
-        )
-    # Defensive: children nested as direct tuple elements.
-    if isinstance(structure[0], tuple):
-        return any(
-            isinstance(child, tuple) and _bodystructure_has_attachment(child)
-            for child in structure
-        )
-
-    return _leaf_has_attachment(structure)
+    """Use the same strict membership as metadata; unknown is never false."""
+    return bool(describe_attachment_parts(structure))
 
 
 def _envelope_to_dict(
@@ -973,7 +879,60 @@ class ImapConnector:
             _apply_operation_timeout(client)
             yield client
         finally:
-            client.logout()
+            try:
+                client.logout()
+            except Exception:
+                # Cleanup cannot replace an operation's result or its primary
+                # error: doing so could trigger a second, native mutation.
+                try:
+                    logger.warning("IMAP session cleanup failed; not retrying the operation")
+                except Exception:
+                    pass  # Even a broken log sink must not replace the outcome.
+
+    @contextmanager
+    def _mutation_session(
+        self, operation: str, requested: int, *, candidate_draft_id: str | None = None,
+    ) -> Iterator[tuple[IMAPClient, _MutationProgress]]:
+        """Classify failures only after the session sees the raw exception.
+
+        This keeps pool invalidation intact. A phase is set immediately before
+        the first command that can change mail; setup failures remain eligible
+        for the caller's ordinary fallback.
+        """
+        progress = _MutationProgress()
+        try:
+            with self._session() as client:
+                yield client, progress
+        except (OSError, IMAPClientError, LoginError) as exc:
+            if progress.phase is None:
+                raise
+            raise MailMutationOutcomeUnknownError(
+                operation=operation, phase=progress.phase, requested=requested,
+                confirmed_steps=tuple(progress.confirmed_steps),
+                mailbox=progress.mailbox, candidate_draft_id=candidate_draft_id,
+            ) from exc
+
+    @staticmethod
+    def _move_resolved_uids(
+        client: IMAPClient, uids: list[int], destination: str,
+        has_move: bool, progress: _MutationProgress,
+    ) -> None:
+        """Move one resolved batch without replaying an uncertain step."""
+        progress.mailbox = destination
+        if has_move:
+            progress.phase = "move"
+            client.move(uids, destination)
+            progress.confirmed()
+            return
+        progress.phase = "copy"
+        client.copy(uids, destination)
+        progress.confirmed()
+        progress.phase = "store_deleted"
+        client.add_flags(uids, [b"\\Deleted"], silent=True)
+        progress.confirmed()
+        progress.phase = "uid_expunge"
+        client.uid_expunge(uids)
+        progress.confirmed()
 
     def search_messages(
         self,
@@ -1140,12 +1099,8 @@ class ImapConnector:
                 ``"raw"`` preserves the legacy behavior: ``content`` is the
                 undecoded ``BODY[TEXT]`` (the entire multipart body with
                 base64 attachments inlined) — kept only as an escape hatch.
-            headers_only: When True, fetches ``BODY[HEADER]`` instead of
-                ``BODY[TEXT]`` — useful for preview-style callers who
-                don't want the body. ``content`` is always returned as
-                the empty string in this mode (the headers themselves
-                are reflected via the envelope dict; we don't expose the
-                raw RFC 822 header block).
+            headers_only: When True, fetches only envelope metadata.
+                ``content`` is empty and no body payload is downloaded.
 
         Returns:
             Dict with the same keys as the AppleScript ``get_message``
@@ -1164,18 +1119,9 @@ class ImapConnector:
         fetch_keys: list[bytes] = [b"ENVELOPE", b"FLAGS"]
         want_body = include_content and not headers_only
         text_mode = body_format != "raw"
-        # text mode parses the whole message server-side, so fetch BODY[] (full
-        # RFC822); raw mode keeps the legacy header-less BODY[TEXT].
+        # Both content formats share the bounded raw transfer. Raw format
+        # returns only the MIME body after removing the outer header block.
         body_key = b"BODY[]" if text_mode else b"BODY[TEXT]"
-        if want_body:
-            fetch_keys.append(body_key)
-        elif headers_only:
-            # We don't currently use the raw header block for anything in
-            # the response (envelope already gives us subject/sender/date),
-            # but requesting BODY[HEADER] is the spec-correct way to ask
-            # the server for headers without paying for the body. Some
-            # servers send less data this way; some don't care.
-            fetch_keys.append(b"BODY[HEADER]")
         # When we parse the full body (text mode), attachment metadata comes
         # from that parse — more reliable than BODYSTRUCTURE, which yields a
         # false-empty list on some real messages. Only pay for BODYSTRUCTURE
@@ -1194,7 +1140,8 @@ class ImapConnector:
                     f"{mailbox!r} on {self._host}."
                 )
 
-            fetched = client.fetch(uids[:1], fetch_keys)
+            transfer = LiteralBudget(raw_message_budget())
+            fetched = guarded_fetch(client, uids[0], fetch_keys, transfer.remaining, transfer)
             entry = fetched.get(uids[0])
             # The message matched SEARCH but vanished before FETCH (expunged
             # or moved by a concurrent change) — treat as not-found rather
@@ -1208,6 +1155,11 @@ class ImapConnector:
                 raise MailMessageReadIncompleteError(
                     "IMAP returned a message without its required ENVELOPE metadata"
                 )
+
+            if want_body:
+                raw = fetch_bounded_message(client, uids[0], transfer=transfer)
+                entry = dict(entry)
+                entry[body_key] = raw if text_mode else re.split(br"\r?\n\r?\n", raw, maxsplit=1)[-1]
 
             return _build_get_message_result(
                 entry,
@@ -1247,15 +1199,27 @@ class ImapConnector:
                     f"Message-ID {message_id!r} not found in mailbox "
                     f"{mailbox!r} on {self._host}."
                 )
-            fetched = client.fetch(uids[:1], [b"BODY[]"])
-            entry = next(iter(fetched.values()))
-            raw = entry.get(b"BODY[]") or b""
-            if not raw:
+            return fetch_bounded_message(client, uids[0])
+
+    def fetch_attachment_payloads(
+        self, message_id: str, mailbox: str = "INBOX", *, indices: list[int] | None = None,
+    ) -> tuple[int, dict[int, ForwardedAttachment]]:
+        """Return total count and only selected canonical attachment indices.
+
+        Out-of-range indices are ignored for save compatibility. Selection is
+        unique and in MIME order. Full-message fallback is chosen solely from
+        pre-download metadata, never after a range, budget, or decoding failure.
+        """
+        bracketed = _bracket_message_id(message_id)
+        _reject_control_chars(mailbox, "mailbox")
+        with self._session() as client:
+            client.select_folder(mailbox, readonly=True)
+            uids = client.search(["HEADER", "Message-ID", bracketed])
+            if not uids:
                 raise MailMessageNotFoundError(
-                    f"Message-ID {message_id!r} in {mailbox!r} returned an "
-                    f"empty body on {self._host}."
+                    f"Message-ID {message_id!r} not found in mailbox {mailbox!r} on {self._host}."
                 )
-            return bytes(raw)
+            return _fetch_attachment_payloads(client, uids[0], indices)
 
     def get_attachments(
         self,
@@ -1308,11 +1272,12 @@ class ImapConnector:
                     f"{mailbox!r} on {self._host}."
                 )
 
-            fetched = client.fetch(uids[:1], [b"BODYSTRUCTURE"])
-            entry = next(iter(fetched.values()))
-            return _bodystructure_extract_attachments(
-                entry.get(b"BODYSTRUCTURE")
-            )
+            limit = raw_message_budget()
+            fetched = guarded_fetch(client, uids[0], [b"BODYSTRUCTURE"], limit, LiteralBudget(limit))
+            entry = fetched.get(uids[0])
+            if not isinstance(entry, dict):
+                raise MailMessageReadIncompleteError("IMAP omitted the selected UID from attachment metadata")
+            return _bodystructure_extract_attachments(entry.get(b"BODYSTRUCTURE"))
 
     def locate_message(
         self, message_id: str, mailbox: str | None = None
@@ -1724,14 +1689,15 @@ class ImapConnector:
         Raises:
             MailImapMoveUnsupportedError: Server advertises neither MOVE
                 nor UIDPLUS.
-            IMAPClientError: SELECT / SEARCH / MOVE / COPY / STORE /
-                EXPUNGE failed at the protocol level.
+            IMAPClientError: Setup failed before a mutation was dispatched.
+            MailMutationOutcomeUnknownError: A dispatched command did not
+                receive a conclusive response; do not replay through fallback.
         """
         _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
         _reject_control_chars(destination_mailbox, "destination_mailbox")
 
-        with self._session() as client:
+        with self._mutation_session("move", len(message_ids)) as (client, progress):
             client.select_folder(source_mailbox, readonly=False)
 
             has_move = self._has_capability(client, b"MOVE")
@@ -1747,12 +1713,7 @@ class ImapConnector:
             if not uids:
                 return 0
 
-            if has_move:
-                client.move(uids, destination_mailbox)
-            else:
-                client.copy(uids, destination_mailbox)
-                client.add_flags(uids, [b"\\Deleted"], silent=True)
-                client.uid_expunge(uids)
+            self._move_resolved_uids(client, uids, destination_mailbox, has_move, progress)
             return len(uids)
 
     # Conventional Trash folder names to fall back on when the IMAP
@@ -1795,8 +1756,16 @@ class ImapConnector:
         ``<blockquote type="cite">`` that renders as a quote on iOS
         (Mail.app bug FB11734014, issue #245). The caller builds
         ``raw_message`` via :func:`apple_mail_fast_mcp.draft_builder.build_draft_mime`.
+
+        A lost APPEND acknowledgment raises MailMutationOutcomeUnknownError
+        with the candidate Message-ID, preventing duplicate native creation.
         """
-        with self._session() as client:
+        candidate = str(BytesHeaderParser(policy=policy.default).parsebytes(
+            raw_message
+        ).get("Message-ID", "")).strip().strip("<>") or None
+        with self._mutation_session(
+            "append_draft", 1, candidate_draft_id=candidate,
+        ) as (client, progress):
             folder = self._find_drafts_folder(
                 client
             ) or self._find_drafts_by_convention(client)
@@ -1806,7 +1775,10 @@ class ImapConnector:
                     f"(no \\Drafts SPECIAL-USE flag and none of "
                     f"{list(self._CONVENTIONAL_DRAFTS_NAMES)} present)."
                 )
+            progress.mailbox = folder
+            progress.phase = "append"
             client.append(folder, raw_message, flags=[DRAFT])
+            progress.confirmed()
             return folder
 
     def fetch_raw_draft(self, message_id: str) -> bytes:
@@ -1827,8 +1799,7 @@ class ImapConnector:
             uids = client.search(["HEADER", "Message-ID", bracketed])
             if len(uids) != 1:
                 raise MailMessageNotFoundError("Draft lookup did not identify exactly one message")
-            fetched = client.fetch(uids, [b"BODY.PEEK[]"])
-            raw = bytes(fetched.get(uids[0], {}).get(b"BODY[]") or b"")
+            raw = fetch_bounded_message(client, uids[0])
             headers = message_from_bytes(raw, policy=policy.default).get_all("Message-ID", [])
             if len(headers) != 1 or str(headers[0]).strip() != bracketed:
                 raise MailMessageNotFoundError("Fetched draft identity did not match")
@@ -1896,12 +1867,14 @@ class ImapConnector:
                 SPECIAL-USE or conventional names. Callers treat this (like
                 any failure here) as best-effort — the message is already
                 delivered — and must not surface it as a send failure.
-            IMAPClientError: Protocol-level APPEND failure.
+            MailMutationOutcomeUnknownError: APPEND completion is uncertain.
+                This must still be treated as a best-effort Sent-copy failure,
+                never as permission to send the message again.
         """
         flags: list[bytes] = [_FLAG_SEEN]
         if answered:
             flags.append(_FLAG_ANSWERED)
-        with self._session() as client:
+        with self._mutation_session("append_sent_copy", 1) as (client, progress):
             folder = self._find_sent_folder(
                 client
             ) or self._find_sent_by_convention(client)
@@ -1911,7 +1884,10 @@ class ImapConnector:
                     f"(no \\Sent SPECIAL-USE flag and none of "
                     f"{list(self._CONVENTIONAL_SENT_NAMES)} present)."
                 )
+            progress.mailbox = folder
+            progress.phase = "append"
             client.append(folder, raw_message, flags=flags)
+            progress.confirmed()
             return folder
 
     def _find_sent_by_convention(self, client: IMAPClient) -> str | None:
@@ -1963,12 +1939,14 @@ class ImapConnector:
                 nor UIDPLUS.
             MailImapTrashNotFoundError: No Trash folder discoverable via
                 SPECIAL-USE or conventional names.
-            IMAPClientError: Protocol-level failure.
+            IMAPClientError: Setup failed before mutation dispatch.
+            MailMutationOutcomeUnknownError: A dispatched move-to-Trash step
+                did not receive a conclusive response; do not replay it.
         """
         _validate_message_ids(message_ids)
         _reject_control_chars(source_mailbox, "source_mailbox")
 
-        with self._session() as client:
+        with self._mutation_session("delete", len(message_ids)) as (client, progress):
             # #199 / #198: do all LIST traffic in AUTHENTICATED state.
             # Some servers (Exchange Online, older Dovecot) issue an
             # implicit CLOSE when LIST runs while a mailbox is SELECTED,
@@ -2001,12 +1979,7 @@ class ImapConnector:
             if not uids:
                 return 0
 
-            if has_move:
-                client.move(uids, trash)
-            else:
-                client.copy(uids, trash)
-                client.add_flags(uids, [b"\\Deleted"], silent=True)
-                client.uid_expunge(uids)
+            self._move_resolved_uids(client, uids, trash, has_move, progress)
             return len(uids)
 
     def set_read_status(

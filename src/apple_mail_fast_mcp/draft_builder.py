@@ -15,12 +15,15 @@ from __future__ import annotations
 import email
 import mimetypes
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from email.message import EmailMessage, MIMEPart
 from email.policy import default as _default_policy
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parseaddr
 from pathlib import Path
 from typing import Any
+
+from .exceptions import MailAttachmentIndexError, MailMessageReadIncompleteError
 
 # A single forwarded attachment carried over from the original message:
 # (filename, maintype, subtype, payload_bytes).
@@ -295,7 +298,8 @@ def _attachment_payload_bytes(part: MIMEPart[Any, Any]) -> bytes:
     when the transfer encoding is one RFC 2046 §5.2.1 permits for ``message/*``
     (7bit/8bit/binary/none). A non-conformant base64/quoted-printable message
     part is parsed from its *still-encoded* text and would serialize to corrupt
-    bytes, so degrade to ``b""``. (rfc822 empty-bytes fix)
+    bytes, so report an incomplete read instead of a successful empty file.
+    Actual zero-byte payloads still return ``b""`` through the ordinary decoder.
     """
     decoded = part.get_payload(decode=True)
     if isinstance(decoded, (bytes, bytearray)):
@@ -310,6 +314,10 @@ def _attachment_payload_bytes(part: MIMEPart[Any, Any]) -> bytes:
             and hasattr(sub[0], "as_bytes")
         ):
             return sub[0].as_bytes()
+        raise MailMessageReadIncompleteError(
+            "Cannot reliably decode forwarded-message attachment "
+            "with its MIME structure or transfer encoding"
+        )
     return b""
 
 
@@ -337,7 +345,17 @@ def _walk_attachment_parts(
         out.append(part)
 
 
-def extract_attachment_payloads(raw: bytes) -> list[ForwardedAttachment]:
+def count_attachment_parts(raw: bytes) -> int:
+    """Count canonical MIME attachment slots without decoding any payload."""
+    msg = email.message_from_bytes(raw, policy=_default_policy)
+    parts: list[MIMEPart[Any, Any]] = []
+    _walk_attachment_parts(msg, parts)
+    return len(parts)
+
+
+def extract_attachment_payloads(
+    raw: bytes, *, indices: Iterable[int] | None = None
+) -> list[ForwardedAttachment]:
     """Enumerate a message's attachments AS BYTES, matching the order and
     membership of the IMAP BODYSTRUCTURE metadata list that ``get_attachments``
     / ``get_messages`` report.
@@ -351,14 +369,31 @@ def extract_attachment_payloads(raw: bytes) -> list[ForwardedAttachment]:
     contract (out-of-range, or — worse — a different part's bytes). The
     concrete divergences were found by dogfooding real iCloud messages.
 
+    ``indices=None`` decodes every attachment. Otherwise validate all requested
+    0-based indices before decoding, then decode only those parts, in canonical
+    MIME order (duplicates appear once; an empty iterable selects nothing).
+    Invalid indices raise :class:`MailAttachmentIndexError`, including negative
+    indices, booleans, and non-integers. No unselected payload is decoded.
+
     Distinct from :func:`parse_original_message`, which deliberately keeps
     stdlib ``iter_attachments`` semantics for the reply/forward draft path.
     """
     msg = email.message_from_bytes(raw, policy=_default_policy)
     parts: list[MIMEPart[Any, Any]] = []
     _walk_attachment_parts(msg, parts)
+    selected: set[int] | None = None
+    if indices is not None:
+        selected = set()
+        for index in indices:
+            if type(index) is not int or not 0 <= index < len(parts):
+                raise MailAttachmentIndexError(
+                    f"Attachment index must be an integer in [0, {len(parts)})"
+                )
+            selected.add(index)
     out: list[ForwardedAttachment] = []
-    for part in parts:
+    for index, part in enumerate(parts):
+        if selected is not None and index not in selected:
+            continue
         maintype, _, subtype = part.get_content_type().partition("/")
         # Membership/order match the metadata list (that's the index
         # contract); the name default differs by design — a nameless part
