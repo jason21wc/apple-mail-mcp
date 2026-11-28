@@ -4,7 +4,7 @@ Complete reference for all MCP tools provided by the Apple Mail MCP server.
 
 ## Overview
 
-**Total Tools:** 25 (11 read-only, 14 mutating — see Classification below). See the [CHANGELOG](../../CHANGELOG.md) for the version history.
+Tools are listed under Classification below; counts are deliberately not stated here because they go stale. See the [CHANGELOG](../../CHANGELOG.md) for the version history.
 
 ## Tool annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`)
 
@@ -19,8 +19,8 @@ Every tool ships with the per-tool annotations the MCP 2025-03 spec defines so h
 
 **Classification:**
 
-- **Read-only:** `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `preview_move_by_query`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
-- **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`, `save_template`, `commit_move_by_query`. All have `destructiveHint=true`, and `idempotentHint=true` except `commit_move_by_query` (each call moves the next slice of a preview). `save_attachments` and `save_template` are here because `overwrite=true` can replace state the caller did not create — the annotation describes capability, not the default path, which refuses to clobber.
+- **Read-only:** `list_accounts`, `list_mailboxes`, `list_rules`, `list_templates`, `search_messages`, `get_messages`, `get_thread`, `get_statistics`, `preview_move_by_query`, `preview_attachment_export`, `get_attachment_content`, `get_template`, `render_template`. All have `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`.
+- **Mutating destructive:** `update_message`, `update_mailbox`, `update_rule`, `update_draft`, `delete_draft`, `delete_mailbox`, `delete_messages`, `delete_rule`, `delete_template`, `save_attachments`, `save_template`, `commit_move_by_query`, `commit_attachment_export`. All have `destructiveHint=true`, and `idempotentHint=true` except `commit_move_by_query` and `commit_attachment_export` (each call works through the next slice of a preview). `save_attachments`, `save_template` and `commit_attachment_export` are here because an overwrite option can replace files the caller did not create — the annotation describes capability, not the default path, which refuses to clobber. `commit_attachment_export` writes files only; it never changes mail.
 - **Mutating additive:** `create_mailbox`, `create_draft`, `create_rule`. All have `destructiveHint=false`. Idempotent except `create_draft` and `create_rule` (each call may create a new entity).
 
 Counts are deliberately omitted — they are derivable and go stale. `make eval-descriptions` regenerates the authoritative list.
@@ -670,6 +670,198 @@ All tools return a consistent error format:
 
 ---
 
+### preview_attachment_export
+
+**Fork-local.** Preview a bulk attachment export chosen by filters. Writes nothing and downloads no message bodies.
+
+Use this with `commit_attachment_export` to save the attachments of hundreds or thousands of messages under names built from a template, instead of calling `save_attachments` once per message. The preview finds the matching messages, shows what would be exported and where, and holds that exact set for 15 minutes. Neither tool ever changes mail: the mailbox is opened read-only and nothing is flagged, moved or deleted. IMAP only; there is no AppleScript fallback.
+
+**Parameters:**
+
+- `account` (string, required): Mail.app account name or UUID.
+- `mailbox` (string, required): Mailbox holding the messages.
+- `save_directory` (string, required): Existing directory to export into. `~` is expanded. Subfolders are created beneath it; nothing is ever written outside it.
+- `sender_contains` (string, optional): Only messages from senders containing this. Use a full address on iCloud; its search can miss domain fragments.
+- `subject_contains` (string, optional): Only messages whose subject contains this.
+- `date_from`, `date_to` (string, optional): Inclusive bounds on the received date, `YYYY-MM-DD`.
+- `attachment_name_contains` (string, optional): Only attachments whose own name contains this, any case (for example `.pdf`).
+- `filename_template` (string, optional, default `{name}`): Name for each saved file. See tokens below.
+- `subfolder_template` (string, optional): Folders beneath `save_directory`, parts separated by `/`, using the same tokens.
+- `subject_pattern` (string, optional): A regular expression applied to each subject, from its start. Its named groups become tokens; a group named `date` feeds `{subject_date}`. See "Pattern rules" below.
+- `subject_date_format` (string, optional): Layout of the `date` group, for example `%d%b%y` for `04May26`.
+- `if_exists` (string, optional, default `skip`): What to do when a **different** file is already at the target name: `skip` (not written, counted as a name collision), `suffix` (saved as `name (2).ext`), or `overwrite`. A file with identical content is never written twice, whichever is chosen.
+
+At least one of `sender_contains`, `subject_contains`, `date_from` or `date_to` is required. A blank value is an error, never "no filter".
+
+**Template tokens:**
+
+| Token | Meaning |
+|---|---|
+| `{name}`, `{stem}`, `{ext}` | The attachment's own name, and its two halves (`{ext}` includes the dot) |
+| `{subject}` | The whole subject |
+| `{received}` | Date the server received the message |
+| `{sent}` | The message's `Date:` header |
+| `{subject_date}` | The `date` group of `subject_pattern`, read with `subject_date_format` |
+| `{sender}` | Sender address |
+| `{index}`, `{uid}` | Attachment position in the message; the message's UID |
+| `{<group>}` | Any other named group of `subject_pattern` |
+
+Date tokens take a format after a colon, `{received:%Y.%m.%d}`, using `%Y %y %m %d %b %B %H %M %S %j %a %A` with spaces, dots, dashes and underscores between them; with no format they give `YYYY-MM-DD`. No other token takes a format. Values taken from mail have `/`, `\` and control characters replaced before they are used, so a subject cannot add a folder level.
+
+**Example.** Daily reports arrive with the subject `Daily Closing Report Summary 04May26 from host.example.com`, each with one attachment called `email.txt`:
+
+```python
+preview_attachment_export(
+    account="iCloud", mailbox="Reports", save_directory="~/Documents/Reports",
+    sender_contains="reports@example.com",
+    date_from="2026-05-01", date_to="2026-05-07",
+    subject_pattern=r"^(?P<report>.+?) (?P<date>\d{2}[A-Za-z]{3}\d{2}) from",
+    subject_date_format="%d%b%y",
+    filename_template="{report} {subject_date:%Y.%m.%d}{ext}",
+    subfolder_template="{subject_date:%Y}/{report}",
+)
+# -> ~/Documents/Reports/2026/Daily Closing Report Summary/Daily Closing Report Summary 2026.05.04.txt
+```
+
+**Returns:**
+
+```json
+{
+  "success": true,
+  "matched": 28,
+  "to_export": 28,
+  "already_exported": 0,
+  "pattern_no_match": 0,
+  "duplicate_target_paths": 0,
+  "oldest_date": "2026-05-02",
+  "newest_date": "2026-05-08",
+  "distinct_senders": 1,
+  "senders": [{"address": "reports@example.com", "count": 28}],
+  "total_message_bytes": 412336,
+  "sample_paths": ["2026/Daily Closing Report Summary/Daily Closing Report Summary 2026.05.01.EXT"],
+  "if_exists": "skip",
+  "manifest_path": "/Users/me/Documents/Reports/export_manifest.csv",
+  "preview_id": "kJ3...",
+  "expires_in_seconds": 900,
+  "commit_time_budget_seconds": 20,
+  "content_is_untrusted": true
+}
+```
+
+- `sample_paths` shows up to five paths with `NAME.EXT` standing in for the attachment's own name, which is not known until the message is downloaded.
+- `pattern_no_match` counts subjects `subject_pattern` does not fit (or whose date does not parse). They are not exported and not guessed at; each gets a manifest row.
+- `duplicate_target_paths` counts messages that would be given the same path as another (a report sent twice, say). Add a token that tells them apart (`{uid}`, `{received:%H%M}`) or choose `if_exists="suffix"`.
+- `already_exported` (only with `if_exists="skip"`): messages left out because an earlier export's manifest names their files **and** those files are still there at the recorded size. See "Resuming" under `commit_attachment_export`.
+- `preview_id` is `null` when there is nothing to export, and in two bounded cases:
+  - `over_limit: true` (more than 2,000 messages): `suggested_windows` lists date ranges to preview one at a time, as for `preview_move_by_query`.
+  - `over_budget: true`: the messages could not be read within about 20 seconds; narrow the date range.
+
+**Error Types:**
+
+- `validation_error`: a bad template, token, pattern, date, `if_exists`, or no filter at all
+- `directory_not_found`, `invalid_directory`: `save_directory` does not exist or is not a directory
+- `imap_required`: IMAP is not set up for the account
+- `account_not_found`, `not_found`: account or mailbox not found
+- `imap_error`: IMAP failed (there is no fallback)
+
+- `directory_error`: a file in `save_directory` that the export needs (its manifest or lock) cannot be used
+
+**Pattern rules.** `subject_pattern` comes from the caller, never from mail, but it is run against subjects anyone can send, and Python's regular expressions have no timeout. So:
+
+- It is applied **from the start of the subject** (as if it began with `^`). To match further in, begin it with `.*?`.
+- Subjects are cut to 300 characters first; the pattern may be at most 200.
+- Only plain constructs are accepted: text, character classes, anchors, groups, choices and repeats. Lookahead, lookbehind, backreferences, atomic groups and possessive repeats are refused.
+- A repeat may not contain another repeat or a choice (`(a+)+`, `(a|b)*`), and groups may be nested at most four deep.
+- The number of ways the pattern could match is bounded: one or two open-ended repeats (`.*`, `.+?`, `\w+`) are fine; a third, or a long row of optional parts or choices, is refused with a message saying so.
+- A group the templates do not use may be optional or empty. A group they do use must match something, or the message is recorded `pattern_no_match`.
+
+**Other notes.**
+
+- `filename_template` is a file name, not a path: `/` and `\` in it are an error. Folders go in `subfolder_template`.
+- `{received}` and `{sent}` are in this machine's local time.
+- `manifest_unreadable: true` means a file named `export_manifest.csv` is there but is not one this tool wrote (or cannot be read); nothing is treated as already exported, and the commit will refuse until it is moved aside.
+- `windows_unavailable: true` can accompany `over_limit` when the date ranges could not be worked out.
+
+---
+
+### commit_attachment_export
+
+**Fork-local.** Export the attachments held by a `preview_attachment_export` result.
+
+Downloads the previewed messages a slice at a time and writes their attachments under the names the preview's templates give. Each call works for about 20 seconds and then returns. **Call again with the same `preview_id` until `outcome` is `"complete"`.** Mail is only read (`BODY.PEEK[]` in a read-only mailbox): nothing is flagged, moved or deleted, and read status does not change.
+
+**Parameters:**
+
+- `preview_id` (string, required): The id returned by `preview_attachment_export`.
+- `max_count` (integer, required): The most messages you expect this export to cover. If the preview holds more, nothing is exported.
+
+**Returns:** counts only, never subjects or file names.
+
+```json
+{
+  "success": true,
+  "outcome": "more",
+  "total": 28,
+  "messages_done": 20,
+  "remaining": 8,
+  "saved": 20,
+  "identical_existing": 0,
+  "name_collisions": 0,
+  "renamed": 0,
+  "overwritten": 0,
+  "no_matching_attachment": 0,
+  "pattern_no_match": 0,
+  "too_large": 0,
+  "missing": 0,
+  "errors": 0,
+  "bytes_written": 294520,
+  "slowest_batch_seconds": 2.1,
+  "manifest_path": "/Users/me/Documents/Reports/export_manifest.csv"
+}
+```
+
+- `outcome`: `"more"` (call again), `"complete"`, or `"failed"` (`error` says why; the batch in flight was not recorded and the next call fetches it again).
+- `saved`, `renamed`, `overwritten`: files written. `identical_existing`: the same content was already there, so nothing was written.
+- `name_collisions`: a **different** file was already at that name and `if_exists` was `skip`. It was not written. Check this on every run; the manifest rows with status `name_collision` say which.
+- `no_matching_attachment`, `pattern_no_match`, `too_large`, `missing` (gone since the preview), `errors`: messages or attachments that produced no file. Each has a manifest row. `errors` covers anything that could not be exported: a file that could not be written, a message that could not be parsed or came back with an empty body, a name the export keeps for itself, or more than 200 attachments on one message (the first 200 are exported).
+- `server_slow: true` with `retry_after_seconds` after a timeout: wait before calling again.
+
+**The manifest.** `export_manifest.csv` in `save_directory`, one row per attachment (or one per message that produced no file): `exported_at, account, mailbox, uidvalidity, uid, message_id, subject, date_received, sender, attachment_index, attachment_name, saved_path, size, sha256, status, note, export_key`. `saved_path` is relative to `save_directory`. `export_key` is a short fingerprint of the naming and filter settings the row was made with. To check an export, compare the rows whose status is `saved`, `renamed`, `overwritten` or `identical_existing` against the files (size and sha256). A cell that begins with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'`, so a subject cannot run as a formula when the file is opened in a spreadsheet.
+
+**Resuming.** A server restart drops pending previews (they are held in memory). Preview again with the same arguments: with `if_exists="skip"` the preview leaves out messages an earlier run finished, so only what is left is downloaded. The files are the authority; the manifest only says which message made which file. A message is left out only when, in its most recent manifest rows made with the **same naming and filter settings**:
+
+- at least one file was saved, and every such file is still inside the directory at the recorded size;
+- nothing was left undone (no `error` or `name_collision` row);
+- the Message-ID **and** the received time both match (a sender can choose a Message-ID, not the time the server received it).
+
+So a message with a failed attachment is tried again, deleting a file exports its message again, and changing a template or the attachment filter exports everything again under the new settings. Matching does not depend on the mailbox, so it still works after the mail has been moved.
+
+**Where files can go.** Only inside `save_directory`. Each folder and file name is cleaned on its own; folders are created one level at a time and never through a symlink; a path that resolves outside the directory is refused and recorded as an error. An attachment cannot take the manifest's or the lock file's name (in any letter case); that is recorded as an error too. The manifest and lock are never opened through a symlink.
+
+**Limits:**
+
+- 2,000 messages per preview; one commit at a time per preview and per save directory (`commit_in_progress`).
+- Up to 10 messages or about 8 MB per fetch; the batch shrinks after a slow one and grows back after fast ones. A message over 4 MB is fetched on its own at the start of a call.
+- Messages over 16 MB are not downloaded by a bulk export: one fetch cannot be interrupted, and a larger one could outlast the client. They are recorded `too_large`; use `save_attachments` for them.
+- The server's per-attachment byte cap also applies (`APPLE_MAIL_MCP_MAX_ATTACHMENT_BYTES`, default 100 MB).
+- At most 200 attachments are exported from one message.
+- A message whose own fetch fails three times is recorded as an `error` and passed over, so it cannot hold up the messages behind it.
+- A call starts no new batch after about 20 seconds, and stops writing a batch it has fetched after about 40. One stalled read can add up to 20 seconds before it times out.
+- Not registered when the server runs with `--read-only` (it writes files); the preview is.
+
+**Error Types:**
+
+- `preview_not_found`: unknown, completed or expired `preview_id`; preview again
+- `max_count_exceeded`: the preview holds more than `max_count`
+- `selection_stale`: the mailbox was rebuilt, or the account now points at a different server
+- `commit_in_progress`: another commit is working on this preview or this directory
+- `validation_error`: `save_directory` no longer exists or cannot be written to
+- `directory_error`: the manifest or lock file in `save_directory` cannot be used (for example another file has the manifest's name)
+- `imap_required`, `account_not_found`, `not_found`: as for the preview
+- `imap_error`: IMAP failed part-way (`outcome: "failed"`, with the counts so far)
+
+---
+
 ## Best Practices
 
 
@@ -773,7 +965,7 @@ Save attachments from a message to a directory.
 | `message_id` | string | Yes | - | Message ID to save attachments from |
 | `save_directory` | string | Yes | - | Directory path to save attachments. `~` is expanded. Must already exist — the tool does not create it (`directory_not_found` otherwise). |
 | `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
-| `output_filename` | string | No | None | **Fork extension.** Save under this exact (sanitized) name instead of the attachment's own. Requires exactly one entry in `attachment_indices`. |
+| `output_filename` | string | No | None | **Fork extension.** Save under this name instead of the attachment's own. The name is kept as written, spaces and non-English letters included (`Daily Closing Report 2026.05.04.txt` stays exactly that). Only what could move the file or break a file name is removed: directory parts (`../../x` becomes `x`), `\` and `:`, control and invisible formatting characters (which can make a name display as something it is not), and leading dots; runs of blanks become one space. Requires exactly one entry in `attachment_indices`. For many messages at once use `preview_attachment_export` / `commit_attachment_export`. |
 | `overwrite` | bool | No | `false` | Only meaningful with `output_filename`. Default is **no-clobber**: an existing destination is left untouched and the call returns `error_type: "already_exists"`. `true` replaces it atomically. |
 | `account` | string | No | None | Mail.app account name or UUID. With `mailbox`, takes the IMAP fast path (one fetch). Pass the same values you read the message with so attachment ordering matches. |
 | `mailbox` | string | No | None | Folder the message lives in (e.g. "INBOX"), used with `account` for the IMAP fast path. |

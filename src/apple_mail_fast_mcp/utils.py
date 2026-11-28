@@ -245,6 +245,84 @@ def make_body_safe(content: str, max_bytes: int) -> tuple[str, bool, int]:
     return encoded[:max_bytes].decode("utf-8", "ignore"), True, original_bytes
 
 
+_MAX_FILENAME_BYTES = 255
+
+# Joiners that some scripts and emoji sequences need inside a word. Every
+# other invisible formatting character is dropped from a file name.
+_KEPT_FORMAT_CHARS = frozenset("\u200c\u200d")
+
+
+def _output_char(ch: str) -> str:
+    """One character of a caller-chosen file name, made safe to show.
+
+    Invisible characters are how a name lies about itself: a direction
+    override makes ``invoice<RLO>fdp.exe`` display as ``invoiceexe.pdf``, a
+    zero-width space makes two different names look the same, and a run of
+    blank look-alikes pushes the real extension out of view.
+    """
+    import unicodedata
+
+    category = unicodedata.category(ch)
+    if ch in "\\:/" or category == "Cc":
+        return "_"
+    if category in ("Zl", "Zp") or (category == "Cf" and ch not in _KEPT_FORMAT_CHARS):
+        return ""
+    if category == "Zs" or ch == "\u2800":  # any blank becomes a plain space
+        return " "
+    return ch
+
+
+def sanitize_output_filename(filename: str) -> str:
+    """Make a caller-chosen file name safe without mangling it. Fork-local.
+
+    For names the caller wrote on purpose (``save_attachments``'
+    ``output_filename``, the export tools' rendered names). Spaces, letters
+    in any script and ordinary punctuation are kept, so
+    ``"Daily Closing Report 2026.05.04.txt"`` stays exactly that.
+
+    Names that come from mail are a different matter and keep going through
+    :func:`sanitize_filename`, which allows far less.
+
+    What is removed is only what could put the file somewhere else or what a
+    file name cannot safely hold:
+
+    * every directory part (only the last path component is used);
+    * ``\\`` and ``:``, which are separators on other systems and in Finder;
+    * control characters;
+    * leading dots (no hidden files, and no ``..``), leading spaces, and
+      trailing dots and spaces.
+
+    The result is one path component, never empty, at most 255 bytes.
+
+    Examples:
+        >>> sanitize_output_filename("Daily Closing Report 2026.05.04.txt")
+        'Daily Closing Report 2026.05.04.txt'
+        >>> sanitize_output_filename("../../etc/passwd")
+        'passwd'
+    """
+    import unicodedata
+    from pathlib import Path
+
+    name = unicodedata.normalize("NFC", filename).replace("\x00", "")
+    name = Path(name).name
+    name = "".join(_output_char(ch) for ch in name)
+    while "  " in name:  # a long run of blanks hides what follows it
+        name = name.replace("  ", " ")
+    name = name.lstrip(". ").rstrip(". ")
+
+    if len(name.encode("utf-8")) > _MAX_FILENAME_BYTES:
+        stem, dot, ext = name.rpartition(".")
+        if not dot or len(ext.encode("utf-8")) > 32:
+            stem, ext = name, ""
+        room = _MAX_FILENAME_BYTES - (len(ext.encode("utf-8")) + 1 if ext else 0)
+        # Cut on a character boundary: a split multi-byte character would
+        # leave a name that is not valid text.
+        stem = stem.encode("utf-8")[:room].decode("utf-8", errors="ignore")
+        name = f"{stem.rstrip('. ')}.{ext}" if ext else stem.rstrip(". ")
+
+    return name or "unnamed_file"
+
+
 def sanitize_filename(filename: str) -> str:
     """
     Sanitize filename for safe file operations.
@@ -259,7 +337,7 @@ def sanitize_filename(filename: str) -> str:
 
     Example:
         >>> sanitize_filename("../../../etc/passwd")
-        'etc_passwd'
+        'passwd'
         >>> sanitize_filename("my-file_v2.txt")
         'my-file_v2.txt'
     """

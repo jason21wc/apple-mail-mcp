@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from apple_mail_fast_mcp import query_moves, server
+from apple_mail_fast_mcp import attachment_exports, query_moves, server
 from apple_mail_fast_mcp.exceptions import (
     MailAppleScriptError,
     MailDraftError,
@@ -25,6 +25,9 @@ from apple_mail_fast_mcp.exceptions import (
 )
 from apple_mail_fast_mcp.mail_connector import AppleMailConnector
 from apple_mail_fast_mcp.templates import Template, TemplateStore
+from tests.unit.test_attachment_exports import FakeConnector as ExportConnector
+from tests.unit.test_attachment_exports import StrictClient as ExportClient
+from tests.unit.test_attachment_exports import _reports as _export_reports
 from tests.unit.test_query_moves import FakeConnector, _client
 
 pytestmark = pytest.mark.e2e
@@ -49,6 +52,9 @@ EXPECTED_TOOLS = {
     # Query-driven bulk move (fork-local)
     "preview_move_by_query",
     "commit_move_by_query",
+    # Bulk attachment export (fork-local)
+    "preview_attachment_export",
+    "commit_attachment_export",
     "save_attachments",
     "create_mailbox",
     "update_mailbox",
@@ -117,6 +123,11 @@ class TestToolRegistration:
                 {"account", "source_mailbox", "destination_mailbox"},
             ),
             ("commit_move_by_query", {"preview_id", "max_count"}),
+            (
+                "preview_attachment_export",
+                {"account", "mailbox", "save_directory"},
+            ),
+            ("commit_attachment_export", {"preview_id", "max_count"}),
             ("delete_draft", {"draft_id"}),
         ],
     )
@@ -144,6 +155,8 @@ _TMP_FILE = "__TMP_FILE__"
 # Replaced with the id of a preview seeded by the ``query_move_preview_id``
 # fixture: commit_move_by_query only accepts an id the server issued.
 _PREVIEW_ID = "__PREVIEW_ID__"
+# Likewise for commit_attachment_export (``export_preview_id`` fixture).
+_EXPORT_PREVIEW_ID = "__EXPORT_PREVIEW_ID__"
 
 
 # (tool_name, call_args, connector_method, connector_return_value)
@@ -231,6 +244,24 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str | None, Any]] = [
     (
         "commit_move_by_query",
         {"preview_id": _PREVIEW_ID, "max_count": 10},
+        None,
+        None,
+    ),
+    (
+        "preview_attachment_export",
+        {
+            "account": "TestAccount",
+            "mailbox": "Reports",
+            "save_directory": _TMP_DIR,
+            "sender_contains": "lp@denbt1.marriott.com",
+            "date_from": "2026-05-01",
+        },
+        None,
+        None,
+    ),
+    (
+        "commit_attachment_export",
+        {"preview_id": _EXPORT_PREVIEW_ID, "max_count": 10},
         None,
         None,
     ),
@@ -323,6 +354,30 @@ class TestToolInvocation:
             identity=(connector._host, connector._email),
         )
 
+    @pytest.fixture
+    def export_preview_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> str:
+        """Back the export tools with a read-only fake IMAP client and seed
+        one preview bound to ``tmp_path``."""
+        connector = ExportConnector(ExportClient(_export_reports(2)))
+        store = attachment_exports.ExportStore()
+        monkeypatch.setattr(server, "_export_store", store)
+        monkeypatch.setattr(server, "_export_connector", lambda _account: connector)
+        return store.put(attachment_exports.ExportEntry(
+            account="TestAccount",
+            mailbox="Reports",
+            uidvalidity=7,
+            identity=(connector._host, connector._email),
+            total=2,
+            remaining=[1, 2],
+            sizes={1: 500, 2: 500},
+            save_directory=tmp_path.resolve(),
+            naming=attachment_exports.build_naming(filename_template="{uid} {name}"),
+            attachment_name_contains=None,
+            if_exists="skip",
+        ))
+
     @pytest.mark.parametrize(
         "tool_name,call_args,connector_method,connector_return",
         INVOCATION_CASES,
@@ -337,7 +392,9 @@ class TestToolInvocation:
         connector_method: str | None,
         connector_return: Any,
         query_move_preview_id: str,
+        export_preview_id: str,
     ) -> None:
+        mock_mail.max_attachment_bytes = 100 * 1024 * 1024
         # Materialize tmp_path-dependent sentinels. save_attachments requires
         # the directory to exist; send_email_with_attachments requires each
         # attachment path to exist on disk.
@@ -348,6 +405,8 @@ class TestToolInvocation:
                 resolved_args[key] = str(tmp_path)
             elif value == _PREVIEW_ID:
                 resolved_args[key] = query_move_preview_id
+            elif value == _EXPORT_PREVIEW_ID:
+                resolved_args[key] = export_preview_id
             elif isinstance(value, list) and _TMP_FILE in value:
                 tmp_file.write_text("dummy")
                 resolved_args[key] = [
@@ -387,6 +446,14 @@ class TestToolInvocation:
         elif tool_name == "commit_move_by_query":
             assert result.structured_content["moved"] == 2
             assert result.structured_content["outcome"] == "complete"
+        elif tool_name == "preview_attachment_export":
+            assert result.structured_content["matched"] == 2
+            assert result.structured_content["preview_id"]
+            assert result.structured_content["content_is_untrusted"] is True
+        elif tool_name == "commit_attachment_export":
+            assert result.structured_content["saved"] == 2
+            assert result.structured_content["outcome"] == "complete"
+            assert (tmp_path / "1 email.txt").is_file()
         elif tool_name == "list_templates":
             assert result.structured_content["templates"] == [
                 {"name": "smoke", "subject": "Hello {person}"}]
