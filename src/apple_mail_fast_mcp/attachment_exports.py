@@ -56,8 +56,10 @@ from . import date_windows
 from .draft_builder import extract_attachment_payloads
 from .exceptions import MailError
 from .imap_connector import (
+    _bodystructure_extract_attachments,
     _decode,
     _decode_mime_header,
+    _format_address_list,
     _format_sender,
     _reject_control_chars,
     _search_charset,
@@ -133,7 +135,7 @@ MANIFEST_NAME = "export_manifest.csv"
 LOCK_NAME = ".export_manifest.lock"
 MANIFEST_FIELDS = (
     "exported_at", "account", "mailbox", "uidvalidity", "uid", "message_id",
-    "subject", "date_received", "sender", "attachment_index",
+    "subject", "date_received", "sender", "to", "cc", "attachment_index",
     "attachment_name", "saved_path", "size", "sha256", "status", "note",
     "export_key",
 )
@@ -162,6 +164,12 @@ PATTERN_DEPTH_LIMIT = 4
 FETCH_FAILURE_LIMIT = 3
 """A message whose own fetch has failed this many times is recorded as an
 error and passed over, so it cannot hold up everything behind it."""
+
+CLASSIFY_AHEAD = 50
+"""How many upcoming messages are asked about (structure and size) at once."""
+
+LISTING_CHUNK = 500
+"""Manifest rows written per step of a manifest-only commit."""
 
 SOLO_MESSAGE_BYTES = 4 * 1024 * 1024
 """A message above this is fetched on its own, as the first work of a call,
@@ -550,16 +558,27 @@ class ExportEntry:
     # their manifest row. They are recorded without downloading the message.
     unmatched: dict[int, dict[str, Any]] = field(default_factory=dict)
     fetch_failures: dict[int, int] = field(default_factory=dict)
+    # List the messages in the manifest and save nothing.
+    manifest_only: bool = False
+    # What the preview read of each message (subject, sender, dates, ...).
+    fields: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Messages the server says have no attachments at all, and those asked.
+    no_attachments: set[int] = field(default_factory=set)
+    classified: set[int] = field(default_factory=set)
     expires_at: float = 0.0
     batch_size: int = MAX_BATCH
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @property
     def export_key(self) -> str:
-        return export_key(self.naming, self.attachment_name_contains)
+        return export_key(
+            self.naming, self.attachment_name_contains, self.manifest_only
+        )
 
 
-def export_key(naming: Naming, attachment_name_contains: str | None) -> str:
+def export_key(
+    naming: Naming, attachment_name_contains: str | None, manifest_only: bool = False
+) -> str:
     """A short fingerprint of the naming and filter settings.
 
     Written on every manifest row. A rerun only trusts rows made with the
@@ -567,8 +586,10 @@ def export_key(naming: Naming, attachment_name_contains: str | None) -> str:
     of skipping it.
     """
     wanted = (attachment_name_contains or "").strip().casefold()
-    text = "\x1f".join((*naming.source, wanted))
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    parts = [*naming.source, wanted]
+    if manifest_only:
+        parts.append("manifest-only")
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
 class ExportStore:
@@ -682,10 +703,32 @@ def _open_inside(directory: Path, name: str, flags: int) -> int:
         ) from exc
 
 
+def _lock_directory() -> Path:
+    """Where export locks live: the app's own data directory, resolved now.
+
+    Not the save directory: a lock file left there was clutter in the
+    user's folder after every export.
+    """
+    home = os.environ.get("APPLE_MAIL_MCP_HOME")
+    root = Path(home) if home else Path.home() / ".apple_mail_mcp"
+    return root / "export_locks"
+
+
 @contextlib.contextmanager
 def _directory_lock(directory: Path) -> Iterator[None]:
     """One export at a time per save directory, across processes."""
-    descriptor = _open_inside(directory, LOCK_NAME, os.O_CREAT | os.O_RDWR)
+    locks = _lock_directory()
+    name = hashlib.sha256(str(directory).encode("utf-8")).hexdigest()[:24] + ".lock"
+    try:
+        locks.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            locks / name,
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+        )
+    except OSError as exc:
+        raise ExportDirectoryError(
+            f"cannot create the export lock: {exc.strerror or exc}"
+        ) from exc
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -840,6 +883,8 @@ def _envelope_fields(data: dict[bytes, Any]) -> dict[str, Any]:
     return {
         "subject": _text(_decode_mime_header(getattr(envelope, "subject", None))),
         "sender": _text(extract_address(sender) or sender),
+        "to": _text(_format_address_list(getattr(envelope, "to", None))),
+        "cc": _text(_format_address_list(getattr(envelope, "cc", None))),
         "received": received if isinstance(received, datetime) else None,
         "sent": sent if isinstance(sent, datetime) else None,
         "message_id": _text(
@@ -879,11 +924,16 @@ def preview(
     naming: Naming,
     attachment_name_contains: str | None = None,
     if_exists: str = "skip",
+    manifest_only: bool = False,
     ceiling: int = EXPORT_CEILING,
     budget: float = PREVIEW_BUDGET_SECONDS,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    """Find what the selector matches and hold that set. Writes nothing."""
+    """Find what the selector matches and hold that set. Writes nothing.
+
+    With ``manifest_only`` the commit lists the messages in the manifest
+    (Message-ID, subject, dates, sender, To, Cc) and downloads nothing.
+    """
     _reject_control_chars(mailbox, "mailbox")
     if if_exists not in IF_EXISTS:
         raise ValueError(f"if_exists must be one of {', '.join(IF_EXISTS)}")
@@ -901,7 +951,8 @@ def preview(
             account=account, mailbox=mailbox, directory=directory,
             selector=selector, naming=naming,
             attachment_name_contains=attachment_name_contains,
-            if_exists=if_exists, ceiling=ceiling, budget=budget, clock=clock,
+            if_exists=if_exists, manifest_only=manifest_only,
+            ceiling=ceiling, budget=budget, clock=clock,
         )
     except _WindowsInterrupted as lost:
         return {**lost.result, "windows_unavailable": True}
@@ -1043,6 +1094,7 @@ def _preview(
     naming: Naming,
     attachment_name_contains: str | None,
     if_exists: str,
+    manifest_only: bool,
     ceiling: int,
     budget: float,
     clock: Callable[[], float],
@@ -1054,8 +1106,68 @@ def _preview(
     result, uids, read, sizes = found.result, found.uids, found.read, found.sizes
     if found.final:
         return result
-    uidvalidity = found.uidvalidity
+    dates = [f["received"].date() for f in read.values() if f["received"]]
+    ranked = rank_senders(
+        [{"sender": f["sender"]} for f in read.values()], "address", max(len(read), 1)
+    )
+    result.update(
+        oldest_date=min(dates).isoformat() if dates else None,
+        newest_date=max(dates).isoformat() if dates else None,
+        distinct_senders=len(ranked),
+        senders=ranked[:SENDER_LIMIT],
+        manifest_path=str(directory / MANIFEST_NAME),
+    )
+    unmatched: dict[int, dict[str, Any]] = {}
+    if manifest_only:
+        # A listing is not an export: every match is listed, every time.
+        remaining = list(uids)
+        result.update(manifest_only=True, to_export=len(remaining))
+    else:
+        outcome = _plan_export(
+            result, uids, read, sizes, directory=directory, naming=naming,
+            attachment_name_contains=attachment_name_contains,
+            if_exists=if_exists, budget=budget, clock=clock,
+        )
+        if outcome is None:
+            return result
+        remaining, unmatched = outcome
+    if not remaining:
+        return result
+    result["preview_id"] = store.put(ExportEntry(
+        account=account,
+        mailbox=mailbox,
+        uidvalidity=found.uidvalidity,
+        identity=_identity(connector),
+        total=len(remaining),
+        remaining=remaining,
+        sizes=sizes,
+        save_directory=directory,
+        naming=naming,
+        attachment_name_contains=attachment_name_contains,
+        if_exists=if_exists,
+        unmatched=unmatched,
+        manifest_only=manifest_only,
+        fields=read,
+    ))
+    result["expires_in_seconds"] = int(store.ttl)
+    result["commit_time_budget_seconds"] = int(TIME_BUDGET_SECONDS)
+    return result
 
+
+def _plan_export(
+    result: dict[str, Any],
+    uids: list[int],
+    read: dict[int, dict[str, Any]],
+    sizes: dict[int, int],
+    *,
+    directory: Path,
+    naming: Naming,
+    attachment_name_contains: str | None,
+    if_exists: str,
+    budget: float,
+    clock: Callable[[], float],
+) -> tuple[list[int], dict[int, dict[str, Any]]] | None:
+    """Fill in what a file export will do. None if it took too long."""
     done_ids: set[tuple[str, str]] = set()
     unreadable = False
     if if_exists == "skip":
@@ -1069,48 +1181,36 @@ def _preview(
     )
     if plan.over_budget:
         result["over_budget"] = True
-        return result
-    remaining = plan.remaining
-
-    dates = [f["received"].date() for f in read.values() if f["received"]]
-    ranked = rank_senders(
-        [{"sender": f["sender"]} for f in read.values()], "address", max(len(read), 1)
-    )
+        return None
     result.update(
-        to_export=len(remaining),
+        to_export=len(plan.remaining),
         already_exported=plan.already,
         pattern_no_match=plan.no_match,
-        duplicate_target_paths=sum(n for n in plan.targets.values() if n > 1),
-        oldest_date=min(dates).isoformat() if dates else None,
-        newest_date=max(dates).isoformat() if dates else None,
-        distinct_senders=len(ranked),
-        senders=ranked[:SENDER_LIMIT],
-        total_message_bytes=sum(sizes.get(u, 0) for u in remaining),
+        total_message_bytes=sum(sizes.get(u, 0) for u in plan.remaining),
         sample_paths=plan.samples,
         if_exists=if_exists,
-        manifest_path=str(directory / MANIFEST_NAME),
     )
+    uses_name = bool(naming.tokens & _NAME_TOKENS)
+    if naming.tokens and naming.tokens <= _NAME_TOKENS:
+        # Nothing in the names comes from the message, so every message
+        # renders to the same placeholder: that says nothing about clashes.
+        result["duplicate_target_paths"] = None
+        result["duplicate_check"] = (
+            "not possible before download: the names depend only on each "
+            "attachment's own name"
+        )
+    else:
+        result["duplicate_target_paths"] = sum(
+            n for n in plan.targets.values() if n > 1
+        )
+    if uses_name:
+        result["sample_note"] = (
+            "NAME.EXT stands for each attachment's own name, which is not "
+            "known until the message is downloaded"
+        )
     if unreadable:
         result["manifest_unreadable"] = True
-    if not remaining:
-        return result
-    result["preview_id"] = store.put(ExportEntry(
-        account=account,
-        mailbox=mailbox,
-        uidvalidity=uidvalidity,
-        identity=_identity(connector),
-        total=len(remaining),
-        remaining=remaining,
-        sizes=sizes,
-        save_directory=directory,
-        naming=naming,
-        attachment_name_contains=attachment_name_contains,
-        if_exists=if_exists,
-        unmatched=plan.unmatched,
-    ))
-    result["expires_in_seconds"] = int(store.ttl)
-    result["commit_time_budget_seconds"] = int(TIME_BUDGET_SECONDS)
-    return result
+    return plan.remaining, plan.unmatched
 
 
 # ------------------------------------------------------------------ commit
@@ -1345,6 +1445,8 @@ def _message_columns(fields: dict[str, Any]) -> dict[str, Any]:
         "message_id": fields["message_id"],
         "subject": fields["subject"],
         "sender": fields["sender"],
+        "to": fields.get("to", ""),
+        "cc": fields.get("cc", ""),
         "date_received": fields["received"].isoformat() if fields["received"] else "",
     }
 
@@ -1410,8 +1512,10 @@ def _next_batch(entry: ExportEntry, raw_cap: int) -> tuple[list[int], list[int]]
     unfetched: list[int] = []
     total = 0
     for uid in entry.remaining:
+        if uid not in entry.unmatched and uid not in entry.classified:
+            break  # not asked about yet: the next pass classifies it first
         size = entry.sizes.get(uid, 0)
-        if size > raw_cap or uid in entry.unmatched:
+        if size > raw_cap or uid in entry.unmatched or uid in entry.no_attachments:
             if batch:
                 break
             unfetched.append(uid)
@@ -1440,6 +1544,12 @@ def _unfetched_row(entry: ExportEntry, uid: int, progress: _Progress) -> dict[st
     if fields is not None:
         progress.counts["pattern_no_match"] += 1
         return {**row, **_message_columns(fields), "status": "pattern_no_match"}
+    if uid in entry.no_attachments:
+        progress.counts["no_matching_attachment"] += 1
+        return {
+            **row, **_message_columns(entry.fields[uid]),
+            "status": "no_matching_attachment",
+        }
     progress.counts["too_large"] += 1
     return {
         **row,
@@ -1449,28 +1559,50 @@ def _unfetched_row(entry: ExportEntry, uid: int, progress: _Progress) -> dict[st
     }
 
 
-def _learn_sizes(client: Any, entry: ExportEntry) -> None:
-    """Find the size of upcoming messages the preview could not size.
+def _classify(client: Any, entry: ExportEntry) -> None:
+    """Ask the server about the next messages before any is downloaded.
 
-    Without it a message of unknown size would be fetched blind, whatever
-    it weighs.
+    Two things are learned from one small fetch. Whether a message has any
+    attachment at all: one with none is recorded without being downloaded,
+    which is most of the time saved on a mailbox of ordinary mail. And its
+    size, where the preview could not read it: a message of unknown size
+    would otherwise be fetched blind, whatever it weighs.
+
+    Only "no attachments at all" is taken from the structure. The names in
+    it are not decoded the way the saved names are, so a name filter is
+    always settled from the downloaded message.
     """
-    # The next messages that will actually be fetched: those recorded
-    # without a download do not count towards the batch.
-    upcoming = [u for u in entry.remaining if u not in entry.unmatched][:MAX_BATCH]
-    unknown = [u for u in upcoming if entry.sizes.get(u, 0) <= 0]
-    if not unknown:
+    ahead = [
+        u for u in entry.remaining[:CLASSIFY_AHEAD]
+        if u not in entry.unmatched and u not in entry.classified
+    ]
+    if not ahead:
         return
-    fetched = client.fetch(unknown, ["RFC822.SIZE"])
-    for uid in unknown:
+    fetched = client.fetch(ahead, ["BODYSTRUCTURE", "RFC822.SIZE"])
+    for uid in ahead:
+        entry.classified.add(uid)
         data = fetched.get(uid)
-        size = data.get(b"RFC822.SIZE") if data else None
         if data is None:
             entry.sizes[uid] = 1  # gone: the body fetch will record it
-        elif isinstance(size, int) and size > 0:
-            entry.sizes[uid] = size
-        else:
-            entry.sizes[uid] = BULK_MESSAGE_BYTES + 1  # will not say: skip it
+            continue
+        if entry.sizes.get(uid, 0) <= 0:
+            size = data.get(b"RFC822.SIZE")
+            entry.sizes[uid] = (
+                size if isinstance(size, int) and size > 0
+                else BULK_MESSAGE_BYTES + 1  # will not say: skip it
+            )
+        if uid in entry.fields and _has_no_attachments(data.get(b"BODYSTRUCTURE")):
+            entry.no_attachments.add(uid)
+
+
+def _has_no_attachments(structure: Any) -> bool:
+    """True only on a positive answer; anything unclear means "download it"."""
+    if not isinstance(structure, tuple) or not structure:
+        return False
+    try:
+        return _bodystructure_extract_attachments(structure) == []
+    except Exception:  # noqa: BLE001 - an odd structure: do not guess
+        return False
 
 
 def _next_size(size: int, took: float) -> int:
@@ -1507,7 +1639,7 @@ def _run(
             while entry.remaining:
                 if progress.done and clock() - started >= time_budget:
                     break
-                _learn_sizes(client, entry)
+                _classify(client, entry)
                 batch, unfetched = _next_batch(entry, raw_cap)
                 solo = len(batch) == 1 and (
                     entry.sizes.get(batch[0], 0) > SOLO_MESSAGE_BYTES
@@ -1552,6 +1684,75 @@ def _run(
         if len(in_flight) == 1:
             _note_fetch_failure(entry, in_flight[0], progress)
     return progress
+
+
+def _run_listing(
+    connector: _Connector,
+    entry: ExportEntry,
+    time_budget: float,
+    clock: Callable[[], float],
+) -> _Progress:
+    """Write one manifest row per message from what the preview already read.
+
+    No message is downloaded, and normally the mail server is not contacted
+    at all: the preview read every envelope. Only a message it could not
+    read is asked for again, by header.
+    """
+    progress = _Progress()
+    started = clock()
+    try:
+        while entry.remaining:
+            if progress.done and clock() - started >= time_budget:
+                break
+            chunk = entry.remaining[:LISTING_CHUNK]
+            unread = [u for u in chunk if u not in entry.fields]
+            if unread:
+                _read_envelopes(connector, entry, unread)
+            rows: list[dict[str, Any]] = []
+            for uid in chunk:
+                row: dict[str, Any] = {
+                    "exported_at": _stamp(),
+                    "account": entry.account,
+                    "mailbox": entry.mailbox,
+                    "uidvalidity": entry.uidvalidity,
+                    "uid": uid,
+                    "export_key": entry.export_key,
+                }
+                fields = entry.fields.get(uid)
+                if fields is None:
+                    progress.counts["missing"] += 1
+                    rows.append({**row, "status": "missing",
+                                 "note": "gone since the preview"})
+                else:
+                    progress.counts["listed"] += 1
+                    rows.append({**row, **_message_columns(fields), "status": "listed"})
+            _append_manifest(entry.save_directory, rows)
+            entry.remaining = entry.remaining[len(chunk):]
+            progress.done += len(chunk)
+    except MailError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        progress.error = str(exc) or type(exc).__name__
+        progress.timed_out = _is_timeout(exc)
+    return progress
+
+
+def _read_envelopes(connector: _Connector, entry: ExportEntry, uids: list[int]) -> None:
+    """Read headers of messages the preview did not get. Never a body."""
+    with connector._session() as client, _socket_timeout(client):
+        selected = client.select_folder(entry.mailbox, readonly=True)
+        if _uidvalidity(selected) != entry.uidvalidity:
+            raise SelectionStaleError(
+                "the mailbox was rebuilt since the preview (UIDVALIDITY "
+                "changed). Preview again."
+            )
+        for start in range(0, len(uids), FETCH_CHUNK):
+            chunk = uids[start:start + FETCH_CHUNK]
+            fetched = client.fetch(chunk, ["ENVELOPE", "INTERNALDATE"])
+            for uid in chunk:
+                data = fetched.get(uid)
+                if data and data.get(b"ENVELOPE") is not None:
+                    entry.fields[uid] = _envelope_fields(data)
 
 
 def _note_fetch_failure(entry: ExportEntry, uid: int, progress: _Progress) -> None:
@@ -1613,10 +1814,13 @@ def commit(
         _check_directory(entry.save_directory)
         with _directory_lock(entry.save_directory):
             _require_own_manifest(entry.save_directory)
-            progress = _run(
-                connector, store, preview_id, entry,
-                max_attachment_bytes, time_budget, clock,
-            )
+            if entry.manifest_only:
+                progress = _run_listing(connector, entry, time_budget, clock)
+            else:
+                progress = _run(
+                    connector, store, preview_id, entry,
+                    max_attachment_bytes, time_budget, clock,
+                )
     finally:
         entry.lock.release()
 
@@ -1625,6 +1829,7 @@ def commit(
         "total": entry.total,
         "messages_done": progress.done,
         "remaining": len(entry.remaining),
+        "listed": counts["listed"],
         "saved": counts["saved"],
         "identical_existing": counts["identical_existing"],
         "name_collisions": counts["name_collisions"],

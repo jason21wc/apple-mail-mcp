@@ -2096,8 +2096,15 @@ async def preview_attachment_export(
     subject_pattern: str | None = None,
     subject_date_format: str | None = None,
     if_exists: str = "skip",
+    manifest_only: bool = False,
 ) -> dict[str, Any]:
     """Preview a bulk attachment export chosen by filters. Writes nothing.
+
+    To list messages instead of saving attachments (an inventory of
+    Message-IDs, subjects, dates, senders and recipients for thousands of
+    messages), pass ``manifest_only=true``: the commit then writes one row
+    per message to the manifest and downloads nothing.
+
 
     Use this with ``commit_attachment_export`` to save the attachments of
     many messages (hundreds or thousands) under names built from a template,
@@ -2144,6 +2151,12 @@ async def preview_attachment_export(
             name: "skip" (default; reported as a name collision), "suffix"
             (save as "name (2).ext") or "overwrite". A file with identical
             content is never written twice, whatever this is.
+        manifest_only: List the matching messages in the manifest and save
+            no files. The commit writes rows with status "listed" from the
+            headers the preview already read (message id, subject, received
+            date, sender, to, cc) and downloads no message, so thousands of
+            messages take one or two commit calls. The naming options and
+            if_exists do not apply.
 
         At least one of sender_contains, subject_contains, date_from or
         date_to is required. A blank value is an error, not "no filter".
@@ -2154,7 +2167,9 @@ async def preview_attachment_export(
         done; only with if_exists="skip"); ``pattern_no_match`` (subjects the
         pattern does not fit); ``duplicate_target_paths`` (messages that
         would be given the same path as another: add a token that tells them
-        apart, or choose if_exists="suffix"); ``oldest_date`` /
+        apart, or choose if_exists="suffix"; null, with ``duplicate_check``
+        saying why, when the names depend only on each attachment's own
+        name and so cannot be judged before download); ``oldest_date`` /
         ``newest_date``; ``senders``; ``total_message_bytes``;
         ``sample_paths`` (up to five, with NAME.EXT standing in for the
         attachment's own name); ``manifest_path``; ``preview_id`` (null when
@@ -2211,6 +2226,7 @@ async def preview_attachment_export(
             naming=naming,
             attachment_name_contains=attachment_name_contains,
             if_exists=if_exists,
+            manifest_only=manifest_only,
         )
         operation_logger.log_operation(
             operation,
@@ -2281,7 +2297,8 @@ async def commit_attachment_export(preview_id: str, max_count: int) -> dict[str,
     Returns:
         Counts only, never subjects or names: ``outcome`` ("more",
         "complete" or "failed"); ``total``; ``messages_done`` and
-        ``remaining``; ``saved``; ``identical_existing`` (already on disk
+        ``remaining``; ``listed`` (rows written by a manifest-only
+        preview); ``saved``; ``identical_existing`` (already on disk
         with the same content); ``name_collisions`` (a different file was
         already at that name and if_exists was "skip": not written, look at
         the manifest); ``renamed``; ``overwritten``;

@@ -117,12 +117,12 @@ class TestReservedNames:
         assert out["overwritten"] == 0
         assert (tmp_path / ax.MANIFEST_NAME).read_bytes().startswith(before)
 
-    @pytest.mark.parametrize("name", [ax.MANIFEST_NAME, ax.LOCK_NAME])
+    @pytest.mark.parametrize("name", [ax.MANIFEST_NAME])
     def test_own_files_are_never_opened_through_a_symlink(
         self, tmp_path: Path, name: str
     ) -> None:
-        """A link planted at the lock's name used to have its target emptied,
-        and one at the manifest's name had rows appended to its target."""
+        """A link planted at the manifest's name had rows appended to its
+        target. (The lock no longer lives in the save directory at all.)"""
         target = tmp_path / "exports"
         target.mkdir()
         outside = tmp_path / "outside.txt"
@@ -452,7 +452,7 @@ class TestLargeMessages:
         out = _commit(conn, store, preview["preview_id"])
         assert out["saved"] == 3
         parts = [p for _, p in conn.client.fetches]
-        assert parts.index(["RFC822.SIZE"]) < next(
+        assert parts.index(["BODYSTRUCTURE", "RFC822.SIZE"]) < next(
             i for i, p in enumerate(parts) if "BODY.PEEK[]" in p
         )
         assert all(size > 0 for size in entry.sizes.values())
@@ -474,7 +474,7 @@ class TestLargeMessages:
         out = _commit(conn, store, preview["preview_id"])
         assert out["saved"] == 3
         assert out["pattern_no_match"] == 12
-        assert ([21, 22, 23], ["RFC822.SIZE"]) in conn.client.fetches
+        assert ([21, 22, 23], ["BODYSTRUCTURE", "RFC822.SIZE"]) in conn.client.fetches
         assert all(entry.sizes[u] > 0 for u in (21, 22, 23))
 
     def test_writing_that_runs_long_leaves_the_rest_for_the_next_call(

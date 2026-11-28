@@ -391,6 +391,12 @@ _No parameters._
 
 Preview a bulk attachment export chosen by filters. Writes nothing.
 
+To list messages instead of saving attachments (an inventory of
+Message-IDs, subjects, dates, senders and recipients for thousands of
+messages), pass ``manifest_only=true``: the commit then writes one row
+per message to the manifest and downloads nothing.
+
+
 Use this with ``commit_attachment_export`` to save the attachments of
 many messages (hundreds or thousands) under names built from a template,
 instead of calling ``save_attachments`` once per message. The preview
@@ -417,6 +423,7 @@ you preview each range in turn.
 - `subject_pattern` (string, optional): A regular expression applied to each subject from its start (begin it with ``.*?`` to match further in); its named groups become tokens. A group named ``date`` feeds {subject_date}. A message whose subject does not match is not exported and not guessed at. Keep it simple: lookarounds, backreferences, a repeat inside a repeat, and more than two open-ended repeats (``.*``, ``.+``) are refused.
 - `subject_date_format` (string, optional): Layout of the ``date`` group, for example "%d%b%y" for 04May26.
 - `if_exists` (string, optional) (default: 'skip'): What to do when a different file is already at the target name: "skip" (default; reported as a name collision), "suffix" (save as "name (2).ext") or "overwrite". A file with identical content is never written twice, whatever this is.
+- `manifest_only` (boolean, optional) (default: False): List the matching messages in the manifest and save no files. The commit writes rows with status "listed" from the headers the preview already read (message id, subject, received date, sender, to, cc) and downloads no message, so thousands of messages take one or two commit calls. The naming options and if_exists do not apply.
 
 ### preview_move_by_query
 

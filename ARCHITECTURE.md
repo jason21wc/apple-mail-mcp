@@ -119,6 +119,17 @@ Its boundaries, which are the reason it is safe to run unattended:
   through one adapter function, so attachment indices agree with
   `save_attachments`.
 
+Two additions from its first field test (2026-11-28). `manifest_only` lists
+the matched messages in the manifest (Message-ID, subject, dates, sender, To,
+Cc) from the envelopes the preview already read, with no download: the test
+had used the export as a Message-ID inventory and found it far too slow,
+because every message was fetched. And in the ordinary mode a message the
+server's BODYSTRUCTURE shows has no attachment at all is recorded without
+being fetched; a name filter is still settled from the downloaded message,
+because BODYSTRUCTURE names are not decoded the way saved names are. The
+export's lock now lives under the app data directory, so the manifest is the
+only file it adds to the save directory.
+
 Why it is fork-local rather than proposed upstream first (ADR-2): it was
 needed now for a one-off backlog, and it builds on `query_moves.py`, which is
 itself not upstream yet. It is a candidate to propose together with that.
