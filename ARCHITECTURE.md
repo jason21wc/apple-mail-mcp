@@ -73,7 +73,9 @@ Gmail, and does not touch `mail_connector.py` (ADR-3). It reuses four private
 helpers from `imap_connector.py` and three from `mail_connector.py` (connector
 construction), which is the sync cost to watch. It is an upstream candidate
 (it answers upstream #442); until it is proposed there it is the fork's third
-divergence.
+divergence. When a selection is above the ceiling the preview returns date
+ranges that each fit (`date_windows.py`, added 2026-11-27), read from
+`INTERNALDATE` only; the ceiling and the caller's `max_count` are unchanged.
 
 Everything else the fork once carried has converged into upstream and been
 dropped. Fork infrastructure that is not a behavior change: governance
