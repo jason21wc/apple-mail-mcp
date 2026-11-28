@@ -610,7 +610,16 @@ At least one of `sender_contains`, `subject_contains`, `date_from`, `date_to`, `
 
 - `senders` lists up to 50 senders with counts; the rest are summed in `other_senders_count`. Sender strings come from email and are marked untrusted.
 - Date filters use the server's received date. `oldest_date` / `newest_date` are header dates, and `header_dates_outside_window` counts messages where the two disagree with the requested window.
-- `preview_id` is `null` when nothing matched, or when the set is above the server limit (default 5,000, override with `APPLE_MAIL_MCP_MAX_QUERY_MOVE`); in that case `over_limit` is `true` and no sender summary is fetched. Narrow the filters, for example by date.
+- `preview_id` is `null` when nothing matched, or when the set is above the server limit (default 5,000, override with `APPLE_MAIL_MCP_MAX_QUERY_MOVE`); in that case `over_limit` is `true`, no sender summary is fetched, and `suggested_windows` gives date ranges to preview one at a time:
+
+  ```json
+  "suggested_windows": [
+    {"date_from": "2022-06-02", "date_to": "2023-09-14", "approx_matched": 4480},
+    {"date_from": "2023-09-15", "date_to": null, "approx_matched": 2691}
+  ]
+  ```
+
+  The ranges together cover exactly the range you asked for: the first and last keep your own `date_from` / `date_to` (`null` where you gave none) and the ones between are consecutive days, so no message falls between them. `approx_matched` is an estimate (the server's day boundary can differ from this machine's by a time zone, and exclusions are not applied yet); the preview of each range gives the exact count, and a range that is still too large returns ranges of its own. A range marked `over_limit` holds a single day above the limit, named in its `day` field; dates cannot split it, so it needs another filter. `windows_unavailable: true` appears instead when the ranges could not be worked out (more than 60,000 matches, the dates could not be read within about 15 seconds, the server refused or the connection dropped, or too few messages reported a date); then you narrow the filters yourself. Each range is still committed with its own `max_count`.
 
 **Limits:** IMAP only, with no AppleScript fallback. Uses `MOVE` where the server advertises it and otherwise the `UIDPLUS` sequence (copy, flag deleted, expunge only those UIDs); iCloud is in the second group. Refused for Gmail accounts (folders are labels) and for servers with neither.
 

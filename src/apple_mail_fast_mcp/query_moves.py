@@ -52,6 +52,7 @@ from typing import Any, Protocol
 
 from imapclient.exceptions import IMAPClientAbortError, IMAPClientError
 
+from . import date_windows
 from .exceptions import (
     MailError,
     MailImapMoveUnsupportedError,
@@ -608,6 +609,45 @@ def preview(
     journal_path: Path | None = None,
 ) -> dict[str, Any]:
     """Find what the selector matches and hold that set. Changes nothing."""
+    try:
+        return _preview(
+            connector, store,
+            account=account,
+            source_mailbox=source_mailbox,
+            destination_mailbox=destination_mailbox,
+            selector=selector,
+            ceiling=ceiling,
+            journal_path=journal_path,
+        )
+    except _WindowsInterrupted as lost:
+        # The count is still true; only the date ranges are missing.
+        return {**lost.result, "windows_unavailable": True}
+
+
+class _WindowsInterrupted(Exception):
+    """The connection broke while date ranges were being worked out.
+
+    Carries the over-the-ceiling answer already built. It is raised through
+    the session on purpose, so the broken connection is dropped rather than
+    reused, and is turned back into that answer outside it.
+    """
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__("connection lost while reading received dates")
+        self.result = result
+
+
+def _preview(
+    connector: _Connector,
+    store: PreviewStore,
+    *,
+    account: str,
+    source_mailbox: str,
+    destination_mailbox: str,
+    selector: Selector,
+    ceiling: int,
+    journal_path: Path | None,
+) -> dict[str, Any]:
     _reject_control_chars(source_mailbox, "source_mailbox")
     _reject_control_chars(destination_mailbox, "destination_mailbox")
     if source_mailbox.strip().casefold() == destination_mailbox.strip().casefold():
@@ -661,6 +701,16 @@ def preview(
             # Counted before exclusions: reading every sender of a set this
             # size is what the ceiling is there to avoid.
             result.update(over_limit=True, limit=ceiling)
+            # Hand back date ranges that each fit, so the caller does not
+            # have to split the range by hand. Each is previewed (and its
+            # max_count stated) on its own; nothing is held for them here.
+            try:
+                result.update(date_windows.suggest(
+                    client, uids, ceiling=ceiling,
+                    date_from=selector.date_from, date_to=selector.date_to,
+                ))
+            except (IMAPClientAbortError, OSError) as exc:
+                raise _WindowsInterrupted(result) from exc
             return result
         if uids:
             read = _read_senders(client, uids)

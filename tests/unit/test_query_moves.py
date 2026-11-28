@@ -148,6 +148,8 @@ def _client(
         for uid in chunk:
             if uid not in present:
                 continue
+            if "INTERNALDATE" in parts:
+                out[uid] = {b"INTERNALDATE": (dates or {}).get(uid, when)}
             if "ENVELOPE" in parts:
                 sender = (senders or {}).get(uid, "news@example.com")
                 out[uid] = {
@@ -277,7 +279,75 @@ class TestPreview:
         assert out["matched"] == 11
         assert out["preview_id"] is None
         assert out["over_limit"] is True
-        client.fetch.assert_not_called()
+        # Only received dates are read for a set this size, never senders.
+        client.fetch.assert_called()
+        assert all(
+            call.args[1] == ["INTERNALDATE"] for call in client.fetch.call_args_list
+        )
+
+    def test_over_ceiling_suggests_date_windows_that_each_fit(self) -> None:
+        uids = list(range(1, 41))
+        dates = {u: datetime(2026, 1, 1 + (u - 1) // 10, 9, 0) for u in uids}
+        client = _client(uids, dates=dates)
+        store = qm.PreviewStore()
+        out = _preview(
+            FakeConnector(client), store, ceiling=25,
+            selector=qm.Selector(
+                sender_contains="news@example.com",
+                date_from="2025-12-01", date_to="2026-05-16",
+            ),
+        )
+        assert out["preview_id"] is None
+        assert out["limit"] == 25
+        windows = out["suggested_windows"]
+        assert sum(w["approx_matched"] for w in windows) == 40
+        assert all(w["approx_matched"] <= 25 for w in windows)
+        # Together they cover exactly the range that was asked for.
+        assert windows[0]["date_from"] == "2025-12-01"
+        assert windows[-1]["date_to"] == "2026-05-16"
+        client.move.assert_not_called()
+        client.copy.assert_not_called()
+        client.add_flags.assert_not_called()
+
+    def test_over_ceiling_without_readable_dates_says_so(self) -> None:
+        client = _client(list(range(1, 12)))
+        client.fetch.side_effect = IMAPClientError("no")
+        out = _preview(FakeConnector(client), qm.PreviewStore(), ceiling=10)
+        assert out["over_limit"] is True
+        assert out["preview_id"] is None
+        assert out["windows_unavailable"] is True
+        assert "suggested_windows" not in out
+
+    @pytest.mark.parametrize(
+        "failure", [IMAPClientAbortError("gone"), TimeoutError("timed out")]
+    )
+    def test_connection_lost_reading_dates_still_answers_and_drops_the_session(
+        self, failure: Exception
+    ) -> None:
+        """The count is still true, so the caller gets it. But the failure
+        must leave the session as an exception: that is what makes the pool
+        drop the dead connection instead of reusing it."""
+        client = _client(list(range(1, 12)))
+        client.fetch.side_effect = failure
+        left_with: list[BaseException | None] = []
+
+        class Recording(FakeConnector):
+            @contextmanager
+            def _session(self) -> Iterator[MagicMock]:
+                try:
+                    yield self.client
+                except BaseException as exc:
+                    left_with.append(exc)
+                    raise
+                else:
+                    left_with.append(None)
+
+        out = _preview(Recording(client), qm.PreviewStore(), ceiling=10)
+        assert out["matched"] == 11
+        assert out["over_limit"] is True
+        assert out["preview_id"] is None
+        assert out["windows_unavailable"] is True
+        assert len(left_with) == 1 and left_with[0] is not None
 
     def test_messages_already_flagged_deleted_are_skipped(self) -> None:
         """A message flagged deleted is usually the leftover of an interrupted
