@@ -135,6 +135,9 @@ OPERATION_TIERS: dict[str, str] = {
     # Query-driven bulk move (fork-local): one IMAP SEARCH / bounded MOVE each.
     "preview_move_by_query": "expensive_ops",
     "commit_move_by_query": "expensive_ops",
+    # Bulk attachment export (fork-local): one IMAP SEARCH / bounded fetch each.
+    "preview_attachment_export": "expensive_ops",
+    "commit_attachment_export": "expensive_ops",
     "create_mailbox": "expensive_ops",
     "update_mailbox": "expensive_ops",
     "delete_mailbox": "expensive_ops",
@@ -415,6 +418,8 @@ ACCOUNT_GATED_OPERATIONS = {
     "get_statistics",
     "preview_move_by_query",
     "commit_move_by_query",
+    "preview_attachment_export",
+    "commit_attachment_export",
 }
 
 SEND_OPERATIONS = {

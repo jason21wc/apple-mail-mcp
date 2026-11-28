@@ -34,6 +34,7 @@ READ_ONLY_TOOLS: set[str] = {
     "get_thread",
     "get_statistics",
     "preview_move_by_query",
+    "preview_attachment_export",
     "get_attachment_content",
     "get_template",
     "render_template",
@@ -53,6 +54,8 @@ DESTRUCTIVE_TOOLS: set[str] = {
     "delete_template",
     # overwrite=True can replace state the caller did not create.
     "save_attachments",
+    # if_exists="overwrite" can replace files; it never changes mail.
+    "commit_attachment_export",
     "save_template",
 }
 
@@ -67,6 +70,7 @@ MUTATING_TOOLS = DESTRUCTIVE_TOOLS | ADDITIVE_TOOLS
 # Idempotent: same args → same end state.
 NON_IDEMPOTENT_TOOLS: set[str] = {
     "commit_move_by_query",  # each call moves the next slice of the preview
+    "commit_attachment_export",  # each call exports the next slice
     "update_draft",   # retries can create/send again when the original is retained
     "create_draft",   # each call may create a new draft
     "create_rule",    # rules may be appended on each call
@@ -175,10 +179,12 @@ class TestProductionAnnotations:
         assert names == READ_ONLY_TOOLS | MUTATING_TOOLS
 
     def test_classifications_partition_correctly(self) -> None:
-        """No overlap between read-only and mutating sets; counts are 12 + 15."""
+        """No overlap between read-only and mutating sets.
+
+        No counts are pinned here: ``test_tool_count_unchanged_in_default_mode``
+        already compares these sets with what the server registers.
+        """
         assert READ_ONLY_TOOLS.isdisjoint(MUTATING_TOOLS)
-        assert len(READ_ONLY_TOOLS) == 12
-        assert len(MUTATING_TOOLS) == 15
         assert DESTRUCTIVE_TOOLS.isdisjoint(ADDITIVE_TOOLS)
 
     @pytest.mark.parametrize("name", sorted(READ_ONLY_TOOLS))

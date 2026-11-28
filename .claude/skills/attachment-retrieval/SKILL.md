@@ -15,6 +15,9 @@ This is an **interim bridge**. For a high-volume, truly hands-off pipeline, a de
 - "Undo that last grab."
 - Define a new recipe for a recurring source.
 
+## When NOT to use: large backlogs
+For hundreds or thousands of messages (a backlog of daily reports, say), do not loop this skill: one `save_attachments` call per message does not scale. Use the server's `preview_attachment_export` / `commit_attachment_export` instead (see `docs/reference/TOOLS.md`). They select by query, name files from a template (subject parts, dates, the attachment's own name), write a manifest CSV, and resume after an interruption. They have no per-run undo log: undo is by the manifest (it lists every file written). Preview first, show Jason the counts and sample paths, and get his go before the commit, as with a grab here.
+
 ## Concepts
 - **Recipe** — a named source + destination, written as prose in this file (see *Recipes* below). Not stored as machine config; you read it here and run it.
 - **Run** — one grab. Every file a run saves is recorded so the run can be reversed.

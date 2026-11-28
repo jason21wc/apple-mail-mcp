@@ -18,7 +18,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.server.elicitation import AcceptedElicitation
 from pydantic import BeforeValidator
 
-from . import query_moves, search_summary
+from . import attachment_exports, query_moves, search_summary
 from .drafts import DraftStateStore, SeedRecord
 from .exceptions import (
     MailAccountNotFoundError,
@@ -78,7 +78,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Read-only mode (#217). The connector can be launched with `--read-only`
-# to skip registration of the 14 mutating tools so Claude Desktop users can
+# to skip registration of the mutating tools so Claude Desktop users can
 # run two server entries side-by-side and batch-approve the read-only one.
 # `_pre_parse_read_only` parses argv at module load (tolerant of unknown
 # args, which `main()` parses again with the full schema) so the
@@ -2029,6 +2029,318 @@ async def commit_move_by_query(
         return _query_move_error(operation, e)
 
 
+# ---------------------------------------------------------------------------
+# Bulk attachment export by query (fork-local, see attachment_exports.py)
+# ---------------------------------------------------------------------------
+
+_export_store = attachment_exports.ExportStore()
+
+
+def _export_connector(account: str) -> Any:
+    """IMAP connector for the export tools. There is no AppleScript fallback."""
+    return query_moves.connector_for(mail, account)
+
+
+class _LazyExportConnector:
+    """Builds the real connector on first use.
+
+    Building it asks Mail.app for the account and reads the Keychain, which
+    can block. Doing that on first use puts it inside the worker thread and
+    after the arguments have been validated, so a bad argument is reported
+    as that rather than as a missing password.
+    """
+
+    def __init__(self, account: str) -> None:
+        self._account = account
+        self._real: Any = None
+
+    def _resolved(self) -> Any:
+        if self._real is None:
+            self._real = _export_connector(self._account)
+        return self._real
+
+    def _session(self) -> Any:
+        return self._resolved()._session()
+
+    @property
+    def _host(self) -> Any:
+        return getattr(self._resolved(), "_host", None)
+
+    @property
+    def _email(self) -> Any:
+        return getattr(self._resolved(), "_email", None)
+
+
+def _export_error(operation: str, exc: Exception) -> dict[str, Any]:
+    """Like ``_query_move_error``, with the save directory's own failures."""
+    if isinstance(exc, attachment_exports.ExportDirectoryError):
+        logger.error("%s failed (directory_error): %s", operation, exc)
+        return {"success": False, "error": str(exc), "error_type": "directory_error"}
+    return _query_move_error(operation, exc)
+
+
+@_tool(
+    {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
+)
+async def preview_attachment_export(
+    account: str,
+    mailbox: str,
+    save_directory: str,
+    sender_contains: str | None = None,
+    subject_contains: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    attachment_name_contains: str | None = None,
+    filename_template: str = "{name}",
+    subfolder_template: str | None = None,
+    subject_pattern: str | None = None,
+    subject_date_format: str | None = None,
+    if_exists: str = "skip",
+) -> dict[str, Any]:
+    """Preview a bulk attachment export chosen by filters. Writes nothing.
+
+    Use this with ``commit_attachment_export`` to save the attachments of
+    many messages (hundreds or thousands) under names built from a template,
+    instead of calling ``save_attachments`` once per message. The preview
+    finds the matching messages, shows what would be exported and where, and
+    holds that exact set for 15 minutes. Nothing is downloaded or written,
+    and mail is never changed by either tool (no flag, move or delete).
+
+    IMAP only. At most 2,000 messages per preview: above that the result has
+    ``over_limit`` and ``suggested_windows`` (date ranges that each fit), and
+    you preview each range in turn.
+
+    Args:
+        account: Mail.app account name or UUID (from list_accounts).
+        mailbox: Mailbox holding the messages.
+        save_directory: Existing directory to export into. ``~`` is expanded.
+            Subfolders are created beneath it; nothing is written outside it.
+        sender_contains: Only messages from senders containing this. Use a
+            full address on iCloud; its search can miss domain fragments.
+        subject_contains: Only messages whose subject contains this.
+        date_from: Inclusive lower bound on the received date, YYYY-MM-DD.
+        date_to: Inclusive upper bound, YYYY-MM-DD.
+        attachment_name_contains: Only attachments whose own name contains
+            this (any case), for example ".pdf".
+        filename_template: Name for each saved file. Tokens: {name} (the
+            attachment's own name), {stem}, {ext} (with its dot), {subject},
+            {sender}, {uid}, {index} (attachment position), and the dates
+            {received}, {sent} and {subject_date}, which take a format such
+            as {received:%Y.%m.%d}. Any named group of ``subject_pattern`` is
+            a token too. Default "{name}".
+        subfolder_template: Optional folders beneath save_directory, using
+            the same tokens, separated by "/", for example
+            "{received:%Y}/{sender}".
+        subject_pattern: A regular expression applied to each subject from
+            its start (begin it with ``.*?`` to match further in); its named
+            groups become tokens. A group named ``date`` feeds
+            {subject_date}. A message whose subject does not match is not
+            exported and not guessed at. Keep it simple: lookarounds,
+            backreferences, a repeat inside a repeat, and more than two
+            open-ended repeats (``.*``, ``.+``) are refused.
+        subject_date_format: Layout of the ``date`` group, for example
+            "%d%b%y" for 04May26.
+        if_exists: What to do when a different file is already at the target
+            name: "skip" (default; reported as a name collision), "suffix"
+            (save as "name (2).ext") or "overwrite". A file with identical
+            content is never written twice, whatever this is.
+
+        At least one of sender_contains, subject_contains, date_from or
+        date_to is required. A blank value is an error, not "no filter".
+
+    Returns:
+        ``matched`` (messages found); ``to_export``; ``already_exported``
+        (left out because an earlier export's manifest and files show them
+        done; only with if_exists="skip"); ``pattern_no_match`` (subjects the
+        pattern does not fit); ``duplicate_target_paths`` (messages that
+        would be given the same path as another: add a token that tells them
+        apart, or choose if_exists="suffix"); ``oldest_date`` /
+        ``newest_date``; ``senders``; ``total_message_bytes``;
+        ``sample_paths`` (up to five, with NAME.EXT standing in for the
+        attachment's own name); ``manifest_path``; ``preview_id`` (null when
+        there is nothing to export, or the set is over the limit or took too
+        long to read: ``over_limit`` / ``over_budget``);
+        ``expires_in_seconds``. Pass ``preview_id`` to
+        ``commit_attachment_export``.
+
+    Example (reports named "Daily Report 04May26 from host", each with an
+    attachment called email.txt):
+        >>> preview_attachment_export(
+        ...     "iCloud", "Reports", "~/Documents/Reports",
+        ...     sender_contains="reports@example.com",
+        ...     date_from="2026-05-01", date_to="2026-05-07",
+        ...     subject_pattern=r"^(?P<report>.+?) (?P<date>\\d{2}[A-Za-z]{3}\\d{2}) from",
+        ...     subject_date_format="%d%b%y",
+        ...     filename_template="{report} {subject_date:%Y.%m.%d}{ext}",
+        ...     subfolder_template="{subject_date:%Y}/{report}")
+    """
+    operation = "preview_attachment_export"
+    try:
+        safety_err = check_test_mode_safety(
+            "preview_attachment_export", account=account
+        )
+        if safety_err:
+            return safety_err
+        rate_err = check_rate_limit(operation, {"account": account, "mailbox": mailbox})
+        if rate_err:
+            return rate_err
+
+        directory_err, directory = _export_directory(save_directory)
+        if directory_err:
+            return directory_err
+        naming = attachment_exports.build_naming(
+            filename_template=filename_template,
+            subfolder_template=subfolder_template,
+            subject_pattern=subject_pattern,
+            subject_date_format=subject_date_format,
+        )
+        selector = query_moves.Selector(
+            sender_contains=sender_contains,
+            subject_contains=subject_contains,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        result = await asyncio.to_thread(
+            attachment_exports.preview,
+            _LazyExportConnector(account),
+            _export_store,
+            account=account,
+            mailbox=mailbox,
+            save_directory=directory,
+            selector=selector,
+            naming=naming,
+            attachment_name_contains=attachment_name_contains,
+            if_exists=if_exists,
+        )
+        operation_logger.log_operation(
+            operation,
+            {"account": account, "mailbox": mailbox, "matched": result["matched"]},
+            "success",
+        )
+        return _mark_untrusted(
+            {"success": True, **result},
+            has_content=bool(result.get("sample_paths") or result.get("senders")),
+        )
+    except Exception as e:
+        return _export_error(operation, e)
+
+
+def _export_directory(save_directory: str) -> tuple[dict[str, Any] | None, Path]:
+    """Resolve the directory argument the way ``save_attachments`` does."""
+    try:
+        path = Path(save_directory).expanduser()
+    except RuntimeError as exc:
+        return (
+            {"success": False, "error": str(exc), "error_type": "validation_error"},
+            Path(save_directory),
+        )
+    if not path.exists():
+        return (
+            {
+                "success": False,
+                "error": f"Directory does not exist: {save_directory}",
+                "error_type": "directory_not_found",
+            },
+            path,
+        )
+    if not path.is_dir():
+        return (
+            {
+                "success": False,
+                "error": f"Not a directory: {save_directory}",
+                "error_type": "invalid_directory",
+            },
+            path,
+        )
+    return None, path
+
+
+@_tool(
+    {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True, "idempotentHint": False},
+    mutating=True,
+)
+async def commit_attachment_export(preview_id: str, max_count: int) -> dict[str, Any]:
+    """Export the attachments held by a ``preview_attachment_export`` result.
+
+    Downloads the previewed messages a slice at a time and writes their
+    attachments under the names the preview's templates give. Each call works
+    for about 20 seconds and then returns; **call again with the same
+    ``preview_id`` until ``outcome`` is ``"complete"``**. Mail is only read:
+    nothing is flagged, moved or deleted, and the read status does not change.
+
+    Files are written only inside the previewed ``save_directory``. Every
+    file and every message that produced none is recorded in
+    ``export_manifest.csv`` in that directory (message id, subject, date,
+    saved path, size, sha256, status).
+
+    Args:
+        preview_id: The id returned by ``preview_attachment_export``.
+        max_count: The most messages you expect this export to cover. If the
+            preview holds more, nothing is exported.
+
+    Returns:
+        Counts only, never subjects or names: ``outcome`` ("more",
+        "complete" or "failed"); ``total``; ``messages_done`` and
+        ``remaining``; ``saved``; ``identical_existing`` (already on disk
+        with the same content); ``name_collisions`` (a different file was
+        already at that name and if_exists was "skip": not written, look at
+        the manifest); ``renamed``; ``overwritten``;
+        ``no_matching_attachment``; ``pattern_no_match``; ``too_large``;
+        ``missing`` (gone since the preview); ``errors`` (could not be
+        written); ``bytes_written``; ``slowest_batch_seconds``;
+        ``manifest_path``. On "failed", ``error`` says why and the batch in
+        flight is tried again by the next call; ``server_slow`` with
+        ``retry_after_seconds`` means wait before calling again.
+
+        After a server restart the ``preview_id`` is gone: preview again
+        with the same arguments. With if_exists="skip" it leaves out what
+        the manifest and files show as already exported.
+    """
+    operation = "commit_attachment_export"
+    try:
+        entry = _export_store.get(preview_id)
+        safety_err = check_test_mode_safety(
+            "commit_attachment_export", account=entry.account
+        )
+        if safety_err:
+            return safety_err
+        rate_err = check_rate_limit(
+            operation, {"account": entry.account, "mailbox": entry.mailbox}
+        )
+        if rate_err:
+            return rate_err
+
+        result = await asyncio.to_thread(
+            attachment_exports.commit,
+            _LazyExportConnector(entry.account),
+            _export_store,
+            preview_id=preview_id,
+            max_count=max_count,
+            max_attachment_bytes=mail.max_attachment_bytes,
+        )
+        try:
+            operation_logger.log_operation(
+                operation,
+                {
+                    "account": entry.account,
+                    "mailbox": entry.mailbox,
+                    "directory": str(entry.save_directory),
+                    "saved": result["saved"],
+                    "remaining": result["remaining"],
+                    "outcome": result["outcome"],
+                },
+                "success" if result["outcome"] != "failed" else "failure",
+            )
+        except Exception as log_exc:  # noqa: BLE001
+            logger.error("commit_attachment_export audit log failed: %s", log_exc)
+            result["audit_log_error"] = str(log_exc)
+        if result["outcome"] == "failed":
+            return {"success": False, "error_type": "imap_error", **result}
+        return {"success": True, **result}
+    except Exception as e:
+        return _export_error(operation, e)
+
+
 @_tool(
     {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True, "idempotentHint": True}
 )
@@ -2447,11 +2759,14 @@ def save_attachments(
     Args:
         message_id: Message ID from search results
         save_directory: Directory path to save attachments. ``~`` is
-            expanded. The directory must already exist — it is not created to
+            expanded. The directory must already exist; it is not created.
         attachment_indices: Specific attachment indices to save (0-based), None for all
         output_filename: Custom filename for the saved attachment (fork mod #2).
             Only valid when saving exactly one attachment (one entry in
-            ``attachment_indices``). The name is sanitized for path safety.
+            ``attachment_indices``). The name is kept as written, spaces
+            included; only directory parts, ``\\`` and ``:``, control
+            characters and leading dots are removed, so the file always
+            lands inside ``save_directory``.
         overwrite: If False (default) and the destination file
             already exists, the save is refused with
             error_type='already_exists' and the existing file is
@@ -2484,7 +2799,7 @@ def save_attachments(
     """
     from pathlib import Path
 
-    from .utils import sanitize_filename
+    from .utils import sanitize_output_filename
 
     try:
         rate_err = check_rate_limit("save_attachments", {"message_id": message_id})
@@ -2533,7 +2848,7 @@ def save_attachments(
                     ),
                     "error_type": "validation_error",
                 }
-            output_filename = sanitize_filename(output_filename)
+            output_filename = sanitize_output_filename(output_filename)
 
         logger.info(
             f"Saving attachments from message {message_id} to {save_directory}"
@@ -4517,7 +4832,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Start the server with only the read-only tools registered "
-            "(skips the 14 mutating tools). Pair with a second non-read-only "
+            "(skips every mutating tool). Pair with a second non-read-only "
             "server entry in your MCP client to batch-approve reads while "
             "still gating writes per call. See docs/reference/TOOLS.md."
         ),
@@ -4598,7 +4913,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if _READ_ONLY:
         logger.info(
-            "Read-only mode: 14 mutating tools skipped (--read-only). "
+            "Read-only mode: mutating tools skipped (--read-only). "
             "Only the read-only tools are registered."
         )
     logger.info("Starting Apple Mail MCP server")

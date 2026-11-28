@@ -52,9 +52,13 @@ The fork is deliberately thin. **Two behavioral modifications, both in
 `server.py`:**
 
 1. **`save_attachments(output_filename=...)`** — save a single attachment under
-   a caller-chosen, sanitized name. Used by the attachment-retrieval skill to
+   a caller-chosen name. Used by the attachment-retrieval skill to
    produce deterministic filenames, which is what makes an incremental re-run
-   possible without a dedup ledger.
+   possible without a dedup ledger. Since 2026-11-27 the name is kept as
+   written, spaces included, by `utils.sanitize_output_filename`: only
+   directory parts, `\` and `:`, control characters and leading dots are
+   removed. Names taken from mail still go through the strict
+   `sanitize_filename`.
 2. **`content_is_untrusted` / `security_notice` marking** — applied through a
    single-source `_mark_untrusted()` helper on every content-returning tool
    (`get_messages`, `get_attachment_content`, `search_messages`, `get_thread`).
@@ -86,6 +90,38 @@ construction), which is the sync cost to watch. It is an upstream candidate
 divergence. When a selection is above the ceiling the preview returns date
 ranges that each fit (`date_windows.py`, added 2026-11-27), read from
 `INTERNALDATE` only; the ceiling and the caller's `max_count` are unchanged.
+
+**A second fork-local capability, in its own module (added 2026-11-27):**
+`attachment_exports.py` plus two tool registrations in `server.py`,
+`preview_attachment_export` and `commit_attachment_export`. `save_attachments`
+takes one message per call, which made a job of about 15,000 report emails
+impractical. These two follow the query-move shape: the preview selects with
+an IMAP SEARCH and holds the exact UID set; each commit call downloads a
+bounded slice and reports `more` or `complete`. Files are named from a
+template whose tokens come from the subject (through a caller-supplied
+pattern), the dates and the attachment's own name, and every outcome is
+recorded in a manifest CSV in the save directory.
+
+Its boundaries, which are the reason it is safe to run unattended:
+
+- **Read-only toward mail.** Read-only select and `BODY.PEEK[]`; the module
+  has no flag, copy, move or expunge call, and a test runs it against a client
+  that has none.
+- **Writes only inside the save directory.** Each path component is cleaned on
+  its own, folders are made one level at a time and never through a symlink,
+  and the resolved parent is checked.
+- **Nothing dropped quietly.** A different file already at the target is a
+  reported `name_collision`; a subject that does not fit the pattern is
+  recorded, not guessed.
+- **IMAP only**, no AppleScript fallback, and it does not touch
+  `mail_connector.py` (ADR-3). It reuses the query-move selector, connector
+  construction and store errors, and `draft_builder.extract_attachment_payloads`
+  through one adapter function, so attachment indices agree with
+  `save_attachments`.
+
+Why it is fork-local rather than proposed upstream first (ADR-2): it was
+needed now for a one-off backlog, and it builds on `query_moves.py`, which is
+itself not upstream yet. It is a candidate to propose together with that.
 
 Everything else the fork once carried has converged into upstream and been
 dropped. Fork infrastructure that is not a behavior change: governance
@@ -177,7 +213,14 @@ desynchronize from the filesystem; the filesystem is already the state.
 guard is `os.link` (and `os.replace` for an explicit overwrite), NOT a
 check-then-act `exists()` test — a separate existence check leaves a window in
 which two concurrent saves both write, which is what the original
-implementation did.
+implementation did. *Narrower use in the bulk export (2026-11-27):* its
+manifest CSV is not a dedup ledger. A rerun leaves a message out only when
+the manifest names files for it **and** those files are still on disk at the
+recorded size; anything else is downloaded again and settled by comparing
+content. The manifest answers "which message made this file", which a
+templated name alone cannot (two messages can render to one name); the
+filesystem still decides what is done. The write itself uses the same
+`os.link` / `os.replace` guard.
 
 **ADR-6 — `_ai-context/` is gitignored, deviating from the framework default.**
 *Rationale:* public repo, private business content. *Consequence:* no team
