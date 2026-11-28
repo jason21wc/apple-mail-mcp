@@ -734,6 +734,7 @@ Use this with `commit_attachment_export` to save the attachments of hundreds or 
 - `subject_pattern` (string, optional): A regular expression applied to each subject, from its start. Its named groups become tokens; a group named `date` feeds `{subject_date}`. See "Pattern rules" below.
 - `subject_date_format` (string, optional): Layout of the `date` group, for example `%d%b%y` for `04May26`.
 - `if_exists` (string, optional, default `skip`): What to do when a **different** file is already at the target name: `skip` (not written, counted as a name collision), `suffix` (saved as `name (2).ext`), or `overwrite`. A file with identical content is never written twice, whichever is chosen.
+- `manifest_only` (boolean, optional, default `false`): List the matching messages instead of saving attachments. The commit writes one manifest row per message with status `listed` (Message-ID, subject, received date, sender, To, Cc), from the headers the preview already read. No message is downloaded, so thousands of messages take one or two commit calls. Use it for an inventory, for example to compare Message-IDs between two accounts. The naming options and `if_exists` do not apply, and the preview leaves out the file-related fields.
 
 At least one of `sender_contains`, `subject_contains`, `date_from` or `date_to` is required. A blank value is an error, never "no filter".
 
@@ -792,9 +793,9 @@ preview_attachment_export(
 }
 ```
 
-- `sample_paths` shows up to five paths with `NAME.EXT` standing in for the attachment's own name, which is not known until the message is downloaded.
+- `sample_paths` shows up to five paths with `NAME.EXT` standing in for the attachment's own name, which is not known until the message is downloaded (`sample_note` says so whenever the templates use it).
 - `pattern_no_match` counts subjects `subject_pattern` does not fit (or whose date does not parse). They are not exported and not guessed at; each gets a manifest row.
-- `duplicate_target_paths` counts messages that would be given the same path as another (a report sent twice, say). Add a token that tells them apart (`{uid}`, `{received:%H%M}`) or choose `if_exists="suffix"`.
+- `duplicate_target_paths` counts messages that would be given the same path as another (a report sent twice, say). Add a token that tells them apart (`{uid}`, `{received:%H%M}`) or choose `if_exists="suffix"`. It is judged on everything in the name except the attachment's own name. When the templates use nothing but the attachment's own name (the default `{name}`), it cannot be judged before download: the value is `null` and `duplicate_check` says why.
 - `already_exported` (only with `if_exists="skip"`): messages left out because an earlier export's manifest names their files **and** those files are still there at the recorded size. See "Resuming" under `commit_attachment_export`.
 - `preview_id` is `null` when there is nothing to export, and in two bounded cases:
   - `over_limit: true` (more than 2,000 messages): `suggested_windows` lists date ranges to preview one at a time, as for `preview_move_by_query`.
@@ -808,7 +809,7 @@ preview_attachment_export(
 - `account_not_found`, `not_found`: account or mailbox not found
 - `imap_error`: IMAP failed (there is no fallback)
 
-- `directory_error`: a file in `save_directory` that the export needs (its manifest or lock) cannot be used
+- `directory_error`: the manifest in `save_directory`, or the export's lock in the app data folder, cannot be used
 
 **Pattern rules.** `subject_pattern` comes from the caller, never from mail, but it is run against subjects anyone can send, and Python's regular expressions have no timeout. So:
 
@@ -848,6 +849,7 @@ Downloads the previewed messages a slice at a time and writes their attachments 
   "total": 28,
   "messages_done": 20,
   "remaining": 8,
+  "listed": 0,
   "saved": 20,
   "identical_existing": 0,
   "name_collisions": 0,
@@ -865,12 +867,14 @@ Downloads the previewed messages a slice at a time and writes their attachments 
 ```
 
 - `outcome`: `"more"` (call again), `"complete"`, or `"failed"` (`error` says why; the batch in flight was not recorded and the next call fetches it again).
+- `listed`: rows written by a `manifest_only` preview. In that mode every other count is 0 apart from `missing`.
+- A message whose structure plainly shows nothing that could be saved (only text parts: no attachment, no named or inline-with-parameters part, no forwarded message) is recorded `no_matching_attachment` without being downloaded. Anything less clear is downloaded and settled from the real message, and so is every name filter.
 - `saved`, `renamed`, `overwritten`: files written. `identical_existing`: the same content was already there, so nothing was written.
 - `name_collisions`: a **different** file was already at that name and `if_exists` was `skip`. It was not written. Check this on every run; the manifest rows with status `name_collision` say which.
 - `no_matching_attachment`, `pattern_no_match`, `too_large`, `missing` (gone since the preview), `errors`: messages or attachments that produced no file. Each has a manifest row. `errors` covers anything that could not be exported: a file that could not be written, a message that could not be parsed or came back with an empty body, a name the export keeps for itself, or more than 200 attachments on one message (the first 200 are exported).
 - `server_slow: true` with `retry_after_seconds` after a timeout: wait before calling again.
 
-**The manifest.** `export_manifest.csv` in `save_directory`, one row per attachment (or one per message that produced no file): `exported_at, account, mailbox, uidvalidity, uid, message_id, subject, date_received, sender, attachment_index, attachment_name, saved_path, size, sha256, status, note, export_key`. `saved_path` is relative to `save_directory`. `export_key` is a short fingerprint of the naming and filter settings the row was made with. To check an export, compare the rows whose status is `saved`, `renamed`, `overwritten` or `identical_existing` against the files (size and sha256). A cell that begins with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'`, so a subject cannot run as a formula when the file is opened in a spreadsheet.
+**The manifest.** `export_manifest.csv` in `save_directory`, one row per attachment (or one per message that produced no file): `exported_at, account, mailbox, uidvalidity, uid, message_id, subject, date_received, sender, to, cc, attachment_index, attachment_name, saved_path, size, sha256, status, note, export_key`. `saved_path` is relative to `save_directory`. A manifest written before the `to` and `cc` columns were added (2026-11-27) is refused as "not a manifest this tool wrote": move it aside or use a new folder. `export_key` is a short fingerprint of the naming and filter settings the row was made with. To check an export, compare the rows whose status is `saved`, `renamed`, `overwritten` or `identical_existing` against the files (size and sha256). A cell that begins with `=`, `+`, `-`, `@`, tab or carriage return is written with a leading `'`, so a subject cannot run as a formula when the file is opened in a spreadsheet.
 
 **Resuming.** A server restart drops pending previews (they are held in memory). Preview again with the same arguments: with `if_exists="skip"` the preview leaves out messages an earlier run finished, so only what is left is downloaded. The files are the authority; the manifest only says which message made which file. A message is left out only when, in its most recent manifest rows made with the **same naming and filter settings**:
 
@@ -880,7 +884,9 @@ Downloads the previewed messages a slice at a time and writes their attachments 
 
 So a message with a failed attachment is tried again, deleting a file exports its message again, and changing a template or the attachment filter exports everything again under the new settings. Matching does not depend on the mailbox, so it still works after the mail has been moved.
 
-**Where files can go.** Only inside `save_directory`. Each folder and file name is cleaned on its own; folders are created one level at a time and never through a symlink; a path that resolves outside the directory is refused and recorded as an error. An attachment cannot take the manifest's or the lock file's name (in any letter case); that is recorded as an error too. The manifest and lock are never opened through a symlink.
+**Where files can go.** Only inside `save_directory`. Each folder and file name is cleaned on its own; folders are created one level at a time and never through a symlink; a path that resolves outside the directory is refused and recorded as an error. An attachment cannot take the manifest's name (in any letter case); that is recorded as an error too. The manifest is never opened through a symlink. The only file the export adds beside your files is `export_manifest.csv`; its lock lives in the app's data folder (`~/.apple_mail_mcp/export_locks/`), not in `save_directory`.
+
+**An abandoned preview.** Nothing needs cleaning up. A preview that is never committed expires after 15 minutes and wrote nothing. A commit stopped part-way leaves the files and manifest rows it finished; preview again with the same arguments and `if_exists="skip"` to carry on, or delete the folder to discard it.
 
 **Limits:**
 
@@ -900,7 +906,7 @@ So a message with a failed attachment is tried again, deleting a file exports it
 - `selection_stale`: the mailbox was rebuilt, or the account now points at a different server
 - `commit_in_progress`: another commit is working on this preview or this directory
 - `validation_error`: `save_directory` no longer exists or cannot be written to
-- `directory_error`: the manifest or lock file in `save_directory` cannot be used (for example another file has the manifest's name)
+- `directory_error`: the manifest in `save_directory` cannot be used (for example another file has its name, or it predates the `to` and `cc` columns), or the export's lock could not be created
 - `imap_required`, `account_not_found`, `not_found`: as for the preview
 - `imap_error`: IMAP failed part-way (`outcome: "failed"`, with the counts so far)
 
@@ -990,6 +996,7 @@ list_mailboxes(account="my gmail account")
 
 - Bulk operations limited to 100 items
 - Consider implementing additional rate limits for production use
+- A call refused with `error_type: "rate_limited"` carries `retry_after_seconds`: how long until the limit allows one more call. Wait that long rather than retrying at once.
 
 ---
 

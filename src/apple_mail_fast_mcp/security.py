@@ -3,6 +3,7 @@ Security utilities for Apple Mail MCP.
 """
 
 import logging
+import math
 import os
 import re
 import subprocess
@@ -179,6 +180,14 @@ class RateLimiter:
         q.append(now)
         return True
 
+    def retry_after(self, tier: str) -> int:
+        """Whole seconds until the tier allows another call (at least 1)."""
+        _max_calls, window = TIER_LIMITS[tier]
+        q = self._windows[tier]
+        if not q:
+            return 1
+        return max(1, math.ceil(q[0] + window - time.monotonic()))
+
     def reset(self) -> None:
         """Clear all tier windows."""
         for q in self._windows.values():
@@ -202,6 +211,8 @@ def check_rate_limit(operation: str, params: dict[str, Any]) -> dict[str, Any] |
         "success": False,
         "error": f"Rate limit exceeded: {max_calls} calls per {int(window)}s for {tier} operations",
         "error_type": "rate_limited",
+        # When the oldest call in the window ages out and one more is allowed.
+        "retry_after_seconds": rate_limiter.retry_after(tier),
     }
 
 

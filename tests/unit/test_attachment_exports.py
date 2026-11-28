@@ -22,6 +22,7 @@ from imapclient.response_types import Address, Envelope
 
 from apple_mail_fast_mcp import attachment_exports as ax
 from apple_mail_fast_mcp import query_moves as qm
+from tests.unit.test_imap_connector import _LEAF_TEXT, _MULTIPART_WITH_ATTACHMENT
 
 SENDER = "lp@denbt1.marriott.com"
 PATTERN = r"^(?P<report>.+?) (?P<date>\d{2}[A-Za-z]{3}\d{2}) from"
@@ -63,6 +64,7 @@ def _message(
         "received": received or datetime(2026, 5, 5, 0, 3),
         "message_id": message_id,
         "raw": _raw(subject, attachments, message_id),
+        "has_attachments": bool(attachments),
     }
 
 
@@ -92,6 +94,7 @@ class StrictClient:
         self._body_fetches = 0
         self.hide_size_once = False  # the first size read reports nothing
         self.empty_body: set[int] = set()  # UIDs answered with no body
+        self.hide_structure = False  # the server sends no BODYSTRUCTURE
 
     def select_folder(self, name: str, readonly: bool = False) -> dict[bytes, Any]:
         self.selected.append((name, readonly))
@@ -116,9 +119,19 @@ class StrictClient:
             if "ENVELOPE" in parts:
                 mailbox, host = row["sender"].split("@")
                 addr = Address(None, None, mailbox.encode(), host.encode())
+                to = (Address(None, None, b"owner", b"example.com"),)
+                cc = tuple(
+                    Address(None, None, *(part.encode() for part in a.split("@")))
+                    for a in row.get("cc", ())
+                ) or None
                 data[b"ENVELOPE"] = Envelope(
                     row["received"], row["subject"].encode(), (addr,), (addr,),
-                    (addr,), None, None, None, None, row["message_id"].encode(),
+                    (addr,), to, cc, None, None, row["message_id"].encode(),
+                )
+            if "BODYSTRUCTURE" in parts and not self.hide_structure:
+                data[b"BODYSTRUCTURE"] = (
+                    _MULTIPART_WITH_ATTACHMENT
+                    if row.get("has_attachments", True) else _LEAF_TEXT
                 )
             if "INTERNALDATE" in parts:
                 data[b"INTERNALDATE"] = row["received"]
@@ -197,6 +210,9 @@ def _files(folder: Path) -> list[str]:
         str(p.relative_to(folder))
         for p in folder.rglob("*")
         if p.is_file() and not p.name.startswith(".") and p.name != ax.MANIFEST_NAME
+        # The test suite points the app's data directory at tmp_path, so the
+        # export's lock files land beside the exported files here.
+        and "export_locks" not in p.parts
     )
 
 

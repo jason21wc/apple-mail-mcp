@@ -163,6 +163,31 @@ class TestPreviewTool:
         assert backend.client.searches == []
 
 
+class TestManifestOnlyTool:
+    async def test_lists_messages_and_saves_no_files(
+        self, backend: FakeConnector, tmp_path: Path
+    ) -> None:
+        preview = await server.preview_attachment_export(
+            account="iCloud", mailbox="_Fosse Export", save_directory=str(tmp_path),
+            sender_contains=SENDER, date_from="2026-05-01", manifest_only=True,
+        )
+        assert preview["success"] is True
+        assert preview["manifest_only"] is True
+        assert preview["to_export"] == 8
+        assert "sample_paths" not in preview
+        out = await server.commit_attachment_export(preview["preview_id"], max_count=10)
+        assert out["success"] is True
+        assert out["outcome"] == "complete"
+        assert out["listed"] == 8
+        assert out["saved"] == 0
+        assert _files(tmp_path) == []
+        rows = _manifest(tmp_path)
+        assert [r["status"] for r in rows] == ["listed"] * 8
+        assert not any(
+            "BODY.PEEK[]" in parts for _, parts in backend.client.fetches
+        )
+
+
 class TestCommitTool:
     async def test_exports_and_reports_counts_only(
         self, backend: FakeConnector, tmp_path: Path

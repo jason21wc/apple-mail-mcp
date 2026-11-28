@@ -202,6 +202,30 @@ class TestCheckRateLimit:
         assert result["error_type"] == "rate_limited"
         assert "sends" in result["error"]
 
+    def test_over_limit_says_how_long_to_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A caller told only "rate limited" has to guess when to try again."""
+        from apple_mail_fast_mcp import security
+
+        now = [1000.0]
+        monkeypatch.setattr(security.time, "monotonic", lambda: now[0])
+        max_calls, window = TIER_LIMITS["sends"]
+        for _ in range(max_calls):
+            check_rate_limit("create_draft", {"subject": "x"})
+            now[0] += 5.0
+        # The oldest call was 15 s ago, so it ages out in window - 15.
+        result = check_rate_limit("create_draft", {"subject": "x"})
+        assert result is not None
+        assert result["retry_after_seconds"] == int(window) - 5 * max_calls
+        now[0] += result["retry_after_seconds"]
+        assert check_rate_limit("create_draft", {"subject": "x"}) is None
+
+    def test_retry_after_is_never_less_than_a_second(self) -> None:
+        from apple_mail_fast_mcp.security import rate_limiter
+
+        assert rate_limiter.retry_after("sends") == 1
+
     def test_logs_rate_limited_to_operation_logger(self) -> None:
         max_calls = TIER_LIMITS["sends"][0]
         for _ in range(max_calls):
